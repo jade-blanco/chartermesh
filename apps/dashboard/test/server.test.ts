@@ -121,12 +121,19 @@ test("dashboard serves one projection and protects mutations", async () => {
       headers: mutationHeaders("dashboard-test-run"),
       body: "{}",
     });
-    assert.equal(ran.status, 200, await ran.text());
+    assert.equal(ran.status, 202, await ran.text());
 
-    const artifact = await fetch(
-      `${dashboard.url}/api/work-items/${id}/artifact`,
-      { headers: { "x-chartermesh-session": token } },
-    ).then((response) => response.json());
+    let artifactResponse: Response | undefined;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      artifactResponse = await fetch(
+        `${dashboard.url}/api/work-items/${id}/artifact`,
+        { headers: { "x-chartermesh-session": token } },
+      );
+      if (artifactResponse.status === 200) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(artifactResponse?.status, 200);
+    const artifact = await artifactResponse!.json();
     assert.match(artifact.sha256, /^[a-f0-9]{64}$/u);
     assert.match(artifact.content, /Simulated CharterMesh result/u);
 
@@ -155,6 +162,20 @@ test("dashboard serves one projection and protects mutations", async () => {
     assert.equal(completed.status, 200);
     const final = await completed.json();
     assert.equal(final.workItem.status, "done");
+
+    const archived = await fetch(
+      `${dashboard.url}/api/work-items/${id}/archive`,
+      {
+        method: "POST",
+        headers: mutationHeaders("dashboard-test-archive"),
+        body: "{}",
+      },
+    );
+    assert.equal(archived.status, 200);
+    const afterArchive = await fetch(`${dashboard.url}/api/dashboard`, {
+      headers: { "x-chartermesh-session": token },
+    }).then((response) => response.json());
+    assert.equal(afterArchive.workItems.length, 0);
   } finally {
     await dashboard.close();
   }

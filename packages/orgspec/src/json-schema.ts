@@ -265,5 +265,12 @@ function validateNode(
 
 export function validateOrgSpecSchema(value: unknown): JsonSchemaIssue[] {
   const root = schemaDocument();
-  return validateNode(root, root, value, "/");
+  return validateJsonSchemaDocument(root, value);
+}
+
+export function validateJsonSchemaDocument(
+  schema: Record<string, unknown>,
+  value: unknown,
+): JsonSchemaIssue[] {
+  return validateNode(schema, schema, value, "/");
 }

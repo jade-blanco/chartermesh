@@ -48,6 +48,7 @@ export interface WorkItem {
   version: number;
   wait: WaitCondition | null;
   nextAction: string;
+  archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -88,6 +89,9 @@ export interface DashboardProjection {
     actor: string;
     createdAt: string;
   }>;
+  page: {
+    nextCursor: string | null;
+  };
 }
 
 export interface RuntimeHealth {
@@ -156,4 +160,57 @@ export interface AuditRecord {
   actor: string;
   createdAt: string;
   payload: Record<string, unknown>;
+}
+
+export interface WorkItemPage {
+  items: WorkItem[];
+  nextCursor: string | null;
+}
+
+export interface ModelInvocationRecord {
+  id: string;
+  attemptId: string;
+  engineId: string;
+  modelId: string;
+  status: "running" | "succeeded" | "failed" | "canceled" | "abandoned";
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cost: number | null;
+  measurementStatus: "measured" | "estimated" | "unknown";
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export interface OutboxDelivery {
+  id: number;
+  eventId: number;
+  eventType: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  attemptCount: number;
+}
+
+export interface OutboxRecord extends OutboxDelivery {
+  nextAttemptAt: string | null;
+  lastErrorCode: string | null;
+  dispatchedAt: string | null;
+  deadLetteredAt: string | null;
+  claimedAt: string | null;
+  claimOwner: string | null;
+}
+
+export interface ScheduleTickRecord {
+  id: string;
+  scheduleId: string;
+  tickKey: string;
+  status:
+    | "started"
+    | "succeeded"
+    | "failed"
+    | "skipped_no_work"
+    | "skipped_overlap";
+  workItemId: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  errorCode: string | null;
 }

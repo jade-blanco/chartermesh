@@ -11,13 +11,18 @@ import type {
   AuditRecord,
   ArtifactEvidence,
   DashboardProjection,
+  ModelInvocationRecord,
   OperationalState,
+  OutboxDelivery,
+  OutboxRecord,
   RuntimeBudgets,
+  ScheduleTickRecord,
   ToolCallApproval,
   ToolExecutionEvidenceRecord,
   UserAction,
   WaitCondition,
   WorkItem,
+  WorkItemPage,
   WorkStatus,
 } from "./types.ts";
 import { assertMaintenanceInactive } from "./maintenance.ts";
@@ -58,6 +63,7 @@ function asWorkItem(row: Row): WorkItem {
     version: Number(row.version),
     wait,
     nextAction: String(row.next_action),
+    archivedAt: row.archived_at ? String(row.archived_at) : null,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -106,6 +112,12 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "status",
   "inputHash",
   "outputHash",
+  "scheduleId",
+  "tickKey",
+  "invocationId",
+  "engineId",
+  "modelId",
+  "measurementStatus",
 ]);
 
 function allowlistedAuditPayload(
@@ -139,6 +151,126 @@ function safeAuditActor(value: unknown): string {
   return /^(?:human|role|runner|system):[A-Za-z0-9._-]{1,96}$/u.test(actor)
     ? actor
     : "system:unknown";
+}
+
+function asAuditRecord(row: Row): AuditRecord {
+  let payload: unknown = {};
+  try {
+    payload = JSON.parse(String(row.payload_json));
+  } catch {
+    payload = {};
+  }
+  return {
+    id: Number(row.id),
+    type: String(row.event_type),
+    workItemId: row.work_item_id ? String(row.work_item_id) : null,
+    actor: safeAuditActor(row.actor),
+    createdAt: String(row.created_at),
+    payload: allowlistedAuditPayload(payload),
+  };
+}
+
+function asInvocation(row: Row): ModelInvocationRecord {
+  return {
+    id: String(row.id),
+    attemptId: String(row.attempt_id),
+    engineId: String(row.engine_id),
+    modelId: String(row.model_id),
+    status: String(row.status) as ModelInvocationRecord["status"],
+    inputTokens:
+      row.input_tokens === null || row.input_tokens === undefined
+        ? null
+        : Number(row.input_tokens),
+    outputTokens:
+      row.output_tokens === null || row.output_tokens === undefined
+        ? null
+        : Number(row.output_tokens),
+    cost:
+      row.cost === null || row.cost === undefined ? null : Number(row.cost),
+    measurementStatus: String(
+      row.measurement_status,
+    ) as ModelInvocationRecord["measurementStatus"],
+    startedAt: String(row.started_at),
+    finishedAt: row.finished_at ? String(row.finished_at) : null,
+  };
+}
+
+function outboxPayload(value: unknown): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(String(value)) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function asOutbox(row: Row): OutboxRecord {
+  return {
+    id: Number(row.id),
+    eventId: Number(row.event_id),
+    eventType: String(row.event_type),
+    payload: outboxPayload(row.payload_json),
+    createdAt: String(row.created_at),
+    attemptCount: Number(row.attempt_count ?? 0),
+    nextAttemptAt: row.next_attempt_at
+      ? String(row.next_attempt_at)
+      : null,
+    lastErrorCode: row.last_error_code
+      ? String(row.last_error_code)
+      : null,
+    dispatchedAt: row.dispatched_at ? String(row.dispatched_at) : null,
+    deadLetteredAt: row.dead_lettered_at
+      ? String(row.dead_lettered_at)
+      : null,
+    claimedAt: row.claimed_at ? String(row.claimed_at) : null,
+    claimOwner: row.claim_owner ? String(row.claim_owner) : null,
+  };
+}
+
+function asScheduleTick(row: Row): ScheduleTickRecord {
+  return {
+    id: String(row.id),
+    scheduleId: String(row.schedule_id),
+    tickKey: String(row.tick_key),
+    status: String(row.status) as ScheduleTickRecord["status"],
+    workItemId: row.work_item_id ? String(row.work_item_id) : null,
+    startedAt: String(row.started_at),
+    finishedAt: row.finished_at ? String(row.finished_at) : null,
+    errorCode: row.error_code ? String(row.error_code) : null,
+  };
+}
+
+function workCursor(row: Row): string {
+  return Buffer.from(
+    JSON.stringify({
+      createdAt: String(row.created_at),
+      id: String(row.id),
+    }),
+    "utf8",
+  ).toString("base64url");
+}
+
+function parseWorkCursor(
+  value: string | undefined,
+): { createdAt: string; id: string } | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(value, "base64url").toString("utf8"),
+    ) as { createdAt?: unknown; id?: unknown };
+    if (
+      typeof parsed.createdAt !== "string" ||
+      typeof parsed.id !== "string" ||
+      !/^work-\d{6,}$/u.test(parsed.id)
+    ) {
+      throw new Error("invalid");
+    }
+    return { createdAt: parsed.createdAt, id: parsed.id };
+  } catch {
+    throw new Error("WORK_ITEM_CURSOR_INVALID");
+  }
 }
 
 export class ControlPlane {
@@ -330,28 +462,379 @@ export class ControlPlane {
   }
 
   auditRecords(): AuditRecord[] {
-    const rows = this.database
-      .prepare(
-        `SELECT id, event_type, work_item_id, actor, payload_json, created_at
-         FROM events ORDER BY id ASC`,
-      )
-      .all() as Row[];
-    return rows.map((row) => {
-      let payload: unknown = {};
-      try {
-        payload = JSON.parse(String(row.payload_json));
-      } catch {
-        payload = { parseError: true };
-      }
-      return {
-        id: Number(row.id),
-        type: String(row.event_type),
-        workItemId: row.work_item_id ? String(row.work_item_id) : null,
-        actor: safeAuditActor(row.actor),
-        createdAt: String(row.created_at),
-        payload: allowlistedAuditPayload(payload),
-      };
+    const records: AuditRecord[] = [];
+    let afterId = 0;
+    for (;;) {
+      const page = this.auditRecordsPage({ afterId, limit: 1_000 });
+      records.push(...page);
+      if (page.length < 1_000) return records;
+      afterId = page.at(-1)!.id;
+    }
+  }
+
+  auditRecordCount(): number {
+    const row = this.database
+      .prepare("SELECT COUNT(*) AS count FROM events")
+      .get() as Row;
+    return Number(row.count);
+  }
+
+  auditRecordsPage(
+    options: { afterId?: number; limit?: number } = {},
+  ): AuditRecord[] {
+    const afterId = Math.max(0, Math.floor(options.afterId ?? 0));
+    const limit = Math.min(
+      1_000,
+      Math.max(1, Math.floor(options.limit ?? 250)),
+    );
+    return (
+      this.database
+        .prepare(
+          `SELECT id, event_type, work_item_id, actor, payload_json, created_at
+           FROM events
+           WHERE id > ?
+           ORDER BY id ASC
+           LIMIT ?`,
+        )
+        .all(afterId, limit) as Row[]
+    ).map(asAuditRecord);
+  }
+
+  claimOutboxBatch(input: {
+    owner: string;
+    limit?: number;
+    claimSeconds?: number;
+  }): OutboxDelivery[] {
+    return this.transact(() => {
+      const owner = assertText(input.owner, "owner");
+      const limit = Math.min(
+        100,
+        Math.max(1, Math.floor(input.limit ?? 25)),
+      );
+      const staleBefore = new Date(
+        Date.now() -
+          Math.min(
+            3_600,
+            Math.max(10, Math.floor(input.claimSeconds ?? 60)),
+          ) *
+            1_000,
+      ).toISOString();
+      this.database
+        .prepare(`
+          UPDATE outbox
+          SET claimed_at = NULL, claim_owner = NULL
+          WHERE dispatched_at IS NULL
+            AND dead_lettered_at IS NULL
+            AND claimed_at IS NOT NULL
+            AND claimed_at <= ?
+        `)
+        .run(staleBefore);
+      const rows = this.database
+        .prepare(`
+          SELECT *
+          FROM outbox
+          WHERE dispatched_at IS NULL
+            AND dead_lettered_at IS NULL
+            AND claimed_at IS NULL
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          ORDER BY id
+          LIMIT ?
+        `)
+        .all(now(), limit) as Row[];
+      if (rows.length === 0) return [];
+      const claimedAt = now();
+      const claim = this.database.prepare(`
+        UPDATE outbox
+        SET claimed_at = ?, claim_owner = ?
+        WHERE id = ?
+          AND dispatched_at IS NULL
+          AND dead_lettered_at IS NULL
+          AND claimed_at IS NULL
+      `);
+      return rows.flatMap((row) => {
+        const result = claim.run(claimedAt, owner, Number(row.id));
+        if (Number(result.changes) === 0) return [];
+        const mapped = asOutbox({ ...row, claimed_at: claimedAt, claim_owner: owner });
+        return [
+          {
+            id: mapped.id,
+            eventId: mapped.eventId,
+            eventType: mapped.eventType,
+            payload: mapped.payload,
+            createdAt: mapped.createdAt,
+            attemptCount: mapped.attemptCount,
+          },
+        ];
+      });
     });
+  }
+
+  acknowledgeOutbox(input: { id: number; owner: string }): OutboxRecord {
+    return this.transact(() => {
+      const stamp = now();
+      const update = this.database
+        .prepare(`
+          UPDATE outbox
+          SET dispatched_at = ?, claimed_at = NULL, claim_owner = NULL,
+              next_attempt_at = NULL, last_error_code = NULL
+          WHERE id = ? AND claim_owner = ?
+            AND dispatched_at IS NULL AND dead_lettered_at IS NULL
+        `)
+        .run(stamp, input.id, assertText(input.owner, "owner"));
+      if (Number(update.changes) === 0) {
+        throw new Error("OUTBOX_CLAIM_NOT_OWNED");
+      }
+      return asOutbox(
+        this.database.prepare("SELECT * FROM outbox WHERE id = ?").get(
+          input.id,
+        ) as Row,
+      );
+    });
+  }
+
+  failOutbox(input: {
+    id: number;
+    owner: string;
+    errorCode: string;
+    maxAttempts?: number;
+    baseBackoffSeconds?: number;
+  }): OutboxRecord {
+    return this.transact(() => {
+      const row = this.database
+        .prepare(`
+          SELECT * FROM outbox
+          WHERE id = ? AND claim_owner = ?
+            AND dispatched_at IS NULL AND dead_lettered_at IS NULL
+        `)
+        .get(input.id, assertText(input.owner, "owner")) as Row | undefined;
+      if (!row) throw new Error("OUTBOX_CLAIM_NOT_OWNED");
+      const attemptCount = Number(row.attempt_count ?? 0) + 1;
+      const maxAttempts = Math.min(
+        20,
+        Math.max(1, Math.floor(input.maxAttempts ?? 5)),
+      );
+      const errorCode = /^[A-Z][A-Z0-9_]{1,79}$/u.test(input.errorCode)
+        ? input.errorCode
+        : "OUTBOX_HANDLER_FAILED";
+      const deadLetteredAt =
+        attemptCount >= maxAttempts ? now() : null;
+      const base = Math.min(
+        3_600,
+        Math.max(1, Math.floor(input.baseBackoffSeconds ?? 2)),
+      );
+      const nextAttemptAt = deadLetteredAt
+        ? null
+        : new Date(
+            Date.now() +
+              Math.min(3_600, base * 2 ** (attemptCount - 1)) * 1_000,
+          ).toISOString();
+      this.database
+        .prepare(`
+          UPDATE outbox
+          SET attempt_count = ?, next_attempt_at = ?,
+              last_error_code = ?, dead_lettered_at = ?,
+              claimed_at = NULL, claim_owner = NULL
+          WHERE id = ?
+        `)
+        .run(
+          attemptCount,
+          nextAttemptAt,
+          errorCode,
+          deadLetteredAt,
+          input.id,
+        );
+      return asOutbox(
+        this.database.prepare("SELECT * FROM outbox WHERE id = ?").get(
+          input.id,
+        ) as Row,
+      );
+    });
+  }
+
+  listOutbox(
+    options: { deadLettersOnly?: boolean; limit?: number } = {},
+  ): OutboxRecord[] {
+    const limit = Math.min(
+      1_000,
+      Math.max(1, Math.floor(options.limit ?? 100)),
+    );
+    return (
+      this.database
+        .prepare(`
+          SELECT * FROM outbox
+          WHERE (? = 0 OR dead_lettered_at IS NOT NULL)
+          ORDER BY id DESC
+          LIMIT ?
+        `)
+        .all(options.deadLettersOnly ? 1 : 0, limit) as Row[]
+    ).map(asOutbox);
+  }
+
+  retryDeadLetter(input: {
+    id: number;
+    actor: string;
+    idempotencyKey: string;
+  }): OutboxRecord {
+    return this.command(input.idempotencyKey, "outbox.dead-letter.retry", () => {
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("OUTBOX_RETRY_REQUIRES_HUMAN");
+      }
+      const update = this.database
+        .prepare(`
+          UPDATE outbox
+          SET attempt_count = 0, next_attempt_at = NULL,
+              last_error_code = NULL, dead_lettered_at = NULL,
+              claimed_at = NULL, claim_owner = NULL
+          WHERE id = ? AND dead_lettered_at IS NOT NULL
+        `)
+        .run(input.id);
+      if (Number(update.changes) === 0) {
+        throw new Error("OUTBOX_DEAD_LETTER_NOT_FOUND");
+      }
+      this.event("outbox.dead-letter.retried", null, input.actor);
+      return asOutbox(
+        this.database.prepare("SELECT * FROM outbox WHERE id = ?").get(
+          input.id,
+        ) as Row,
+      );
+    });
+  }
+
+  latestScheduleTick(scheduleId: string): ScheduleTickRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT * FROM schedule_ticks
+        WHERE schedule_id = ?
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(scheduleId) as Row | undefined;
+    return row ? asScheduleTick(row) : null;
+  }
+
+  activeScheduleTick(scheduleId: string): ScheduleTickRecord | null {
+    const row = this.database
+      .prepare(`
+        SELECT * FROM schedule_ticks
+        WHERE schedule_id = ? AND status = 'started'
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(scheduleId) as Row | undefined;
+    return row ? asScheduleTick(row) : null;
+  }
+
+  beginScheduleTick(input: {
+    scheduleId: string;
+    tickKey: string;
+    workItemId: string | null;
+    status?: "started" | "skipped_no_work" | "skipped_overlap";
+  }): ScheduleTickRecord {
+    return this.transact(() => {
+      const scheduleId = assertText(input.scheduleId, "scheduleId");
+      const tickKey = assertText(input.tickKey, "tickKey");
+      if (input.workItemId) this.get(input.workItemId);
+      const status = input.status ?? "started";
+      const id = `schedule-tick-${createHash("sha256")
+        .update(`${scheduleId}\0${tickKey}`)
+        .digest("hex")
+        .slice(0, 24)}`;
+      const stamp = now();
+      const insert = this.database
+        .prepare(`
+          INSERT OR IGNORE INTO schedule_ticks(
+            id, schedule_id, tick_key, status, work_item_id,
+            started_at, finished_at, error_code
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+        `)
+        .run(
+          id,
+          scheduleId,
+          tickKey,
+          status,
+          input.workItemId,
+          stamp,
+          status === "started" ? null : stamp,
+        );
+      const row = this.database
+        .prepare(`
+          SELECT * FROM schedule_ticks
+          WHERE schedule_id = ? AND tick_key = ?
+        `)
+        .get(scheduleId, tickKey) as Row;
+      if (Number(insert.changes) > 0) {
+        this.event(
+          `schedule.tick.${status}`,
+          input.workItemId,
+          "system:scheduler",
+          {
+            scheduleId,
+            tickKey,
+            status,
+          },
+        );
+      }
+      return asScheduleTick(row);
+    });
+  }
+
+  finishScheduleTick(input: {
+    id: string;
+    status: "succeeded" | "failed";
+    errorCode?: string;
+  }): ScheduleTickRecord {
+    return this.transact(() => {
+      const errorCode =
+        input.errorCode &&
+        /^[A-Z][A-Z0-9_]{1,79}$/u.test(input.errorCode)
+          ? input.errorCode
+          : input.status === "failed"
+            ? "SCHEDULE_RUN_FAILED"
+            : null;
+      const update = this.database
+        .prepare(`
+          UPDATE schedule_ticks
+          SET status = ?, finished_at = ?, error_code = ?
+          WHERE id = ? AND status = 'started'
+        `)
+        .run(input.status, now(), errorCode, input.id);
+      const row = this.database
+        .prepare("SELECT * FROM schedule_ticks WHERE id = ?")
+        .get(input.id) as Row | undefined;
+      if (!row) throw new Error(`Unknown schedule tick '${input.id}'.`);
+      if (Number(update.changes) > 0) {
+        this.event(
+          `schedule.tick.${input.status}`,
+          row.work_item_id ? String(row.work_item_id) : null,
+          "system:scheduler",
+          {
+            scheduleId: String(row.schedule_id),
+            tickKey: String(row.tick_key),
+            status: input.status,
+            ...(errorCode ? { errorCode } : {}),
+          },
+        );
+      }
+      return asScheduleTick(row);
+    });
+  }
+
+  listScheduleTicks(scheduleId?: string): ScheduleTickRecord[] {
+    const rows = scheduleId
+      ? (this.database
+          .prepare(`
+            SELECT * FROM schedule_ticks
+            WHERE schedule_id = ?
+            ORDER BY started_at DESC, id DESC
+          `)
+          .all(scheduleId) as Row[])
+      : (this.database
+          .prepare(`
+            SELECT * FROM schedule_ticks
+            ORDER BY started_at DESC, id DESC
+          `)
+          .all() as Row[]);
+    return rows.map(asScheduleTick);
   }
 
   private command<T>(
@@ -610,6 +1093,62 @@ export class ControlPlane {
     });
   }
 
+  requestRunCancellation(input: {
+    id: string;
+    actor: string;
+    idempotencyKey: string;
+  }): { workItemId: string; runId: string; requestedAt: string } {
+    return this.command(input.idempotencyKey, "run.cancel.request", () => {
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("RUN_CANCELLATION_REQUIRES_HUMAN");
+      }
+      const current = this.get(input.id);
+      if (current.status !== "in_progress") {
+        throw new Error("Only in-progress work can request cancellation.");
+      }
+      const run = this.database
+        .prepare(`
+          SELECT id, cancel_requested_at
+          FROM runs
+          WHERE work_item_id = ? AND status IN ('running', 'waiting')
+          ORDER BY generation DESC
+          LIMIT 1
+        `)
+        .get(input.id) as Row | undefined;
+      if (!run) throw new Error("No active run exists.");
+      const requestedAt = run.cancel_requested_at
+        ? String(run.cancel_requested_at)
+        : now();
+      this.database
+        .prepare(`
+          UPDATE runs
+          SET cancel_requested_at = COALESCE(cancel_requested_at, ?),
+              cancel_requested_by = COALESCE(cancel_requested_by, ?)
+          WHERE id = ?
+        `)
+        .run(requestedAt, input.actor, String(run.id));
+      this.event("run.cancel.requested", input.id, input.actor, {
+        runId: String(run.id),
+      });
+      return {
+        workItemId: input.id,
+        runId: String(run.id),
+        requestedAt,
+      };
+    });
+  }
+
+  isRunCancellationRequested(runId: string): boolean {
+    const row = this.database
+      .prepare(`
+        SELECT cancel_requested_at
+        FROM runs
+        WHERE id = ? AND status IN ('running', 'waiting')
+      `)
+      .get(runId) as Row | undefined;
+    return Boolean(row?.cancel_requested_at);
+  }
+
   heartbeat(input: {
     leaseId: string;
     generation: number;
@@ -764,6 +1303,14 @@ export class ControlPlane {
       for (const row of expired) {
         const stamp = now();
         const workItemId = String(row.work_item_id);
+        const runningInvocations = this.database
+          .prepare(`
+            SELECT id
+            FROM model_invocations
+            WHERE attempt_id = ? AND status = 'running'
+            ORDER BY id
+          `)
+          .all(String(row.attempt_id)) as Row[];
         this.database
           .prepare(`
             UPDATE attempts
@@ -771,6 +1318,13 @@ export class ControlPlane {
                 error_code = 'LEASE_EXPIRED',
                 error_message = 'The worker lease expired before completion.'
             WHERE id = ? AND status = 'running'
+          `)
+          .run(stamp, String(row.attempt_id));
+        this.database
+          .prepare(`
+            UPDATE model_invocations
+            SET status = 'abandoned', finished_at = ?
+            WHERE attempt_id = ? AND status = 'running'
           `)
           .run(stamp, String(row.attempt_id));
         this.database
@@ -799,6 +1353,13 @@ export class ControlPlane {
           runId: String(row.run_id),
           generation: Number(row.generation),
         });
+        for (const invocation of runningInvocations) {
+          this.event("model.invocation.abandoned", workItemId, actor, {
+            invocationId: String(invocation.id),
+            status: "abandoned",
+            measurementStatus: "unknown",
+          });
+        }
         recovered.push(workItemId);
       }
       return recovered;
@@ -1174,6 +1735,151 @@ export class ControlPlane {
     });
   }
 
+  archive(input: {
+    id: string;
+    actor: string;
+    idempotencyKey: string;
+  }): WorkItem {
+    return this.command(input.idempotencyKey, "work.archive", () => {
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("WORK_ARCHIVE_REQUIRES_HUMAN");
+      }
+      const current = this.get(input.id);
+      if (!["done", "canceled"].includes(current.status)) {
+        throw new Error("Only completed or canceled work can be archived.");
+      }
+      if (!current.archivedAt) {
+        this.database
+          .prepare(`
+            UPDATE work_items
+            SET archived_at = ?, version = version + 1, updated_at = ?
+            WHERE id = ?
+          `)
+          .run(now(), now(), input.id);
+        this.event("work.archived", input.id, input.actor);
+      }
+      return this.get(input.id);
+    });
+  }
+
+  startInvocation(input: {
+    attemptId: string;
+    engineId: string;
+    modelId: string;
+  }): ModelInvocationRecord {
+    return this.transact(() => {
+      const attempt = this.database
+        .prepare(`
+          SELECT a.id, r.work_item_id
+          FROM attempts a
+          JOIN runs r ON r.id = a.run_id
+          WHERE a.id = ? AND a.status = 'running'
+        `)
+        .get(input.attemptId) as Row | undefined;
+      if (!attempt) throw new Error("Invocation attempt is not active.");
+      const id = this.nextId("invocation");
+      const stamp = now();
+      this.database
+        .prepare(`
+          INSERT INTO model_invocations(
+            id, attempt_id, engine_id, model_id, status, input_tokens,
+            output_tokens, cost, measurement_status, started_at, finished_at
+          ) VALUES (?, ?, ?, ?, 'running', NULL, NULL, NULL, 'unknown', ?, NULL)
+        `)
+        .run(
+          id,
+          input.attemptId,
+          assertText(input.engineId, "engineId"),
+          assertText(input.modelId, "modelId"),
+          stamp,
+        );
+      this.event(
+        "model.invocation.started",
+        String(attempt.work_item_id),
+        "runner:local",
+        {
+          invocationId: id,
+          engineId: input.engineId,
+          modelId: input.modelId,
+        },
+      );
+      return asInvocation(
+        this.database
+          .prepare("SELECT * FROM model_invocations WHERE id = ?")
+          .get(id) as Row,
+      );
+    });
+  }
+
+  finishInvocation(input: {
+    id: string;
+    status: "succeeded" | "failed" | "canceled";
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cost: number | null;
+    measurementStatus: "measured" | "estimated" | "unknown";
+  }): ModelInvocationRecord {
+    return this.transact(() => {
+      for (const [label, value] of [
+        ["inputTokens", input.inputTokens],
+        ["outputTokens", input.outputTokens],
+      ] as const) {
+        if (
+          value !== null &&
+          (!Number.isInteger(value) || value < 0)
+        ) {
+          throw new Error(`${label} must be a non-negative integer or null.`);
+        }
+      }
+      if (
+        input.cost !== null &&
+        (!Number.isFinite(input.cost) || input.cost < 0)
+      ) {
+        throw new Error("cost must be a finite non-negative number or null.");
+      }
+      const stamp = now();
+      const update = this.database
+        .prepare(`
+          UPDATE model_invocations
+          SET status = ?, input_tokens = ?, output_tokens = ?, cost = ?,
+              measurement_status = ?, finished_at = ?
+          WHERE id = ? AND status = 'running'
+        `)
+        .run(
+          input.status,
+          input.inputTokens,
+          input.outputTokens,
+          input.cost,
+          input.measurementStatus,
+          stamp,
+          input.id,
+        );
+      const row = this.database
+        .prepare(`
+          SELECT mi.*, r.work_item_id
+          FROM model_invocations mi
+          JOIN attempts a ON a.id = mi.attempt_id
+          JOIN runs r ON r.id = a.run_id
+          WHERE mi.id = ?
+        `)
+        .get(input.id) as Row | undefined;
+      if (!row) throw new Error(`Unknown model invocation '${input.id}'.`);
+      if (Number(update.changes) > 0) {
+        this.event(
+          `model.invocation.${input.status}`,
+          String(row.work_item_id),
+          "runner:local",
+          {
+            invocationId: input.id,
+            status: input.status,
+            measurementStatus: input.measurementStatus,
+          },
+        );
+      }
+      return asInvocation(row);
+    });
+  }
+
   recordInvocation(input: {
     attemptId: string;
     engineId: string;
@@ -1184,31 +1890,34 @@ export class ControlPlane {
     cost: number | null;
     measurementStatus: "measured" | "estimated" | "unknown";
   }): string {
-    return this.transact(() => {
-      const id = this.nextId("invocation");
-      const stamp = now();
-      this.database
-        .prepare(`
-          INSERT INTO model_invocations(
-            id, attempt_id, engine_id, model_id, status, input_tokens,
-            output_tokens, cost, measurement_status, started_at, finished_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        .run(
-          id,
-          input.attemptId,
-          input.engineId,
-          input.modelId,
-          input.status,
-          input.inputTokens,
-          input.outputTokens,
-          input.cost,
-          input.measurementStatus,
-          stamp,
-          stamp,
-        );
-      return id;
+    const started = this.startInvocation(input);
+    this.finishInvocation({
+      id: started.id,
+      status: input.status,
+      inputTokens: input.inputTokens,
+      outputTokens: input.outputTokens,
+      cost: input.cost,
+      measurementStatus: input.measurementStatus,
     });
+    return started.id;
+  }
+
+  listInvocations(attemptId?: string): ModelInvocationRecord[] {
+    const rows = attemptId
+      ? (this.database
+          .prepare(`
+            SELECT * FROM model_invocations
+            WHERE attempt_id = ?
+            ORDER BY started_at, id
+          `)
+          .all(attemptId) as Row[])
+      : (this.database
+          .prepare(`
+            SELECT * FROM model_invocations
+            ORDER BY started_at, id
+          `)
+          .all() as Row[]);
+    return rows.map(asInvocation);
   }
 
   approveToolCall(input: {
@@ -1427,22 +2136,90 @@ export class ControlPlane {
     return asWorkItem(row);
   }
 
-  list(): WorkItem[] {
+  list(options: { includeArchived?: boolean } = {}): WorkItem[] {
     return (
       this.database
         .prepare(`
           SELECT * FROM work_items
+          WHERE archived_at IS NULL OR ? = 1
           ORDER BY
             CASE availability WHEN 'ready' THEN 0 ELSE 1 END,
             priority DESC,
             updated_at DESC
         `)
-        .all() as Row[]
+        .all(options.includeArchived ? 1 : 0) as Row[]
     ).map(asWorkItem);
   }
 
-  dashboard(): DashboardProjection {
-    const workItems = this.list();
+  listPage(
+    options: {
+      cursor?: string;
+      limit?: number;
+      includeCompleted?: boolean;
+      includeArchived?: boolean;
+    } = {},
+  ): WorkItemPage {
+    const cursor = parseWorkCursor(options.cursor);
+    const limit = Math.min(
+      500,
+      Math.max(1, Math.floor(options.limit ?? 100)),
+    );
+    const clauses = [
+      options.includeArchived ? "1 = 1" : "archived_at IS NULL",
+      options.includeCompleted
+        ? "1 = 1"
+        : "status NOT IN ('done', 'canceled')",
+      cursor
+        ? "(created_at < ? OR (created_at = ? AND id < ?))"
+        : "1 = 1",
+    ];
+    const parameters: Array<string | number> = [];
+    if (cursor) {
+      parameters.push(cursor.createdAt, cursor.createdAt, cursor.id);
+    }
+    parameters.push(limit + 1);
+    const rows = this.database
+      .prepare(`
+        SELECT * FROM work_items
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+      `)
+      .all(...parameters) as Row[];
+    const hasNext = rows.length > limit;
+    const pageRows = rows.slice(0, limit);
+    return {
+      items: pageRows.map(asWorkItem),
+      nextCursor:
+        hasNext && pageRows.length > 0
+          ? workCursor(pageRows.at(-1)!)
+          : null,
+    };
+  }
+
+  nextClaimableWork(): WorkItem | null {
+    const row = this.database
+      .prepare(`
+        SELECT * FROM work_items
+        WHERE archived_at IS NULL
+          AND availability = 'ready'
+          AND status IN ('ready', 'changes_requested')
+        ORDER BY priority DESC, updated_at ASC, id ASC
+        LIMIT 1
+      `)
+      .get() as Row | undefined;
+    return row ? asWorkItem(row) : null;
+  }
+
+  dashboard(
+    options: { cursor?: string; limit?: number } = {},
+  ): DashboardProjection {
+    const page = this.listPage({
+      cursor: options.cursor,
+      limit: options.limit ?? 200,
+      includeCompleted: true,
+    });
+    const workItems = page.items;
     const userActions = workItems
       .filter(({ status }) => !["done", "canceled"].includes(status))
       .map((item) => this.projectAction(item))
@@ -1477,6 +2254,7 @@ export class ControlPlane {
         actor: String(event.actor),
         createdAt: String(event.created_at),
       })),
+      page: { nextCursor: page.nextCursor },
     };
   }
 

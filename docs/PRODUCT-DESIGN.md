@@ -1688,3 +1688,32 @@ Executable pinning is not an OS sandbox. Backups still exclude the user's
 project/Git files and hosted disaster recovery. Dead-letter policy, active-run
 termination, OS sandboxing, signed releases/SBOM, registry publication, and a
 broad clean-OS matrix remain incomplete.
+
+# 0.0.6 authoritative implementation amendment — 2026-07-30
+
+This amendment supersedes the 0.0.5 implementation-status paragraph above:
+
+- `runtime.json` is validated against its complete checked-in JSON Schema
+  before adapter construction. Semantic checks additionally reject duplicate
+  engine/runner ids and dangling runner engine references.
+- A model invocation is persisted as `running` before inference starts.
+  Success, failure, cancellation, and expired-lease recovery close it
+  explicitly; unknown usage and cost remain unknown.
+- Ctrl+C/SIGTERM, dashboard cancellation, and a second CLI use the same
+  durable Control Plane cancellation command and engine `AbortSignal`.
+- WorkItem reads support stable cursor pages. Human archive hides terminal
+  items without deleting their Runs, artifacts, or audit evidence. Audit JSONL
+  export pages and appends rather than loading the complete ledger in memory.
+- Outbox consumers claim bounded batches, acknowledge success, retry with
+  backoff, dead-letter exhausted delivery, and permit explicit human replay.
+  No network dispatcher is enabled by default.
+- The first local controller scheduler supports bounded interval RRULEs,
+  durable idempotent ticks, and overlap prevention. Default proposals contain
+  no schedules. Each due tick checks for claimable work before model inference,
+  and an empty queue records `skipped_no_work` with zero model starts.
+
+These controls add no paid provider call, cloud resource, runtime dependency,
+or automatic background service. Broader recurrence/missed-tick semantics,
+service installation, provider-native schedule reconciliation, external
+AgentHost adapters, OS sandboxing, signed releases/SBOM, and registry
+publication remain separate work.

@@ -7,7 +7,7 @@
   projection boundaries.
 - OrgSpec, the SQLite Control Plane, the safe Tool Runtime, recoverable apply,
   operational backup/audit controls, the reviewed-work dashboard, and a
-  dependency-free package build are present at `0.0.5-alpha.1`.
+  dependency-free package build are present at `0.0.6-alpha.1`.
 - `ModelEngine`, `AgentHost`, and `ManagedRunner` are separate contracts;
   generic and fake engines are the primary foundation, while Codex and Claude
   Code remain optional host adapters.
@@ -39,11 +39,16 @@ git status --short
 9. Executable-digest-pinned command engines, dedicated engine cwd,
    maintenance lock, explicit new-run pause/resume, and bounded no-redirect
    HTTP responses.
+10. Runtime schema validation, durable invocation start/finish and shared
+    cancellation, cursor pagination/archive, streaming audit export, retryable
+    outbox delivery, and an opt-in no-work-safe local scheduler.
 
 ## Next implementation slice
 
-1. Add attempt-level dead-letter policy and active-run cancellation semantics.
-2. Add no-work scheduling and empty-start accounting.
+1. Add attempt-level retry/dead-letter policy distinct from the external
+   outbox.
+2. Extend the local scheduler beyond interval RRULEs and define missed-tick
+   service-installation behavior.
 3. Add provider failover canaries with permission revalidation.
 4. Add command/network tools only behind separate policy and sandbox ADRs.
 5. Add a second protocol-native HTTP ModelEngine adapter and optional AgentHost
@@ -52,7 +57,7 @@ git status --short
 
 ## Rollback
 
-Database migration 6 marks the trust-boundary slice; older known schemas
+Database migration 7 marks the durable-runtime slice; older known schemas
 receive an automatic SQLite snapshot before migration. File transactions
 recover automatically from `.chartermesh/.transactions`; use
 `chartermesh recover` rather than deleting journal or backup files. Revert

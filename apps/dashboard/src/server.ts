@@ -8,6 +8,7 @@ import {
   openControlPlaneDatabase,
   type RuntimeHealth,
 } from "../../../packages/control-plane/src/index.ts";
+import { parseRuntimeConfig } from "../../../packages/runtime/src/index.ts";
 
 const PUBLIC_DIRECTORY = fileURLToPath(new URL("../public/", import.meta.url));
 const MAX_BODY_BYTES = 128 * 1024;
@@ -123,15 +124,8 @@ function runtimeHealth(target: string): RuntimeHealth[] {
   }
 
   try {
-    const config = JSON.parse(readFileSync(runtimePath, "utf8")) as {
-      modelEngines?: Array<{
-        id?: string;
-        adapter?: string;
-        apiKeyEnv?: string;
-      }>;
-      managedRunners?: Array<{ id?: string; modelEngineRef?: string }>;
-    };
-    const engines: RuntimeHealth[] = (config.modelEngines ?? []).map((engine) => {
+    const config = parseRuntimeConfig(readFileSync(runtimePath, "utf8"));
+    const engines: RuntimeHealth[] = config.modelEngines.map((engine) => {
       const requiresKey = Boolean(engine.apiKeyEnv);
       const keyReady = !engine.apiKeyEnv || Boolean(process.env[engine.apiKeyEnv]);
       return {
@@ -144,7 +138,7 @@ function runtimeHealth(target: string): RuntimeHealth[] {
       };
     });
     const engineReady = engines.some(({ status }) => status === "ready");
-    const runners: RuntimeHealth[] = (config.managedRunners ?? []).map((runner) => ({
+    const runners: RuntimeHealth[] = config.managedRunners.map((runner) => ({
       id: runner.id ?? "unnamed-runner",
       kind: "managed_runner",
       status: engineReady ? "ready" : "configuration_required",
@@ -159,7 +153,7 @@ function runtimeHealth(target: string): RuntimeHealth[] {
         id: "runtime-config",
         kind: "model_engine",
         status: "configuration_required",
-        detail: "runtime.json is not valid JSON.",
+        detail: "runtime.json does not satisfy the runtime schema.",
       },
     ];
   }
@@ -279,7 +273,17 @@ export async function startDashboard(
 
     try {
       if (method === "GET" && url.pathname === "/api/dashboard") {
-        json(response, 200, controlPlane.dashboard());
+        const requestedLimit = Number(url.searchParams.get("limit") ?? 200);
+        json(
+          response,
+          200,
+          controlPlane.dashboard({
+            cursor: url.searchParams.get("cursor") ?? undefined,
+            limit: Number.isFinite(requestedLimit)
+              ? requestedLimit
+              : 200,
+          }),
+        );
         return;
       }
       if (method === "GET" && url.pathname === "/api/runtime") {
@@ -309,7 +313,7 @@ export async function startDashboard(
         return;
       }
       const actionMatch = url.pathname.match(
-        /^\/api\/work-items\/([^/]+)\/(triage|run|retry|decision|complete)$/u,
+        /^\/api\/work-items\/([^/]+)\/(triage|run|cancel|retry|decision|complete|archive)$/u,
       );
       if (method === "POST" && actionMatch) {
         const id = decodeURIComponent(actionMatch[1]);
@@ -336,7 +340,22 @@ export async function startDashboard(
         }
         if (action === "run") {
           const { runWork } = await import("../../cli/src/main.ts");
-          json(response, 200, await runWork(target, id, { quiet: true }));
+          void runWork(target, id, { quiet: true }).catch(() => {
+            // Durable Run/Attempt records expose the failure.
+          });
+          json(response, 202, { workItemId: id, started: true });
+          return;
+        }
+        if (action === "cancel") {
+          json(
+            response,
+            202,
+            controlPlane.requestRunCancellation({
+              id,
+              actor: "human:dashboard",
+              idempotencyKey,
+            }),
+          );
           return;
         }
         if (action === "retry") {
@@ -387,6 +406,18 @@ export async function startDashboard(
             response,
             200,
             controlPlane.complete({
+              id,
+              actor: "human:dashboard",
+              idempotencyKey,
+            }),
+          );
+          return;
+        }
+        if (action === "archive") {
+          json(
+            response,
+            200,
+            controlPlane.archive({
               id,
               actor: "human:dashboard",
               idempotencyKey,

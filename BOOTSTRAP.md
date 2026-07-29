@@ -146,6 +146,8 @@ Never report credential values or unrelated absolute paths.
   or projections, never the source of truth.
 - State changes use commands with actor identity and idempotency.
 - Claim atomically creates Run, Attempt, Lease, and generation.
+- A model invocation is recorded as running before inference and is closed as
+  succeeded, failed, canceled, or abandoned.
 - Stale generations cannot submit artifacts.
 - Human review binds the exact immutable artifact hash.
 - Tool availability, workspace roots, and iteration limits come from OrgSpec.
@@ -158,6 +160,8 @@ Never report credential values or unrelated absolute paths.
 - External side effects require their own human approval.
 - Provider features enter through adapters and capability manifests.
 - Default bootstrap and tests are offline and free.
+- Default proposals contain no active schedules. A controller schedule checks
+  for claimable work before starting a model.
 
 ## Failure handling
 
@@ -171,6 +175,8 @@ Never report credential values or unrelated absolute paths.
   `ModelEngine` adapter; do not add provider fields to OrgSpec.
 - Failed or expired run: preserve the failure, use `retry`, and create a new
   generation.
+- Active run no longer needed: use `cancel --id WORK`; dashboard cancel and
+  foreground Ctrl+C write the same Control Plane cancellation request.
 - `TOOL_APPROVAL_REQUIRED`: show the exact call hash and tool name, obtain a
   human `approve-tool` command, then use `retry` and start a new generation.
 - Interrupted file apply: run `doctor` or `recover`; do not delete the journal

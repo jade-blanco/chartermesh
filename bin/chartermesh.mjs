@@ -11,7 +11,23 @@ main().then(
     process.exitCode = code;
   },
   (error) => {
-    console.error(error instanceof Error ? error.message : error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (process.argv.includes("--json")) {
+      console.log(
+        JSON.stringify(
+          {
+            apiVersion: "chartermesh.dev/cli/v1alpha1",
+            command: process.argv[2] ?? "unknown",
+            ok: false,
+            error: { message },
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.error(message);
+    }
     process.exitCode = 1;
   },
 );

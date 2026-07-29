@@ -91,6 +91,11 @@ API reads require the per-process browser session token; mutations additionally
 require same-origin JSON and an idempotency key. General API, mutation, and
 model-run request rates are bounded independently.
 
+`doctor` validates all of `runtime.json` against the checked-in runtime schema,
+then checks adapter-specific settings and references. A hand-edited unknown
+field, invalid value, duplicate id, or dangling runner reference is reported
+before a model process or HTTP request can start.
+
 ## 5. Configure a live engine
 
 ```powershell
@@ -146,6 +151,21 @@ node bin/chartermesh.mjs evaluate-model `
 
 The `--live` flag is an explicit model-call opt-in. The evaluation uses
 synthetic prompts only. See `MODEL-EVALUATION.md`.
+
+## 7. Optional operations
+
+These controls are local and disabled or inactive until explicitly used:
+
+```powershell
+node bin/chartermesh.mjs cancel --id work-000001 --target C:\path\to\target
+node bin/chartermesh.mjs list --target C:\path\to\target --active-only --limit 100 --json
+node bin/chartermesh.mjs outbox list --target C:\path\to\target --dead-letters --json
+node bin/chartermesh.mjs scheduler tick --target C:\path\to\target --json
+```
+
+The default organization contains no schedules. An active local controller
+schedule checks the queue before model inference and records an empty tick
+without a model start. See `USAGE.md` before enabling a watcher.
 
 ## Removal
 

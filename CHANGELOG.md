@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.6-alpha.1 — 2026-07-30
+
+- Validated the complete runtime configuration against its dependency-free
+  JSON Schema, including unique ids and managed-runner engine references.
+- Created durable `running` model-invocation records before inference and
+  unified Ctrl+C, dashboard, and separate-CLI cancellation through one Control
+  Plane command.
+- Added stable cursor pagination, explicit terminal-work archive, and
+  incremental allowlisted JSONL audit export.
+- Completed outbox delivery claims, acknowledgements, exponential retry,
+  dead-letter state, and explicit human replay.
+- Added an opt-in local interval scheduler with durable tick records, overlap
+  control, and verified zero model starts when no work is claimable.
+- Expanded CLI and dashboard actions plus offline E2E coverage for malformed
+  runtime files, scheduling, archiving, and cross-process cancellation.
+
 ## 0.0.5-alpha.1 — 2026-07-29
 
 - Pinned every command-process executable to the SHA-256 approved in the

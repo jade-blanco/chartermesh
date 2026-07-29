@@ -18,3 +18,15 @@ export {
   type ToolLoopResult,
   type ToolRuntimeOptions,
 } from "./tool-runtime.ts";
+export {
+  RuntimeConfigParseError,
+  parseRuntimeConfig,
+  validateRuntimeConfigSchema,
+  type ModelPricing,
+  type RuntimeConfig,
+  type RuntimeModelEngine,
+} from "./runtime-config.ts";
+export {
+  evaluateIntervalSchedule,
+  type IntervalScheduleEvaluation,
+} from "./scheduler.ts";

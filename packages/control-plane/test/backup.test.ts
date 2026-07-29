@@ -98,7 +98,7 @@ test("Control Plane backups are hashed, integrity-checked snapshots", () => {
       backupDirectory,
       "manual",
     );
-    assert.equal(manifest.schemaVersion, 6);
+    assert.equal(manifest.schemaVersion, 7);
     assert.equal(manifest.workItemCount, 1);
     assert.equal(manifest.artifacts?.length, 1);
     assert.equal(manifest.artifacts?.[0]?.sha256, submission.sha256);
@@ -145,7 +145,7 @@ test("opening an older schema creates a migration safety backup", () => {
     const version = migrated
       .prepare("SELECT MAX(version) AS version FROM schema_migrations")
       .get() as { version: number };
-    assert.equal(Number(version.version), 6);
+    assert.equal(Number(version.version), 7);
     const backups = listControlPlaneBackups(join(directory, "backups"));
     assert.equal(backups.length, 1);
     assert.equal(backups[0]?.reason, "migration");

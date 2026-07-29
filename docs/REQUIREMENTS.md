@@ -18,7 +18,7 @@ Status values: `done`, `partial`, `planned`, `decision`.
 | DATA-002 | Events are append-only and command projections update atomically | 2 | command transactions, events, transactional outbox | done |
 | RUN-001 | Claim creates Run, Attempt, and Lease atomically | 2 | Control Plane lifecycle test | done |
 | RUN-002 | Fencing rejects stale workers | 2 | stale-generation artifact regression test | done |
-| RUN-003 | No-work controller starts zero models | 2 | scheduler tests | planned |
+| RUN-003 | No-work controller starts zero models | 2 | scheduler unit and CLI E2E invocation-count tests | done |
 | GOV-001 | Human approval cannot be replaced by a model or host prompt | 1/2 | schema, install gate, tool-call approval actor checks | done |
 | GOV-002 | External side effects require a separate execution approval | 2 | policy state-machine tests | planned |
 | GOV-003 | Permission-expanding provider fallback is rejected | 1/4 | validator test | done |
@@ -57,6 +57,13 @@ Status values: `done`, `partial`, `planned`, `decision`.
 | ENGINE-006 | Local command engines execute only an approved executable digest from a dedicated cwd | 4 | command adapter unit and CLI E2E | done |
 | OPS-001 | Restore rejects concurrent writers and operators can explicitly pause new run claims | 2/6 | maintenance and pause unit/CLI tests | done |
 | HTTP-001 | HTTP model inference rejects redirects and oversized response bodies | 4 | OpenAI-compatible adapter tests | done |
+| CONFIG-001 | Runtime JSON is schema-validated before adapter load or inference | 1/4 | dependency-free parser and invalid-runtime CLI E2E | done |
+| RUN-005 | Model invocation is durable before call and closes on success, failure, cancellation, or abandonment | 2/4 | invocation lifecycle and cancellation E2E | done |
+| RUN-006 | CLI, dashboard, and foreground signals use one durable cancellation command | 2/5 | service, dashboard, and separate-CLI cancellation tests | done |
+| DATA-003 | Work lists page by stable cursor and terminal archive does not delete evidence | 2/5 | pagination/archive Control Plane and dashboard tests | done |
+| AUDIT-002 | Audit export is memory-bounded as event history grows | 2/5 | paged projection and incremental JSONL writer | done |
+| OUTBOX-001 | Outbox delivery claims, retries, dead-letters, and permits explicit human replay | 2/4 | dispatcher and Control Plane tests | done |
+| SCHED-003 | Local controller scheduling is opt-in, overlap-aware, and records durable ticks | 2/4 | scheduler runtime, Control Plane ticks, CLI E2E | done |
 
 ## Engine/host separation acceptance tests
 

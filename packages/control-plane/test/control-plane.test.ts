@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ControlPlane,
+  dispatchOutboxBatch,
   openControlPlaneDatabase,
 } from "../src/index.ts";
 
@@ -673,6 +674,190 @@ test("audit export projection preserves allowlisted evidence and drops all other
     assert.equal(records[0]?.payload.nested, undefined);
     assert.equal(records[0]?.actor, "system:unknown");
     assert.doesNotMatch(JSON.stringify(records), /must-not-export|private/u);
+  } finally {
+    database.close();
+  }
+});
+
+test("model invocation lifecycle survives cancellation and lease recovery", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const prepare = (name: string) => {
+      const item = controlPlane.intake({
+        title: name,
+        summary: "Track the call before model execution starts.",
+        actor: "human:test",
+        idempotencyKey: `invocation:intake:${name}`,
+      });
+      controlPlane.triage({
+        id: item.id,
+        ownerRole: "operator",
+        executionTarget: "local",
+        actor: "human:test",
+        idempotencyKey: `invocation:triage:${name}`,
+      });
+      return item;
+    };
+    const canceledItem = prepare("cancel");
+    const canceledClaim = controlPlane.claim({
+      id: canceledItem.id,
+      actor: "runner:test",
+      idempotencyKey: "invocation:claim:cancel",
+    });
+    const running = controlPlane.startInvocation({
+      attemptId: canceledClaim.attemptId,
+      engineId: "local-model",
+      modelId: "fixture",
+    });
+    assert.equal(running.status, "running");
+    assert.equal(running.finishedAt, null);
+    const cancellation = controlPlane.requestRunCancellation({
+      id: canceledItem.id,
+      actor: "human:test",
+      idempotencyKey: "invocation:cancel",
+    });
+    assert.equal(cancellation.runId, canceledClaim.runId);
+    assert.equal(
+      controlPlane.isRunCancellationRequested(canceledClaim.runId),
+      true,
+    );
+    assert.equal(
+      controlPlane.finishInvocation({
+        id: running.id,
+        status: "canceled",
+        inputTokens: null,
+        outputTokens: null,
+        cost: null,
+        measurementStatus: "unknown",
+      }).status,
+      "canceled",
+    );
+
+    const abandonedItem = prepare("abandon");
+    const abandonedClaim = controlPlane.claim({
+      id: abandonedItem.id,
+      actor: "runner:test",
+      idempotencyKey: "invocation:claim:abandon",
+      leaseMinutes: 0,
+    });
+    const abandoned = controlPlane.startInvocation({
+      attemptId: abandonedClaim.attemptId,
+      engineId: "local-model",
+      modelId: "fixture",
+    });
+    controlPlane.recoverExpiredLeases();
+    assert.equal(
+      controlPlane
+        .listInvocations(abandonedClaim.attemptId)
+        .find(({ id }) => id === abandoned.id)?.status,
+      "abandoned",
+    );
+    assert.ok(
+      controlPlane
+        .auditRecords()
+        .some(
+          ({ type, payload }) =>
+            type === "model.invocation.abandoned" &&
+            payload.invocationId === abandoned.id,
+        ),
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("work pagination is stable and explicit archive hides terminal work", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    for (const name of ["one", "two", "three"]) {
+      controlPlane.intake({
+        title: name,
+        summary: `Pagination fixture ${name}.`,
+        actor: "human:test",
+        idempotencyKey: `page:${name}`,
+      });
+    }
+    const first = controlPlane.listPage({
+      limit: 2,
+      includeCompleted: true,
+    });
+    assert.equal(first.items.length, 2);
+    assert.ok(first.nextCursor);
+    const second = controlPlane.listPage({
+      cursor: first.nextCursor!,
+      limit: 2,
+      includeCompleted: true,
+    });
+    assert.equal(second.items.length, 1);
+    assert.equal(
+      new Set([...first.items, ...second.items].map(({ id }) => id)).size,
+      3,
+    );
+    const terminal = first.items[0]!;
+    database
+      .prepare(`
+        UPDATE work_items
+        SET status = 'done', availability = 'completed'
+        WHERE id = ?
+      `)
+      .run(terminal.id);
+    assert.ok(
+      controlPlane.archive({
+        id: terminal.id,
+        actor: "human:test",
+        idempotencyKey: "page:archive",
+      }).archivedAt,
+    );
+    assert.equal(
+      controlPlane.list().some(({ id }) => id === terminal.id),
+      false,
+    );
+    assert.equal(
+      controlPlane
+        .list({ includeArchived: true })
+        .some(({ id }) => id === terminal.id),
+      true,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("outbox dispatcher retries, dead-letters, and permits human replay", async () => {
+  const { database, controlPlane } = fixture();
+  try {
+    controlPlane.intake({
+      title: "Dispatch one event",
+      summary: "Exercise local transactional outbox delivery.",
+      actor: "human:test",
+      idempotencyKey: "outbox:intake",
+    });
+    const failed = await dispatchOutboxBatch(controlPlane, {
+      owner: "dispatcher:test",
+      maxAttempts: 1,
+      handler: () => {
+        throw new Error("FIXTURE_DELIVERY_FAILED");
+      },
+    });
+    assert.equal(failed.deadLettered, 1);
+    const dead = controlPlane.listOutbox({
+      deadLettersOnly: true,
+    });
+    assert.equal(dead.length, 1);
+    controlPlane.retryDeadLetter({
+      id: dead[0]!.id,
+      actor: "human:test",
+      idempotencyKey: "outbox:retry",
+    });
+    const delivered: number[] = [];
+    const succeeded = await dispatchOutboxBatch(controlPlane, {
+      owner: "dispatcher:test",
+      handler: (delivery) => {
+        delivered.push(delivery.id);
+      },
+    });
+    assert.ok(succeeded.dispatched >= 1);
+    assert.ok(delivered.includes(dead[0]!.id));
   } finally {
     database.close();
   }

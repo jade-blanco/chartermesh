@@ -2,6 +2,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -44,6 +45,9 @@ import {
 import {
   BuiltInManagedRunner,
   createWorkspaceToolRuntime,
+  evaluateIntervalSchedule,
+  parseRuntimeConfig,
+  type RuntimeConfig,
 } from "../../../packages/runtime/src/index.ts";
 import {
   createProposal,
@@ -53,25 +57,7 @@ import {
 import { evaluateModelEngine } from "./evaluate-model.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
-const CHARTERMESH_VERSION = "0.0.5-alpha.1";
-
-interface RuntimeConfig {
-  apiVersion: "chartermesh.dev/runtime/v1alpha1";
-  modelEngines: Array<
-    | { id: string; adapter: "fake" }
-    | ({
-        adapter: "command-process";
-      } & CommandProcessConfig)
-    | ({
-        adapter: "openai-compatible";
-      } & OpenAICompatibleConfig)
-  >;
-  managedRunners: Array<{
-    id: string;
-    adapter: "builtin-managed-runner";
-    modelEngineRef: string;
-  }>;
-}
+const CHARTERMESH_VERSION = "0.0.6-alpha.1";
 
 interface BootstrapFile {
   path: string;
@@ -246,7 +232,7 @@ function readRuntime(target: string): RuntimeConfig {
       "Runtime configuration is missing. Run 'chartermesh bootstrap' first.",
     );
   }
-  return JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
+  return parseRuntimeConfig(readFileSync(path, "utf8"));
 }
 
 function readOrganization(target: string) {
@@ -693,41 +679,49 @@ function doctor(target: string, args: string[]): number {
   if (!existsSync(paths.runtime)) {
     issues.push("runtime.json is missing");
   } else {
-    const runtime = readRuntime(target);
-    for (const engine of runtime.modelEngines) {
-      if (engine.adapter === "openai-compatible") {
-        issues.push(...validateOpenAICompatibleConfig(engine));
-      }
-      if (engine.adapter === "command-process") {
-        issues.push(...validateCommandProcessConfig(engine));
-        try {
-          if (
-            sha256Executable(engine.command) !==
-            engine.executableSha256
-          ) {
+    try {
+      const runtime = readRuntime(target);
+      for (const engine of runtime.modelEngines) {
+        if (engine.adapter === "openai-compatible") {
+          issues.push(...validateOpenAICompatibleConfig(engine));
+        }
+        if (engine.adapter === "command-process") {
+          issues.push(...validateCommandProcessConfig(engine));
+          try {
+            if (
+              sha256Executable(engine.command) !==
+              engine.executableSha256
+            ) {
+              issues.push(
+                `Command-process executable digest changed for '${engine.id}'.`,
+              );
+            }
+          } catch {
             issues.push(
-              `Command-process executable digest changed for '${engine.id}'.`,
+              `Command-process executable is unavailable for '${engine.id}'.`,
             );
           }
-        } catch {
+        }
+        const policy =
+          organization?.spec.budgets.unknownCostPolicy ?? "warn";
+        if (
+          engine.adapter !== "fake" &&
+          !("pricing" in engine && engine.pricing) &&
+          ["block", "estimate"].includes(policy)
+        ) {
           issues.push(
-            `Command-process executable is unavailable for '${engine.id}'.`,
+            policy === "block"
+              ? `Engine '${engine.id}' has unknown cost but OrgSpec blocks unknown-cost runs`
+              : `Engine '${engine.id}' needs pricing for the OrgSpec estimate policy`,
           );
         }
       }
-      const policy =
-        organization?.spec.budgets.unknownCostPolicy ?? "warn";
-      if (
-        engine.adapter !== "fake" &&
-        !("pricing" in engine && engine.pricing) &&
-        ["block", "estimate"].includes(policy)
-      ) {
-        issues.push(
-          policy === "block"
-            ? `Engine '${engine.id}' has unknown cost but OrgSpec blocks unknown-cost runs`
-            : `Engine '${engine.id}' needs pricing for the OrgSpec estimate policy`,
-        );
-      }
+    } catch (error) {
+      issues.push(
+        error instanceof Error
+          ? `runtime.json: ${error.message}`
+          : "runtime.json is invalid",
+      );
     }
   }
   const result = {
@@ -873,7 +867,7 @@ function exportAudit(target: string, args: string[]): void {
   const { database, controlPlane } = controlPlaneFor(target);
   try {
     const organization = readOrganization(target);
-    const records = controlPlane.auditRecords();
+    const recordCount = controlPlane.auditRecordCount();
     const header = {
       apiVersion: "chartermesh.dev/audit-export/v1alpha1",
       recordType: "export",
@@ -881,17 +875,30 @@ function exportAudit(target: string, args: string[]): void {
       exportedAt: new Date().toISOString(),
       organizationId: organization.metadata.id,
       organizationRevision: organization.metadata.revision,
-      recordCount: records.length,
+      recordCount,
     };
-    const content = [header, ...records]
-      .map((record) => JSON.stringify(record))
-      .join("\n")
-      .concat("\n");
     mkdirSync(dirname(output), { recursive: true });
-    writeFileSync(output, content, { encoding: "utf8", flag: "wx" });
-    const result = { output, recordCount: records.length };
+    writeFileSync(output, `${JSON.stringify(header)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    let afterId = 0;
+    for (;;) {
+      const page = controlPlane.auditRecordsPage({
+        afterId,
+        limit: 500,
+      });
+      if (page.length === 0) break;
+      appendFileSync(
+        output,
+        `${page.map((record) => JSON.stringify(record)).join("\n")}\n`,
+        "utf8",
+      );
+      afterId = page.at(-1)!.id;
+    }
+    const result = { output, recordCount };
     if (has(args, "--json")) writeJsonEnvelope("audit export", result);
-    else console.log(`Exported ${records.length} audit records to ${output}.`);
+    else console.log(`Exported ${recordCount} audit records to ${output}.`);
   } finally {
     database.close();
   }
@@ -1091,6 +1098,32 @@ export interface RunWorkResult {
   generation: number;
 }
 
+export interface SchedulerTickSummary {
+  evaluatedAt: string;
+  activeSchedules: number;
+  started: number;
+  succeeded: number;
+  failed: number;
+  skippedNoWork: number;
+  skippedOverlap: number;
+  notDue: number;
+  inactive: number;
+  results: Array<{
+    scheduleId: string;
+    status:
+      | "inactive"
+      | "not_due"
+      | "skipped_no_work"
+      | "skipped_overlap"
+      | "succeeded"
+      | "failed"
+      | "unsupported";
+    workItemId?: string;
+    tickId?: string;
+    errorCode?: string;
+  }>;
+}
+
 export async function runWork(
   target: string,
   id?: string,
@@ -1099,6 +1132,10 @@ export async function runWork(
   const runtime = readRuntime(target);
   const { database, controlPlane } = controlPlaneFor(target);
   let heartbeat: NodeJS.Timeout | undefined;
+  let cancellationPoll: NodeJS.Timeout | undefined;
+  let invocationId: string | undefined;
+  const runController = new AbortController();
+  let removeSignalHandlers = () => {};
   let claim:
     | {
         runId: string;
@@ -1147,6 +1184,27 @@ export async function runWork(
       actor: "runner:local",
       idempotencyKey: `cli:claim:${candidate.id}:${randomUUID()}`,
     });
+    const requestSignalCancellation = (signal: string) => {
+      try {
+        controlPlane.requestRunCancellation({
+          id: candidate.id,
+          actor: "human:cli-signal",
+          idempotencyKey:
+            `cli:cancel:${claim!.runId}:${signal.toLowerCase()}`,
+        });
+      } catch {
+        // A concurrent cancellation or terminal transition is already visible.
+      }
+      runController.abort(new Error("RUN_CANCELED"));
+    };
+    const onSigint = () => requestSignalCancellation("SIGINT");
+    const onSigterm = () => requestSignalCancellation("SIGTERM");
+    process.once("SIGINT", onSigint);
+    process.once("SIGTERM", onSigterm);
+    removeSignalHandlers = () => {
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+    };
     heartbeat = setInterval(() => {
       try {
         if (!claim) return;
@@ -1161,6 +1219,19 @@ export async function runWork(
       }
     }, 60_000);
     heartbeat.unref();
+    cancellationPoll = setInterval(() => {
+      try {
+        if (
+          claim &&
+          controlPlane.isRunCancellationRequested(claim.runId)
+        ) {
+          runController.abort(new Error("RUN_CANCELED"));
+        }
+      } catch {
+        // Lease recovery or terminal fencing decides the durable result.
+      }
+    }, 500);
+    cancellationPoll.unref();
     try {
       const runner = new BuiltInManagedRunner();
       const role = organization.spec.roles.find(
@@ -1199,6 +1270,15 @@ export async function runWork(
           });
         },
       });
+      const modelId =
+        "config" in engine && engine.config?.model
+          ? String(engine.config.model)
+          : "deterministic-fixture";
+      invocationId = controlPlane.startInvocation({
+        attemptId: claim.attemptId,
+        engineId: engine.manifest.profileId,
+        modelId,
+      }).id;
       const handle = await runner.start(
         {
           taskPacket: {
@@ -1216,16 +1296,11 @@ export async function runWork(
           attemptId: claim.attemptId,
           generation: claim.generation,
         },
-        { engine, toolRuntime },
+        { engine, toolRuntime, signal: runController.signal },
       );
       const result = await runner.result(handle.hostRunId);
-      controlPlane.recordInvocation({
-        attemptId: claim.attemptId,
-        engineId: engine.manifest.profileId,
-        modelId:
-          "config" in engine && engine.config?.model
-            ? String(engine.config.model)
-            : "deterministic-fixture",
+      controlPlane.finishInvocation({
+        id: invocationId,
         status: "succeeded",
         inputTokens: result.inference.usage.inputTokens,
         outputTokens: result.inference.usage.outputTokens,
@@ -1254,20 +1329,6 @@ export async function runWork(
       }
       return runResult;
     } catch (error) {
-      const configured = runtime.modelEngines[0];
-      controlPlane.recordInvocation({
-        attemptId: claim.attemptId,
-        engineId: configured?.id ?? "unknown-engine",
-        modelId:
-          configured && "model" in configured
-            ? configured.model
-            : "deterministic-fixture",
-        status: "failed",
-        inputTokens: null,
-        outputTokens: null,
-        cost: null,
-        measurementStatus: "unknown",
-      });
       const rawMessage = error instanceof Error ? error.message : String(error);
       const errorCode = rawMessage.startsWith("STRUCTURED_ARTIFACT_INVALID")
         ? "STRUCTURED_ARTIFACT_INVALID"
@@ -1275,9 +1336,22 @@ export async function runWork(
           ? "TOOL_APPROVAL_REQUIRED"
           : rawMessage.startsWith("TOOL_ITERATION_LIMIT")
             ? "TOOL_ITERATION_LIMIT"
-            : rawMessage.toLowerCase().includes("abort")
+            : rawMessage.startsWith("RUN_CANCELED") ||
+                rawMessage.toLowerCase().includes("abort") ||
+                rawMessage.toLowerCase().includes("canceled")
               ? "RUN_CANCELED"
               : "MODEL_INVOCATION_FAILED";
+      if (invocationId) {
+        controlPlane.finishInvocation({
+          id: invocationId,
+          status:
+            errorCode === "RUN_CANCELED" ? "canceled" : "failed",
+          inputTokens: null,
+          outputTokens: null,
+          cost: null,
+          measurementStatus: "unknown",
+        });
+      }
       controlPlane.failRun({
         id: candidate.id,
         generation: claim.generation,
@@ -1300,22 +1374,293 @@ export async function runWork(
     }
   } finally {
     if (heartbeat) clearInterval(heartbeat);
+    if (cancellationPoll) clearInterval(cancellationPoll);
+    removeSignalHandlers();
     database.close();
+  }
+}
+
+export async function runSchedulerTick(
+  target: string,
+  evaluatedAt = new Date(),
+): Promise<SchedulerTickSummary> {
+  const organization = readOrganization(target);
+  const summary: SchedulerTickSummary = {
+    evaluatedAt: evaluatedAt.toISOString(),
+    activeSchedules: 0,
+    started: 0,
+    succeeded: 0,
+    failed: 0,
+    skippedNoWork: 0,
+    skippedOverlap: 0,
+    notDue: 0,
+    inactive: 0,
+    results: [],
+  };
+  for (const schedule of organization.spec.schedules) {
+    if (
+      schedule.activation !== "active" ||
+      (schedule.executor ?? "controller") !== "controller"
+    ) {
+      summary.inactive += 1;
+      summary.results.push({
+        scheduleId: schedule.id,
+        status: "inactive",
+      });
+      continue;
+    }
+    summary.activeSchedules += 1;
+    let database;
+    let controlPlane;
+    try {
+      ({ database, controlPlane } = controlPlaneFor(target));
+      controlPlane.recoverExpiredLeases("system:scheduler");
+      let active = controlPlane.activeScheduleTick(schedule.id);
+      if (active?.workItemId) {
+        const activeWork = controlPlane.get(active.workItemId);
+        if (
+          ["review_pending", "approved", "done"].includes(activeWork.status)
+        ) {
+          controlPlane.finishScheduleTick({
+            id: active.id,
+            status: "succeeded",
+          });
+          active = null;
+        } else if (activeWork.status !== "in_progress") {
+          controlPlane.finishScheduleTick({
+            id: active.id,
+            status: "failed",
+            errorCode: "SCHEDULE_TICK_ABANDONED",
+          });
+          active = null;
+        }
+      }
+      const latest = controlPlane.latestScheduleTick(schedule.id);
+      let evaluation;
+      try {
+        evaluation = evaluateIntervalSchedule({
+          rrule: schedule.cadence.rrule,
+          timezone: schedule.cadence.timezone,
+          now: evaluatedAt,
+          lastStartedAt: latest?.startedAt,
+        });
+      } catch (error) {
+        summary.failed += 1;
+        summary.results.push({
+          scheduleId: schedule.id,
+          status: "unsupported",
+          errorCode:
+            error instanceof Error
+              ? error.message
+              : "SCHEDULE_CONFIGURATION_INVALID",
+        });
+        continue;
+      }
+      if (!evaluation.due) {
+        summary.notDue += 1;
+        summary.results.push({
+          scheduleId: schedule.id,
+          status: "not_due",
+        });
+        continue;
+      }
+      if (
+        schedule.overlapPolicy === "forbid" &&
+        active
+      ) {
+        const tick = controlPlane.beginScheduleTick({
+          scheduleId: schedule.id,
+          tickKey: evaluation.tickKey,
+          workItemId: null,
+          status: "skipped_overlap",
+        });
+        summary.skippedOverlap += 1;
+        summary.results.push({
+          scheduleId: schedule.id,
+          status: "skipped_overlap",
+          tickId: tick.id,
+        });
+        continue;
+      }
+      const candidate = controlPlane.nextClaimableWork();
+      if (!candidate) {
+        const tick = controlPlane.beginScheduleTick({
+          scheduleId: schedule.id,
+          tickKey: evaluation.tickKey,
+          workItemId: null,
+          status: "skipped_no_work",
+        });
+        summary.skippedNoWork += 1;
+        summary.results.push({
+          scheduleId: schedule.id,
+          status: "skipped_no_work",
+          tickId: tick.id,
+        });
+        continue;
+      }
+      const tick = controlPlane.beginScheduleTick({
+        scheduleId: schedule.id,
+        tickKey: evaluation.tickKey,
+        workItemId: candidate.id,
+      });
+      summary.started += 1;
+      database.close();
+      database = undefined;
+      try {
+        await runWork(target, candidate.id, { quiet: true });
+        const completion = controlPlaneFor(target);
+        try {
+          completion.controlPlane.finishScheduleTick({
+            id: tick.id,
+            status: "succeeded",
+          });
+        } finally {
+          completion.database.close();
+        }
+        summary.succeeded += 1;
+        summary.results.push({
+          scheduleId: schedule.id,
+          status: "succeeded",
+          workItemId: candidate.id,
+          tickId: tick.id,
+        });
+      } catch {
+        const completion = controlPlaneFor(target);
+        try {
+          completion.controlPlane.finishScheduleTick({
+            id: tick.id,
+            status: "failed",
+            errorCode: "SCHEDULE_RUN_FAILED",
+          });
+        } finally {
+          completion.database.close();
+        }
+        summary.failed += 1;
+        summary.results.push({
+          scheduleId: schedule.id,
+          status: "failed",
+          workItemId: candidate.id,
+          tickId: tick.id,
+          errorCode: "SCHEDULE_RUN_FAILED",
+        });
+      }
+    } finally {
+      database?.close();
+    }
+  }
+  return summary;
+}
+
+async function schedulerCommand(
+  target: string,
+  args: string[],
+): Promise<void> {
+  const subcommand = args[1] ?? "tick";
+  if (subcommand === "list") {
+    const { database, controlPlane } = controlPlaneFor(target);
+    try {
+      const items = controlPlane.listScheduleTicks(
+        option(args, "--schedule"),
+      );
+      if (has(args, "--json")) {
+        writeJsonEnvelope("scheduler list", { items });
+      } else {
+        for (const item of items) {
+          console.log(
+            `${item.scheduleId} | ${item.tickKey} | ${item.status}` +
+              (item.workItemId ? ` | ${item.workItemId}` : ""),
+          );
+        }
+      }
+      return;
+    } finally {
+      database.close();
+    }
+  }
+  const requestedNow = option(args, "--now");
+  const tick = async () => {
+    const at = requestedNow ? new Date(requestedNow) : new Date();
+    if (!Number.isFinite(at.getTime())) {
+      throw new Error("--now must be an ISO-8601 timestamp.");
+    }
+    const result = await runSchedulerTick(target, at);
+    if (has(args, "--json")) {
+      writeJsonEnvelope(`scheduler ${subcommand}`, result);
+    } else {
+      console.log(
+        `Scheduler: ${result.succeeded} succeeded, ` +
+          `${result.skippedNoWork} no-work skip, ` +
+          `${result.failed} failed.`,
+      );
+    }
+  };
+  if (subcommand === "tick") {
+    await tick();
+    return;
+  }
+  if (subcommand !== "watch") {
+    throw new Error("scheduler requires tick, watch, or list.");
+  }
+  if (requestedNow) {
+    throw new Error("scheduler watch does not accept --now.");
+  }
+  const pollMs = Number(option(args, "--poll-ms") ?? 30_000);
+  if (
+    !Number.isInteger(pollMs) ||
+    pollMs < 1_000 ||
+    pollMs > 3_600_000
+  ) {
+    throw new Error("--poll-ms must be between 1000 and 3600000.");
+  }
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    while (!stopped) {
+      await tick();
+      if (stopped) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, pollMs));
+    }
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
   }
 }
 
 function printItems(target: string, args: string[]): void {
   const { database, controlPlane } = controlPlaneFor(target);
   try {
-    const items = controlPlane.list();
+    const paged =
+      option(args, "--limit") !== undefined ||
+      option(args, "--cursor") !== undefined ||
+      has(args, "--active-only");
+    const page = paged
+      ? controlPlane.listPage({
+          cursor: option(args, "--cursor"),
+          limit: Number(option(args, "--limit") ?? 100),
+          includeCompleted: !has(args, "--active-only"),
+          includeArchived: has(args, "--include-archived"),
+        })
+      : {
+          items: controlPlane.list({
+            includeArchived: has(args, "--include-archived"),
+          }),
+          nextCursor: null,
+        };
     if (has(args, "--json")) {
-      writeJsonEnvelope("list", { items });
+      writeJsonEnvelope("list", page);
       return;
     }
-    for (const item of items) {
+    for (const item of page.items) {
       console.log(
         `${item.id} | ${item.status} | ${item.availability} | ${item.ownerRole} | ${item.title}`,
       );
+    }
+    if (page.nextCursor) {
+      console.log(`Next cursor: ${page.nextCursor}`);
     }
   } finally {
     database.close();
@@ -1422,6 +1767,82 @@ function retryWork(target: string, args: string[]): void {
     });
     if (has(args, "--json")) writeJsonEnvelope("retry", item);
     else console.log(`${item.id} is ready to retry.`);
+  } finally {
+    database.close();
+  }
+}
+
+function cancelWork(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  if (!id) throw new Error("cancel requires --id.");
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const result = controlPlane.requestRunCancellation({
+      id,
+      actor: "human:cli",
+      idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+    });
+    if (has(args, "--json")) writeJsonEnvelope("cancel", result);
+    else console.log(`Cancellation requested for ${result.workItemId}.`);
+  } finally {
+    database.close();
+  }
+}
+
+function archiveWork(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  if (!id) throw new Error("archive requires --id.");
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const item = controlPlane.archive({
+      id,
+      actor: "human:cli",
+      idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+    });
+    if (has(args, "--json")) writeJsonEnvelope("archive", item);
+    else console.log(`${item.id} archived.`);
+  } finally {
+    database.close();
+  }
+}
+
+function outboxCommand(target: string, args: string[]): void {
+  const subcommand = args[1] ?? "list";
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    if (subcommand === "list") {
+      const items = controlPlane.listOutbox({
+        deadLettersOnly: has(args, "--dead-letters"),
+        limit: Number(option(args, "--limit") ?? 100),
+      });
+      if (has(args, "--json")) {
+        writeJsonEnvelope("outbox list", { items });
+      } else {
+        for (const item of items) {
+          console.log(
+            `${item.id} | ${item.eventType} | attempts=${item.attemptCount} | ` +
+              `${item.deadLetteredAt ? "dead-letter" : item.dispatchedAt ? "dispatched" : "pending"}`,
+          );
+        }
+      }
+      return;
+    }
+    if (subcommand === "retry") {
+      const id = Number(option(args, "--id"));
+      if (!Number.isSafeInteger(id) || id <= 0) {
+        throw new Error("outbox retry requires a positive --id.");
+      }
+      const item = controlPlane.retryDeadLetter({
+        id,
+        actor: "human:cli",
+        idempotencyKey:
+          option(args, "--idempotency-key") ?? randomUUID(),
+      });
+      if (has(args, "--json")) writeJsonEnvelope("outbox retry", item);
+      else console.log(`Outbox delivery ${item.id} is pending again.`);
+      return;
+    }
+    throw new Error("outbox requires list or retry.");
   } finally {
     database.close();
   }
@@ -1642,8 +2063,11 @@ Commands:
   chartermesh seed-demo --target PATH
   chartermesh request "work title" --target PATH [--json]
   chartermesh triage --id WORK --role ROLE --target PATH [--json]
-  chartermesh list --target PATH [--json]
+  chartermesh list --target PATH [--json] [--limit N --cursor CURSOR]
+    [--active-only] [--include-archived]
   chartermesh run --id WORK --target PATH [--json]
+  chartermesh cancel --id WORK --target PATH [--json]
+  chartermesh archive --id WORK --target PATH [--json]
   chartermesh wait --id WORK --type user_input --reason TEXT --target PATH
   chartermesh resume --id WORK --target PATH
   chartermesh retry --id WORK --target PATH
@@ -1653,6 +2077,11 @@ Commands:
   chartermesh decide --id WORK --decision approve --artifact-hash SHA256 \\
     --note TEXT --target PATH
   chartermesh complete --id WORK --target PATH
+  chartermesh outbox list --target PATH [--dead-letters] [--limit N] [--json]
+  chartermesh outbox retry --id DELIVERY --target PATH [--json]
+  chartermesh scheduler tick --target PATH [--now ISO_TIME] [--json]
+  chartermesh scheduler list --target PATH [--schedule ID] [--json]
+  chartermesh scheduler watch --target PATH [--poll-ms 30000] [--json]
   chartermesh evaluate-model --target PATH --live [--engine-id ID] [--json]
   chartermesh dashboard --target PATH [--port 4173]
 
@@ -1721,6 +2150,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     await runWork(target, option(args, "--id"), { json: has(args, "--json") });
     return 0;
   }
+  if (command === "cancel") {
+    cancelWork(target, args);
+    return 0;
+  }
+  if (command === "archive") {
+    archiveWork(target, args);
+    return 0;
+  }
   if (command === "wait") {
     waitWork(target, args);
     return 0;
@@ -1747,6 +2184,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   }
   if (command === "complete") {
     completeWork(target, args);
+    return 0;
+  }
+  if (command === "outbox") {
+    outboxCommand(target, args);
+    return 0;
+  }
+  if (command === "scheduler") {
+    await schedulerCommand(target, args);
     return 0;
   }
   if (command === "evaluate-model") {

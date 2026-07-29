@@ -29,13 +29,15 @@ executable that implements CharterMesh's neutral stdin/stdout JSON contract.
 Provider-specific features enter through adapter capability manifests, never
 through the core OrgSpec schema.
 
-## 0.0.5-alpha.1 runnable slice
+## 0.0.6-alpha.1 runnable slice
 
 - Project-aware `lean`, `balanced`, and `controlled` proposals
 - Exact plan-hash approval and crash-recoverable journaled apply
 - Dependency-free OrgSpec JSON Schema plus semantic validation
-- SQLite Control Plane with transactional commands and outbox
+- SQLite Control Plane with transactional commands and retryable outbox
 - Generation fencing, lease heartbeat/recovery, visible failure, and retry
+- Durable model-invocation start/finish records plus shared CLI, dashboard,
+  signal, and cross-process cancellation
 - Multi-process claim, idempotency, and database-lock stress coverage
 - Enforced concurrency, daily-start, and monthly-cost budgets
 - User-owned unknown-cost policy, optional token-price estimation, and
@@ -46,8 +48,12 @@ through the core OrgSpec schema.
 - Fake, generic OpenAI-compatible, and shell-free, executable-hash-pinned
   command-process engines with dedicated working directories
 - Rate-limited local dashboard APIs and keyboard/mobile accessibility flow
-- Allowlisted JSONL audit export plus hashed SQLite+artifact backup and
-  maintenance-locked approved restore
+- Cursor-paged WorkItems, explicit terminal-work archive, and memory-bounded
+  allowlisted JSONL audit export
+- Claim/retry/dead-letter outbox dispatcher plus hashed SQLite+artifact backup
+  and maintenance-locked approved restore
+- Optional local interval scheduler, disabled by default, that starts zero
+  models when no claimable work exists
 - Human-controlled pause/resume for new run starts and bounded,
   no-redirect HTTP model responses
 - Versioned `--json` CLI output for coding agents and automation
@@ -184,6 +190,28 @@ node bin/chartermesh.mjs complete --id work-000001 --target TARGET
 
 Add `--json` to agent-facing commands for the
 `chartermesh.dev/cli/v1alpha1` envelope.
+
+Active runs can be canceled from another CLI or from the dashboard. Ctrl+C
+uses the same durable Control Plane cancellation command:
+
+```powershell
+node bin/chartermesh.mjs cancel --id work-000001 --target TARGET
+node bin/chartermesh.mjs list --target TARGET --active-only --limit 100 --json
+node bin/chartermesh.mjs archive --id work-000001 --target TARGET
+```
+
+Local schedules are opt-in OrgSpec entries. The default proposal contains no
+schedules. Once a human-approved OrgSpec has an active controller schedule,
+run one tick or keep a local watcher alive:
+
+```powershell
+node bin/chartermesh.mjs scheduler tick --target TARGET --json
+node bin/chartermesh.mjs scheduler watch --target TARGET --poll-ms 30000
+```
+
+The dependency-free scheduler currently accepts
+`FREQ=MINUTELY|HOURLY|DAILY;INTERVAL=N`. It checks the Control Plane first and
+records `skipped_no_work` without starting a model.
 
 If a model requests `workspace.write_file`, CharterMesh does not execute it
 until a human approves the exact call hash:

@@ -13,6 +13,11 @@ Any local executable can connect through the shell-free command-process JSON
 contract; its approved executable digest is pinned and it runs from a dedicated
 cwd. Unknown model cost follows the user's OrgSpec policy and is never silently
 zero. Allowlisted audit export and DB+artifact backup/restore remain local.
+Runtime JSON is schema-validated before inference. Model calls are recorded
+before start and share durable CLI/dashboard/signal cancellation. Work lists
+support cursors and archive, audit export streams, outbox delivery retries and
+dead-letters, and optional local schedules are disabled by default and start
+zero models on an empty queue.
 
 Project architecture: docs/PRODUCT-DESIGN.md
 CLI and first run: docs/FIRST-RUN.md

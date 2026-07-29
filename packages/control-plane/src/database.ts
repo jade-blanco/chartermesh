@@ -34,7 +34,7 @@ export function openControlPlaneDatabase(
         )
         .get() as { version: number };
       const priorVersion = Number(row.version);
-      if (priorVersion > 0 && priorVersion < 6) {
+      if (priorVersion > 0 && priorVersion < 7) {
         createControlPlaneBackup(
           database,
           join(dirname(path), "backups"),
@@ -73,6 +73,7 @@ export function openControlPlaneDatabase(
       resume_at TEXT,
       wait_created_by TEXT,
       next_action TEXT NOT NULL,
+      archived_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY(parent_id) REFERENCES work_items(id)
@@ -97,6 +98,8 @@ export function openControlPlaneDatabase(
       execution_target TEXT NOT NULL,
       started_at TEXT NOT NULL,
       finished_at TEXT,
+      cancel_requested_at TEXT,
+      cancel_requested_by TEXT,
       FOREIGN KEY(work_item_id) REFERENCES work_items(id)
     );
 
@@ -191,7 +194,26 @@ export function openControlPlaneDatabase(
       payload_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
       dispatched_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error_code TEXT,
+      dead_lettered_at TEXT,
+      claimed_at TEXT,
+      claim_owner TEXT,
       FOREIGN KEY(event_id) REFERENCES events(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS schedule_ticks (
+      id TEXT PRIMARY KEY,
+      schedule_id TEXT NOT NULL,
+      tick_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      work_item_id TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      error_code TEXT,
+      UNIQUE(schedule_id, tick_key),
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
     );
 
     CREATE INDEX IF NOT EXISTS work_items_status_idx
@@ -201,12 +223,17 @@ export function openControlPlaneDatabase(
     CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_generation
       ON runs(work_item_id, generation)
       WHERE status IN ('running', 'waiting');
+    CREATE INDEX IF NOT EXISTS schedule_ticks_schedule_idx
+      ON schedule_ticks(schedule_id, started_at DESC);
   `);
   const workItemColumns = database
     .prepare("PRAGMA table_info(work_items)")
     .all() as Array<{ name: string }>;
   if (!workItemColumns.some(({ name }) => name === "wait_created_by")) {
     database.exec("ALTER TABLE work_items ADD COLUMN wait_created_by TEXT");
+  }
+  if (!workItemColumns.some(({ name }) => name === "archived_at")) {
+    database.exec("ALTER TABLE work_items ADD COLUMN archived_at TEXT");
   }
   const attemptColumns = database
     .prepare("PRAGMA table_info(attempts)")
@@ -223,6 +250,35 @@ export function openControlPlaneDatabase(
   if (!leaseColumns.some(({ name }) => name === "heartbeat_at")) {
     database.exec("ALTER TABLE leases ADD COLUMN heartbeat_at TEXT");
   }
+  const runColumns = database
+    .prepare("PRAGMA table_info(runs)")
+    .all() as Array<{ name: string }>;
+  if (!runColumns.some(({ name }) => name === "cancel_requested_at")) {
+    database.exec("ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT");
+  }
+  if (!runColumns.some(({ name }) => name === "cancel_requested_by")) {
+    database.exec("ALTER TABLE runs ADD COLUMN cancel_requested_by TEXT");
+  }
+  const outboxColumns = database
+    .prepare("PRAGMA table_info(outbox)")
+    .all() as Array<{ name: string }>;
+  const outboxAdditions = [
+    ["attempt_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["next_attempt_at", "TEXT"],
+    ["last_error_code", "TEXT"],
+    ["dead_lettered_at", "TEXT"],
+    ["claimed_at", "TEXT"],
+    ["claim_owner", "TEXT"],
+  ] as const;
+  for (const [name, type] of outboxAdditions) {
+    if (!outboxColumns.some((column) => column.name === name)) {
+      database.exec(`ALTER TABLE outbox ADD COLUMN ${name} ${type}`);
+    }
+  }
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS outbox_pending_idx
+      ON outbox(dispatched_at, dead_lettered_at, next_attempt_at, id);
+  `);
   database
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -317,6 +373,12 @@ export function openControlPlaneDatabase(
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (6, ?)
+    `)
+    .run(new Date().toISOString());
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (7, ?)
     `)
     .run(new Date().toISOString());
   return database;

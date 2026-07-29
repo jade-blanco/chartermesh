@@ -37,6 +37,22 @@ at most one repair turn, and submits only from the active generation.
 Lease heartbeats protect active work. Expired leases recover to a visible
 `failed` state instead of leaving work permanently `in_progress`.
 
+The Control Plane creates a `running` model invocation before handing control
+to the engine. Success, failure, cancellation, and abandoned lease recovery
+close that record explicitly, so an interrupted call is never silently
+treated as zero-cost or as though it never started.
+
+## Cancel an active run
+
+```powershell
+node bin/chartermesh.mjs cancel --id work-000001 --target TARGET --json
+```
+
+The dashboard cancel action, a second CLI process, and Ctrl+C/SIGTERM on the
+foreground runner all write the same durable cancellation request. The
+runner's abort signal is propagated to the ModelEngine, then the Attempt and
+invocation are closed with visible cancellation evidence.
+
 ## Safe tool execution
 
 The built-in tools are `workspace.list_files`, `workspace.read_file`, and
@@ -176,7 +192,64 @@ The output is JSONL under `.chartermesh/exports/` unless `--output` names
 another path inside the target. Only documented ids, hashes, state labels,
 engine/role labels, and timing evidence are exported. Unknown and nested
 payload fields are dropped rather than copied and redacted. Existing files are
-never overwritten.
+never overwritten. Export pages through the event ledger and appends JSONL
+incrementally, so event growth does not require loading the entire audit
+history into memory.
+
+## Pagination and archive
+
+The original `list` behavior remains available for compatibility. Long-lived
+installations can request stable cursor pages and omit terminal work:
+
+```powershell
+node bin/chartermesh.mjs list --target TARGET --limit 100 --active-only --json
+node bin/chartermesh.mjs list --target TARGET --limit 100 --cursor NEXT_CURSOR --json
+```
+
+Archiving is an explicit human action and is permitted only for `done` or
+`canceled` WorkItems:
+
+```powershell
+node bin/chartermesh.mjs archive --id work-000001 --target TARGET
+node bin/chartermesh.mjs list --target TARGET --include-archived --json
+```
+
+Archive hides terminal work from normal lists and the dashboard; it does not
+delete WorkItems, Runs, artifacts, or audit evidence.
+
+## Outbox delivery
+
+External adapters can call the dependency-free `dispatchOutboxBatch` service.
+Deliveries are claimed with an owner and stale-claim timeout, acknowledged on
+success, retried with exponential backoff, and moved to dead-letter state
+after the configured attempt bound. Operators can inspect and explicitly
+requeue dead letters:
+
+```powershell
+node bin/chartermesh.mjs outbox list --target TARGET --dead-letters --json
+node bin/chartermesh.mjs outbox retry --id DELIVERY_ID --target TARGET
+```
+
+CharterMesh does not start a network dispatcher by default; the adapter that
+owns an external side effect must supply the delivery handler.
+
+## Optional local scheduler
+
+Default proposals have `schedules: []`, so no scheduler process or model starts
+unless the operator adds and activates a controller schedule in an approved
+OrgSpec. Run one evaluation or keep a local process watching:
+
+```powershell
+node bin/chartermesh.mjs scheduler tick --target TARGET --json
+node bin/chartermesh.mjs scheduler list --target TARGET --json
+node bin/chartermesh.mjs scheduler watch --target TARGET --poll-ms 30000
+```
+
+The first implementation supports dependency-free interval rules:
+`FREQ=MINUTELY|HOURLY|DAILY;INTERVAL=N`. It enforces overlap policy and records
+ticks. Before a model starts it queries for claimable work; an empty queue is
+recorded as `skipped_no_work` and starts zero models. The watcher is a local
+foreground process, not a service installed at boot.
 
 ## Control Plane backup and restore
 

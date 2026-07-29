@@ -91,7 +91,7 @@ const version = JSON.parse(
     cwd: target,
   }),
 );
-assert.equal(version.data.currentVersion, "0.0.5-alpha.1");
+assert.equal(version.data.currentVersion, "0.0.6-alpha.1");
 
 const proposal = JSON.parse(
   run(
@@ -144,6 +144,6 @@ assert.equal(
       "utf8",
     ),
   ).charterMeshVersion,
-  "0.0.5-alpha.1",
+  "0.0.6-alpha.1",
 );
 console.log(`Package install check passed: ${packed[0].filename}`);

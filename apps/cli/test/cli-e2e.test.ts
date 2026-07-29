@@ -2,16 +2,20 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
+import {
+  ControlPlane,
+  openControlPlaneDatabase,
+} from "../../../packages/control-plane/src/index.ts";
 import { compareVersions } from "../src/main.ts";
 
 const executable = resolve("bin", "chartermesh.mjs");
 
 test("version comparison does not treat an older release as an update", () => {
-  assert.ok(compareVersions("0.0.5-alpha.1", "0.0.4-alpha.1") > 0);
-  assert.ok(compareVersions("0.0.5", "0.0.5-alpha.1") > 0);
-  assert.equal(compareVersions("v0.0.5-alpha.1", "0.0.5-alpha.1"), 0);
+  assert.ok(compareVersions("0.0.6-alpha.1", "0.0.5-alpha.1") > 0);
+  assert.ok(compareVersions("0.0.6", "0.0.6-alpha.1") > 0);
+  assert.equal(compareVersions("v0.0.6-alpha.1", "0.0.6-alpha.1"), 0);
 });
 
 function cli(
@@ -22,6 +26,18 @@ function cli(
     encoding: "utf8",
     env: { ...process.env, ...environment },
   });
+}
+
+async function waitUntil(
+  predicate: () => boolean,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  throw new Error("Timed out waiting for test condition.");
 }
 
 test("clean target completes the fake-engine bootstrap workflow", () => {
@@ -453,4 +469,281 @@ test("Control Plane restore requires the exact preview hash and keeps a safety b
     listed.data.items.map((item: { title: string }) => item.title),
     ["Before backup"],
   );
+});
+
+test("doctor reports a schema-invalid runtime before a model run", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-runtime-schema-"));
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "fake",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  assert.equal(
+    cli([...bootstrapArgs, "--approve", preview.data.planHash]).status,
+    0,
+  );
+  const runtimePath = join(target, ".chartermesh", "runtime.json");
+  const runtime = JSON.parse(readFileSync(runtimePath, "utf8"));
+  runtime.unexpected = true;
+  writeFileSync(runtimePath, JSON.stringify(runtime, null, 2));
+
+  const doctor = cli(["doctor", "--target", target, "--json"]);
+  assert.equal(doctor.status, 1, doctor.stdout + doctor.stderr);
+  const envelope = JSON.parse(doctor.stdout);
+  assert.equal(envelope.ok, false);
+  assert.match(
+    envelope.error.issues.join("\n"),
+    /runtime\.json:.*additionalProperties/u,
+  );
+
+  const run = cli(["run", "--target", target, "--json"]);
+  assert.equal(run.status, 1, run.stdout + run.stderr);
+  assert.match(
+    JSON.parse(run.stdout).error.message,
+    /Runtime configuration does not satisfy/u,
+  );
+});
+
+test("local scheduler is disabled by default and skips empty queues without a model", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-scheduler-"));
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "fake",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  assert.equal(
+    cli([...bootstrapArgs, "--approve", preview.data.planHash]).status,
+    0,
+  );
+
+  const disabled = cli([
+    "scheduler",
+    "tick",
+    "--target",
+    target,
+    "--now",
+    "2026-07-30T00:00:00.000Z",
+    "--json",
+  ]);
+  assert.equal(disabled.status, 0, disabled.stdout + disabled.stderr);
+  assert.equal(JSON.parse(disabled.stdout).data.activeSchedules, 0);
+
+  const organizationPath = join(
+    target,
+    ".chartermesh",
+    "organization.json",
+  );
+  const organization = JSON.parse(
+    readFileSync(organizationPath, "utf8"),
+  );
+  organization.spec.schedules = [
+    {
+      id: "local-minute",
+      workflow: "reviewed-work",
+      cadence: {
+        rrule: "FREQ=MINUTELY;INTERVAL=1",
+        timezone: "UTC",
+      },
+      activation: "active",
+      executor: "controller",
+      noWorkBehavior: "skip_without_model",
+      overlapPolicy: "forbid",
+    },
+  ];
+  writeFileSync(
+    organizationPath,
+    JSON.stringify(organization, null, 2),
+  );
+
+  const empty = cli([
+    "scheduler",
+    "tick",
+    "--target",
+    target,
+    "--now",
+    "2026-07-30T00:01:00.000Z",
+    "--json",
+  ]);
+  assert.equal(empty.status, 0, empty.stdout + empty.stderr);
+  assert.equal(JSON.parse(empty.stdout).data.skippedNoWork, 1);
+  const database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  try {
+    assert.equal(
+      new ControlPlane(
+        database,
+        join(target, ".chartermesh", "artifacts"),
+      ).listInvocations().length,
+      0,
+    );
+  } finally {
+    database.close();
+  }
+
+  const requested = cli([
+    "request",
+    "Scheduled local work",
+    "--target",
+    target,
+  ]);
+  const workId = requested.stdout.match(/(work-\d{6}) created/u)?.[1];
+  assert.ok(workId, requested.stdout);
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      workId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+  const executed = cli([
+    "scheduler",
+    "tick",
+    "--target",
+    target,
+    "--now",
+    "2026-07-30T00:02:00.000Z",
+    "--json",
+  ]);
+  assert.equal(executed.status, 0, executed.stdout + executed.stderr);
+  assert.equal(JSON.parse(executed.stdout).data.succeeded, 1);
+  const listed = JSON.parse(
+    cli(["list", "--target", target, "--json"]).stdout,
+  );
+  assert.equal(listed.data.items[0].status, "review_pending");
+});
+
+test("a separate CLI cancellation durably ends a running invocation", async () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-cancel-"));
+  const fixture = resolve(
+    "adapters",
+    "model-engines",
+    "command-process",
+    "test",
+    "fixtures",
+    "slow-engine.mjs",
+  );
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "command-process",
+    "--command",
+    process.execPath,
+    "--command-arg",
+    fixture,
+    "--timeout-ms",
+    "60000",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  assert.equal(
+    cli([...bootstrapArgs, "--approve", preview.data.planHash]).status,
+    0,
+  );
+  const requested = cli([
+    "request",
+    "Cancelable local invocation",
+    "--target",
+    target,
+  ]);
+  const workId = requested.stdout.match(/(work-\d{6}) created/u)?.[1];
+  assert.ok(workId, requested.stdout);
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      workId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+
+  const runner = spawn(
+    process.execPath,
+    [
+      executable,
+      "run",
+      "--id",
+      workId,
+      "--target",
+      target,
+      "--json",
+    ],
+    {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  runner.stdout.setEncoding("utf8");
+  runner.stderr.setEncoding("utf8");
+  runner.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  runner.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const closed = new Promise<number | null>((resolveClose) => {
+    runner.once("close", resolveClose);
+  });
+
+  await waitUntil(() => {
+    const listed = cli(["list", "--target", target, "--json"]);
+    if (listed.status !== 0) return false;
+    return JSON.parse(listed.stdout).data.items[0]?.status === "in_progress";
+  });
+  const canceled = cli([
+    "cancel",
+    "--id",
+    workId,
+    "--target",
+    target,
+    "--json",
+  ]);
+  assert.equal(canceled.status, 0, canceled.stdout + canceled.stderr);
+  assert.equal(JSON.parse(canceled.stdout).data.workItemId, workId);
+  const exitCode = await Promise.race([
+    closed,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => {
+        reject(new Error("Canceled run did not exit."));
+      }, 10_000).unref(),
+    ),
+  ]);
+  assert.equal(exitCode, 1, stdout + stderr);
+  assert.match(JSON.parse(stdout).error.message, /CANCELED/u);
+
+  const database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  try {
+    const controlPlane = new ControlPlane(
+      database,
+      join(target, ".chartermesh", "artifacts"),
+    );
+    assert.equal(controlPlane.get(workId).status, "failed");
+    assert.equal(controlPlane.listInvocations()[0]?.status, "canceled");
+  } finally {
+    database.close();
+  }
 });

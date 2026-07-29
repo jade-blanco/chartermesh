@@ -171,6 +171,8 @@ function renderActions(item) {
     actions.innerHTML = `<button class="primary-button" data-action="triage" ${disabled}>담당 지정</button>`;
   } else if (["ready", "changes_requested"].includes(item.status)) {
     actions.innerHTML = `<button class="primary-button" data-action="run" ${disabled}>모델 실행</button>`;
+  } else if (item.status === "in_progress") {
+    actions.innerHTML = `<button class="secondary-button danger" data-action="cancel" ${disabled}>실행 취소</button>`;
   } else if (item.status === "failed") {
     actions.innerHTML = `<button class="secondary-button" data-action="retry" ${disabled}>재시도 준비</button>`;
   } else if (item.status === "review_pending") {
@@ -180,6 +182,8 @@ function renderActions(item) {
       <button class="secondary-button danger" data-action="reject" ${disabled}>거절</button>`;
   } else if (item.status === "approved") {
     actions.innerHTML = `<button class="primary-button" data-action="complete" ${disabled}>완료 확정</button>`;
+  } else if (["done", "canceled"].includes(item.status)) {
+    actions.innerHTML = `<button class="secondary-button" data-action="archive" ${disabled}>보관</button>`;
   } else {
     actions.innerHTML = "";
   }
@@ -197,7 +201,17 @@ function renderInspector() {
   const item = state.projection?.workItems.find(({ id }) => id === state.selectedId);
   const content = document.querySelector("#inspector-content");
   if (!item) {
+    const inspectorHadFocus = inspector.contains(document.activeElement);
+    document.querySelector("#inspector-heading").textContent =
+      "작업을 선택하세요";
+    document.querySelector("#inspector-summary").textContent =
+      "표에서 작업을 선택하면 현재 상태, 다음 조치, 대기 이유와 계보를 볼 수 있습니다.";
     content.hidden = true;
+    inspector.classList.remove("open");
+    syncInspectorAccessibility();
+    if (inspectorHadFocus) {
+      document.querySelector("#new-request-button").focus();
+    }
     return;
   }
   document.querySelector("#inspector-heading").textContent = item.title;
@@ -304,7 +318,11 @@ async function mutateSelected(action) {
     if (action === "retry") {
       toast("작업을 다시 실행할 수 있도록 준비했습니다.");
     } else if (action === "run") {
-      toast("모델 실행 결과가 검토 대기 상태로 제출되었습니다.");
+      toast("모델 실행을 시작했습니다.");
+    } else if (action === "cancel") {
+      toast("실행 취소를 요청했습니다.");
+    } else if (action === "archive") {
+      toast("완료 작업을 보관했습니다.");
     } else {
       toast("작업 상태를 업데이트했습니다.");
     }

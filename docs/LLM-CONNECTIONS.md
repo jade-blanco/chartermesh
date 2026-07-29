@@ -165,6 +165,10 @@ node bin/chartermesh.mjs doctor --target TARGET
 ```
 
 `doctor` validates configuration without making a model call.
+The complete runtime document is checked against
+`schemas/runtime-config-v1alpha1.schema.json` before adapter-specific
+validation, so malformed hand edits and dangling engine references fail
+before inference.
 
 ## Cost visibility is a user policy
 
@@ -199,6 +203,12 @@ provider-side account limits remain the hard outer control.
 Token counts are retained when the endpoint returns them. Cost remains unknown
 unless the process reports a measured cost or the user supplies both token
 prices, in which case it is explicitly marked `estimated`.
+
+CharterMesh records the invocation as `running` before calling the engine.
+When a process is killed or a caller cancels, the same Control Plane
+cancellation path closes it as `canceled`; lease recovery closes an orphan as
+`abandoned`. Unknown usage or cost stays unknown rather than disappearing.
+ModelEngine adapters should honor the supplied `AbortSignal`.
 
 ## Security checklist
 

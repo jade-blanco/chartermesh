@@ -1,6 +1,6 @@
 # CharterMesh dashboard design contract
 
-Status: accepted for `0.0.2-alpha.1`.
+Status: accepted through `0.0.6-alpha.1`.
 
 The dashboard is a local projection and command client for the SQLite Control
 Plane. It is never a second task ledger.
@@ -19,10 +19,13 @@ The first screen answers:
 - Create an idempotent request.
 - Triage unassigned work.
 - Run ready or change-requested work.
+- Request durable cancellation of an active run without blocking the HTTP
+  response for the full model call.
 - Inspect immutable artifact content and exact SHA-256.
 - Approve, request changes, or reject.
 - Recover failed work to ready and run a new generation.
 - Complete approved work.
+- Archive completed or canceled work without deleting its evidence.
 - Filter all, actionable, waiting, and completed work.
 
 The inspector derives actions from server-projected state. The browser does not
@@ -30,7 +33,7 @@ edit database rows or invent transitions.
 
 ## Information architecture
 
-- Today: summary, prioritized work, inspector, runtime health.
+- Today: summary, cursor-bounded prioritized work, inspector, runtime health.
 - Work: same table and inspector.
 - Approvals: exact artifact review.
 - Runs & schedules, Organization, and Activity: reserved follow-on areas.

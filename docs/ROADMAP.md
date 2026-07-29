@@ -1,7 +1,7 @@
 # Implementation roadmap
 
-Current milestone: `0.0.5-alpha.1`, local trust-boundary hardening and
-consistent Control Plane recovery.
+Current milestone: `0.0.6-alpha.1`, durable invocation control and bounded
+local automation.
 
 ## Completed foundation
 
@@ -34,11 +34,20 @@ consistent Control Plane recovery.
   maintenance-locked approved restore with a pre-restore safety backup
 - Explicit human pause/resume for new run claims
 - Redirect-disabled and size-bounded HTTP model responses
+- Full dependency-free runtime JSON Schema validation with reference checks
+- Pre-call invocation records, cross-process/dashboard/signal cancellation,
+  and abandoned-call recovery
+- Cursor WorkItem pagination, terminal archive, and memory-bounded JSONL audit
+  streaming
+- Claim/retry/backoff/dead-letter outbox dispatcher with human replay
+- Optional local interval scheduler, disabled by default, with overlap control
+  and zero model starts on empty queues
 
 ## Next: execution hardening
 
-- Attempt-level dead-letter policy and active-run cancellation semantics
-- No-work scheduler and empty-start accounting
+- Attempt-level retry/dead-letter policy distinct from external outbox delivery
+- Broader recurrence rules, durable service installation, and missed-tick
+  policy for the local scheduler
 - Provider failover canary with permission/capability revalidation
 - More adversarial filesystem races and cross-user local-host testing
 
