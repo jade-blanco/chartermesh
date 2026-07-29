@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="chartermesh-session" content="__SESSION_TOKEN__" />
+    <title>CharterMesh · 오늘의 운영</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="navigation" aria-label="주 탐색">
+        <a class="brand" href="/" aria-label="CharterMesh 홈">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>CharterMesh</span>
+        </a>
+        <nav>
+          <a class="nav-item active" href="/" aria-current="page">
+            <span aria-hidden="true">⌂</span> 오늘
+          </a>
+          <button class="nav-item" type="button" data-filter-nav="all">
+            <span aria-hidden="true">▤</span> 작업
+          </button>
+          <button class="nav-item reserved" type="button" disabled title="준비 중">
+            <span aria-hidden="true">✓</span> 승인 <small>준비 중</small>
+          </button>
+          <button class="nav-item reserved" type="button" disabled title="준비 중">
+            <span aria-hidden="true">↻</span> 실행·일정 <small>준비 중</small>
+          </button>
+          <button class="nav-item reserved" type="button" disabled title="준비 중">
+            <span aria-hidden="true">◇</span> 조직 <small>준비 중</small>
+          </button>
+          <button class="nav-item reserved" type="button" disabled title="준비 중">
+            <span aria-hidden="true">◷</span> 활동 <small>준비 중</small>
+          </button>
+        </nav>
+        <div class="local-note">
+          <span class="health-dot"></span>
+          <div><strong>로컬 제어평면</strong><small>단일 상태 원장</small></div>
+        </div>
+      </aside>
+
+      <main>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">CONTROL PLANE</p>
+            <h1>오늘의 운영</h1>
+            <p>사람의 결정과 다음 실행이 필요한 작업을 한눈에 확인합니다.</p>
+          </div>
+          <button class="primary-button" id="new-request-button" type="button">
+            <span aria-hidden="true">＋</span> 새 요청
+          </button>
+        </header>
+
+        <section class="summary-grid" aria-label="운영 요약">
+          <article class="summary-card blue">
+            <div><span class="summary-icon">↗</span><span>지금 필요한 조치</span></div>
+            <strong id="summary-actionable">–</strong>
+            <small>실행 또는 결정 가능</small>
+          </article>
+          <article class="summary-card violet">
+            <div><span class="summary-icon">✓</span><span>사람 검토</span></div>
+            <strong id="summary-approvals">–</strong>
+            <small>불변 산출물 검토</small>
+          </article>
+          <article class="summary-card amber">
+            <div><span class="summary-icon">?</span><span>사용자 입력</span></div>
+            <strong id="summary-input">–</strong>
+            <small>답변이 있어야 재개</small>
+          </article>
+          <article class="summary-card red">
+            <div><span class="summary-icon">!</span><span>실패</span></div>
+            <strong id="summary-failed">–</strong>
+            <small>검사와 재시도 필요</small>
+          </article>
+        </section>
+
+        <section class="workspace-card" aria-labelledby="work-heading">
+          <div class="section-heading">
+            <div>
+              <h2 id="work-heading">작업 흐름</h2>
+              <p>상태가 아닌 다음 조치를 기준으로 정렬됩니다.</p>
+            </div>
+            <div class="filters" role="group" aria-label="작업 필터">
+              <button class="filter active" data-filter="all" type="button">전체</button>
+              <button class="filter" data-filter="actionable" type="button">조치 필요</button>
+              <button class="filter" data-filter="waiting" type="button">대기 중</button>
+              <button class="filter" data-filter="completed" type="button">완료</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>상태</th>
+                  <th>작업</th>
+                  <th>담당</th>
+                  <th>다음 조치</th>
+                  <th>업데이트</th>
+                </tr>
+              </thead>
+              <tbody id="work-table-body">
+                <tr><td class="loading-cell" colspan="5">제어평면을 읽는 중…</td></tr>
+              </tbody>
+            </table>
+            <div class="mobile-list" id="mobile-work-list"></div>
+          </div>
+          <div class="empty-state" id="empty-state" hidden>
+            <span>◇</span>
+            <strong>이 필터에 해당하는 작업이 없습니다.</strong>
+            <p>새 요청을 만들거나 다른 필터를 선택하세요.</p>
+          </div>
+        </section>
+
+        <section class="runtime-band" aria-labelledby="runtime-heading">
+          <div>
+            <span class="runtime-symbol">⌁</span>
+            <div><h2 id="runtime-heading">런타임 상태</h2><p>엔진과 실행기의 연결 준비 상태</p></div>
+          </div>
+          <div class="runtime-items" id="runtime-items">
+            <span class="runtime-item"><i></i> 확인 중…</span>
+          </div>
+        </section>
+      </main>
+
+      <aside class="inspector" id="inspector" aria-labelledby="inspector-heading">
+        <button class="inspector-close" id="inspector-close" type="button" aria-label="상세 닫기">×</button>
+        <p class="eyebrow">WORK INSPECTOR</p>
+        <h2 id="inspector-heading">작업을 선택하세요</h2>
+        <p class="inspector-summary" id="inspector-summary">
+          표에서 작업을 선택하면 현재 상태, 다음 조치, 대기 이유와 계보를 볼 수 있습니다.
+        </p>
+        <div class="inspector-content" id="inspector-content" hidden>
+          <div class="inspector-block">
+            <label>현재 상태</label>
+            <div id="inspector-status"></div>
+          </div>
+          <div class="inspector-block emphasis">
+            <label>다음 조치</label>
+            <strong id="inspector-action"></strong>
+          </div>
+          <div class="inspector-grid">
+            <div><label>담당 역할</label><strong id="inspector-owner"></strong></div>
+            <div><label>실행 대상</label><strong id="inspector-target"></strong></div>
+          </div>
+          <div class="inspector-block" id="inspector-wait-block">
+            <label>대기 조건</label>
+            <p id="inspector-wait"></p>
+          </div>
+          <div class="inspector-block">
+            <label>계보</label>
+            <p class="mono" id="inspector-lineage"></p>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <dialog id="request-dialog">
+      <form id="request-form">
+        <div class="dialog-header">
+          <div><p class="eyebrow">NEW INTAKE</p><h2>새 요청</h2></div>
+          <button class="icon-button" value="cancel" type="button" id="dialog-close" aria-label="닫기">×</button>
+        </div>
+        <label for="request-title">요청 제목</label>
+        <input id="request-title" name="title" maxlength="180" required placeholder="예: 릴리스 안내문 초안 만들기" />
+        <label for="request-summary">요청 설명</label>
+        <textarea id="request-summary" name="summary" maxlength="4000" rows="5" required placeholder="목표와 완료 기준을 간단히 적어주세요."></textarea>
+        <p class="form-error" id="form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="secondary-button" value="cancel" type="button" id="dialog-cancel">취소</button>
+          <button class="primary-button" value="default" type="submit">요청 만들기</button>
+        </div>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

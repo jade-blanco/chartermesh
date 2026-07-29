@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible CharterMesh defect
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private artifacts, databases, or absolute private paths.
+  - type: input
+    id: version
+    attributes:
+      label: CharterMesh version or commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Node version and operating system
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use a synthetic target and sanitized output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private data, and absolute private paths.
+          required: true

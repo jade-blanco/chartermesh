@@ -1,0 +1,28 @@
+{
+  "name": "chartermesh",
+  "version": "0.0.1-alpha.1",
+  "private": true,
+  "description": "Provider-neutral organization-as-code control plane for AI work",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "chartermesh": "bin/chartermesh.mjs"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "chartermesh": "node bin/chartermesh.mjs",
+    "lint": "node scripts/check-boundaries.mjs",
+    "test": "node --test packages/adapter-sdk/test/negotiate.test.ts packages/orgspec/test/validator.test.ts packages/compiler/test/plan.test.ts packages/control-plane/test/control-plane.test.ts packages/runtime/test/managed-runner.test.ts adapters/model-engines/openai-compatible/test/adapter.test.ts apps/cli/test/cli-e2e.test.ts apps/dashboard/test/server.test.ts",
+    "smoke": "node --test apps/cli/test/cli-e2e.test.ts",
+    "verify": "pnpm lint && pnpm test"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "adapters/*",
+    "adapters/*/*"
+  ]
+}

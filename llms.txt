@@ -1,0 +1,12 @@
+# CharterMesh
+
+CharterMesh is a provider-neutral organization-as-code control plane for AI
+work.
+
+When asked to apply this repository to another project, read BOOTSTRAP.md and
+use its inspect -> plan -> exact human approval -> apply -> verify protocol.
+
+Project architecture: docs/PRODUCT-DESIGN.md
+CLI and first run: docs/FIRST-RUN.md
+Model connections: docs/LLM-CONNECTIONS.md
+Operating workflow: docs/USAGE.md

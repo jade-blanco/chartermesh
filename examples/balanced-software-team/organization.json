@@ -1,0 +1,212 @@
+{
+  "apiVersion": "chartermesh.dev/v1alpha1",
+  "kind": "Organization",
+  "metadata": {
+    "id": "example-product-team",
+    "name": "Example Product Team",
+    "revision": 1
+  },
+  "spec": {
+    "mission": "Research user needs and safely build, review, and release a product.",
+    "operatingProfile": "balanced",
+    "budgets": {
+      "monthlyCostLimitUsd": 100,
+      "maxConcurrentRuns": 3,
+      "maxDailyModelStarts": 24
+    },
+    "modelEngines": [
+      {
+        "id": "primary-llm",
+        "adapter": "generic-model-api",
+        "transport": "http",
+        "model": "configured-by-user",
+        "enabled": true
+      },
+      {
+        "id": "simulated-llm",
+        "adapter": "fake-model-engine",
+        "transport": "embedded",
+        "model": "deterministic-fixture",
+        "enabled": true
+      }
+    ],
+    "agentHosts": [],
+    "managedRunners": [
+      {
+        "id": "primary-runner",
+        "adapter": "builtin-managed-runner",
+        "modelEngineRef": "primary-llm",
+        "executionHost": "local",
+        "enabled": true
+      },
+      {
+        "id": "simulated-runner",
+        "adapter": "fake-managed-runner",
+        "modelEngineRef": "simulated-llm",
+        "executionHost": "local",
+        "enabled": true
+      }
+    ],
+    "executionTargets": [
+      {
+        "id": "generic-local",
+        "kind": "managed_runner",
+        "runnerRef": "primary-runner",
+        "enabled": true
+      },
+      {
+        "id": "simulated-fallback",
+        "kind": "managed_runner",
+        "runnerRef": "simulated-runner",
+        "enabled": true
+      }
+    ],
+    "roles": [
+      {
+        "id": "strategy",
+        "name": "Strategy",
+        "class": "c_level",
+        "executionMode": "manual_persistent",
+        "capabilities": [
+          "planning",
+          "prioritization",
+          "exception_routing"
+        ],
+        "requiredRuntimeCapabilities": [
+          "host.session.resume"
+        ],
+        "requiredModelCapabilities": [
+          "model.structured_output"
+        ],
+        "promptRef": "prompts/strategy.md",
+        "execution": {
+          "preferred": "generic-local",
+          "allowEmulation": true,
+          "fallbacks": [
+            "simulated-fallback"
+          ]
+        },
+        "concurrency": 1,
+        "tools": {
+          "allow": [
+            "work_read",
+            "work_create",
+            "proposal_write"
+          ],
+          "approvalRequired": [
+            "policy_apply",
+            "schedule_activate"
+          ]
+        },
+        "orchestration": {
+          "strategy": "single",
+          "maxWorkers": 1,
+          "workspaceIsolation": "shared_read_only",
+          "communication": "parent_only",
+          "humanApprovalAuthority": "control_plane_only"
+        }
+      },
+      {
+        "id": "implementation",
+        "name": "Implementation",
+        "class": "worker",
+        "executionMode": "scheduled_ephemeral",
+        "capabilities": [
+          "code_change",
+          "testing"
+        ],
+        "requiredRuntimeCapabilities": [
+          "host.delegate.subagent",
+          "host.workspace.isolated"
+        ],
+        "requiredModelCapabilities": [
+          "model.tool_calling"
+        ],
+        "promptRef": "prompts/implementation.md",
+        "execution": {
+          "preferred": "generic-local",
+          "fallbacks": [
+            "simulated-fallback"
+          ]
+        },
+        "concurrency": 2,
+        "tools": {
+          "allow": [
+            "repo_read",
+            "repo_write",
+            "test_run"
+          ],
+          "approvalRequired": [
+            "deploy",
+            "destructive_action"
+          ]
+        },
+        "orchestration": {
+          "strategy": "delegated",
+          "maxWorkers": 2,
+          "workspaceIsolation": "required",
+          "communication": "parent_only",
+          "humanApprovalAuthority": "control_plane_only"
+        }
+      }
+    ],
+    "workflows": [
+      {
+        "id": "feature-delivery",
+        "name": "Feature Delivery",
+        "trigger": {
+          "type": "queue"
+        },
+        "stages": [
+          {
+            "id": "implement",
+            "type": "agent",
+            "role": "implementation",
+            "outputContract": "schemas/implementation-result.json"
+          },
+          {
+            "id": "user-review",
+            "type": "approval",
+            "dependsOn": [
+              "implement"
+            ],
+            "acceptanceCriteria": [
+              "A human reviews the immutable implementation artifact."
+            ]
+          },
+          {
+            "id": "close",
+            "type": "deterministic",
+            "dependsOn": [
+              "user-review"
+            ],
+            "acceptanceCriteria": [
+              "The approved artifact is recorded as complete."
+            ]
+          }
+        ]
+      }
+    ],
+    "schedules": [
+      {
+        "id": "implementation-dispatch",
+        "workflow": "feature-delivery",
+        "cadence": {
+          "rrule": "FREQ=HOURLY;INTERVAL=3",
+          "timezone": "Asia/Seoul"
+        },
+        "activation": "proposed",
+        "executor": "controller",
+        "noWorkBehavior": "skip_without_model",
+        "overlapPolicy": "forbid"
+      }
+    ],
+    "policies": {
+      "externalSideEffects": "user_approval",
+      "destructiveActions": "prohibited",
+      "providerFailover": "same_or_lower_permissions",
+      "organizationChanges": "user_approval",
+      "firstRunMode": "read_only"
+    }
+  }
+}

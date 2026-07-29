@@ -1,0 +1,27 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  adapters/model-engines/fake: {}
+
+  adapters/model-engines/openai-compatible: {}
+
+  apps/cli: {}
+
+  apps/dashboard: {}
+
+  packages/adapter-sdk: {}
+
+  packages/compiler: {}
+
+  packages/control-plane: {}
+
+  packages/orgspec: {}
+
+  packages/runtime: {}
