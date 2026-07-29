@@ -29,6 +29,7 @@ function send(
   status: number,
   body: string | Buffer,
   contentType: string,
+  extraHeaders: Record<string, string> = {},
 ): void {
   response.writeHead(status, {
     "content-type": contentType,
@@ -38,12 +39,49 @@ function send(
     "referrer-policy": "no-referrer",
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
+    ...extraHeaders,
   });
   response.end(body);
 }
 
-function json(response: ServerResponse, status: number, value: unknown): void {
-  send(response, status, JSON.stringify(value), "application/json; charset=utf-8");
+function json(
+  response: ServerResponse,
+  status: number,
+  value: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
+  send(
+    response,
+    status,
+    JSON.stringify(value),
+    "application/json; charset=utf-8",
+    extraHeaders,
+  );
+}
+
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+
+function allowRate(
+  buckets: Map<string, RateBucket>,
+  key: string,
+  limit: number,
+  windowMs: number,
+): { allowed: boolean; retryAfter: number } {
+  const timestamp = Date.now();
+  const current = buckets.get(key);
+  const bucket =
+    !current || current.resetAt <= timestamp
+      ? { count: 0, resetAt: timestamp + windowMs }
+      : current;
+  bucket.count += 1;
+  buckets.set(key, bucket);
+  return {
+    allowed: bucket.count <= limit,
+    retryAfter: Math.max(1, Math.ceil((bucket.resetAt - timestamp) / 1000)),
+  };
 }
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -151,6 +189,9 @@ export async function startDashboard(
         monthlyCostLimitUsd: number;
         maxConcurrentRuns: number;
         maxDailyModelStarts: number;
+        unknownCostPolicy?: "block" | "warn" | "estimate";
+        maxArtifactBytes?: number;
+        maxWorkItemArtifactBytes?: number;
       }
     | undefined;
   try {
@@ -168,6 +209,7 @@ export async function startDashboard(
   );
   controlPlane.recoverExpiredLeases("system:dashboard-start");
   const sessionToken = randomBytes(32).toString("base64url");
+  const rateBuckets = new Map<string, RateBucket>();
   let port = options.port ?? 4173;
 
   const server = createServer(async (request, response) => {
@@ -192,6 +234,28 @@ export async function startDashboard(
     ) {
       json(response, 403, { error: "Invalid dashboard session." });
       return;
+    }
+    if (isApi) {
+      const remote = request.socket.remoteAddress ?? "loopback";
+      const checks = [
+        allowRate(rateBuckets, `${remote}:api`, 120, 60_000),
+        ...(isMutation
+          ? [allowRate(rateBuckets, `${remote}:mutation`, 30, 60_000)]
+          : []),
+        ...(isMutation && url.pathname.endsWith("/run")
+          ? [allowRate(rateBuckets, `${remote}:run`, 6, 60_000)]
+          : []),
+      ];
+      const denied = checks.find(({ allowed }) => !allowed);
+      if (denied) {
+        json(
+          response,
+          429,
+          { error: "Dashboard request rate limit exceeded." },
+          { "retry-after": String(denied.retryAfter) },
+        );
+        return;
+      }
     }
     if (isMutation) {
       const allowedOrigins = new Set([

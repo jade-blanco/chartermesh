@@ -1602,3 +1602,89 @@ changing the core architecture:
 The general tool-execution loop, process-death recovery during filesystem
 apply, scheduler/dead-letter/kill-switch behavior, and package publication are
 not complete and must not be represented as complete.
+
+# 0.0.3 authoritative implementation amendment — 2026-07-29
+
+This amendment supersedes the 0.0.2 implementation-status paragraph above:
+
+- The built-in ManagedRunner now owns a provider-neutral Tool Runtime. OrgSpec
+  roles declare exact allowed tools, approval-required tools, relative
+  workspace roots, and a hard iteration bound.
+- Tool call approval binds the WorkItem, tool name, and canonical arguments
+  hash. Only a human Control Plane actor can approve it. Workspace writes
+  always require approval.
+- Tool execution evidence is Control Plane state linked to Run and Attempt. It
+  records hashes, status, bounded paths, and timing without storing raw
+  arguments or results.
+- Bootstrap and engine configuration use an immutable pre-mutation journal,
+  durable commit marker, atomic per-target lock, and hash-directed automatic
+  rollback or finalization after process termination.
+- Multi-process stress suites cover claim fencing, idempotent replay, WAL
+  initialization, and writer-lock waits.
+- A dependency-free JavaScript build makes the repository installable as an
+  npm/Git package and is verified in a clean temporary consumer. Actual npm
+  registry or GitHub release publication still requires separate approval.
+- Local installation/CLI version matching is automatic and offline.
+  `version --check` is the explicit network latest-release check.
+
+Scheduler/dead-letter/kill-switch behavior, command/network/deployment tools,
+registry publication, and a broad clean-OS compatibility matrix remain
+incomplete and must not be represented as complete.
+
+# 0.0.4 authoritative implementation amendment — 2026-07-29
+
+This amendment supersedes the 0.0.3 implementation-status paragraph above:
+
+- Cost is an operator-owned policy. OrgSpec declares `warn`, `block`, or
+  `estimate`; runtime configuration may contain operator-supplied per-million
+  token prices. Unknown values remain null and are never treated as zero.
+- OrgSpec also bounds one artifact and cumulative WorkItem artifact bytes.
+- Dashboard APIs have per-process general, mutation, and model-run rate limits
+  in addition to loopback, Host, Origin, session, media-type, and body limits.
+- Audit events export as redacted JSONL without raw prompt/content/argument or
+  secret-like fields.
+- The Control Plane creates hashed, integrity-checked SQLite snapshots before
+  known-schema migration and on demand. Restore requires an exact current-state
+  plan hash and creates a pre-restore safety backup.
+- `command-process` is a provider-neutral ModelEngine adapter for any absolute
+  local executable implementing the versioned stdin/stdout JSON contract. It
+  uses no shell, inherits only a minimal/allowed environment, and bounds time
+  and output.
+- The dashboard now has explicit keyboard focus/escape return, filter pressed
+  state, skip navigation, semantic table headers, and mobile inspector hidden
+  state validated in the in-app Browser.
+
+The backup covers CharterMesh SQLite state, not the user's project or hosted
+disaster recovery. The command process is trusted local code, not a sandbox.
+Scheduler/dead-letter/global kill-switch behavior, external AgentHost adapters,
+registry publication, signed releases/SBOM, and a broad clean-OS matrix remain
+incomplete.
+
+# 0.0.5 authoritative implementation amendment — 2026-07-29
+
+This amendment supersedes the 0.0.4 implementation-status paragraph above:
+
+- A command-process engine is bound to the executable SHA-256 included in the
+  approved runtime plan. The digest is reverified before and after every spawn.
+  Its cwd is a dedicated ignored `.chartermesh/engine-work/ENGINE_ID`
+  directory, not the target project.
+- Control Plane backups are consistent DB+artifact sets. Referenced artifacts
+  are length/hash checked, deduplicated by content address, and bound into the
+  manifest through an artifact-set hash. Legacy DB-only manifests remain
+  readable.
+- Approved restore acquires a persistent maintenance lock, blocks new and
+  already-open Control Plane writers, makes a full pre-restore safety backup,
+  and replaces the DB and required artifacts through one journaled file
+  transaction.
+- A human-only pause flag, off by default, can block new claims without
+  canceling active work or changing WorkItem state.
+- OpenAI-compatible requests do not follow redirects and read responses
+  through an 8 MiB default, configurable 1 KiB–64 MiB bound.
+- Audit export is now a positive, flat evidence-field allowlist. Unknown and
+  nested fields are omitted, and invalid actor labels are normalized.
+
+These controls use no paid API, cloud resource, or new runtime dependency.
+Executable pinning is not an OS sandbox. Backups still exclude the user's
+project/Git files and hosted disaster recovery. Dead-letter policy, active-run
+termination, OS sandboxing, signed releases/SBOM, registry publication, and a
+broad clean-OS matrix remain incomplete.

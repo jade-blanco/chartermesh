@@ -72,11 +72,17 @@ function stableStrings(values: Iterable<string>): string[] {
 }
 
 function profileBudgets(profile: ProposalProfile) {
+  const operationalSafety = {
+    unknownCostPolicy: "warn" as const,
+    maxArtifactBytes: 1_048_576,
+    maxWorkItemArtifactBytes: 10_485_760,
+  };
   if (profile === "lean") {
     return {
       monthlyCostLimitUsd: 10,
       maxConcurrentRuns: 1,
       maxDailyModelStarts: 5,
+      ...operationalSafety,
     };
   }
   if (profile === "controlled") {
@@ -84,12 +90,14 @@ function profileBudgets(profile: ProposalProfile) {
       monthlyCostLimitUsd: 50,
       maxConcurrentRuns: 2,
       maxDailyModelStarts: 20,
+      ...operationalSafety,
     };
   }
   return {
     monthlyCostLimitUsd: 25,
     maxConcurrentRuns: 2,
     maxDailyModelStarts: 20,
+    ...operationalSafety,
   };
 }
 
@@ -192,7 +200,16 @@ export function organizationFor(
     requiredModelCapabilities: ["model.text.generate"],
     execution: { preferred: "local" },
     concurrency: 1,
-    tools: { allow: ["work_read", "artifact_write"] },
+    tools: {
+      allow: [
+        "workspace.list_files",
+        "workspace.read_file",
+        "workspace.write_file",
+      ],
+      approvalRequired: ["workspace.write_file"],
+      workspaceRoots: ["."],
+      maxIterations: profile === "lean" ? 3 : 5,
+    },
   };
   const roles: OrganizationSpec["spec"]["roles"] =
     profile === "controlled"
@@ -207,7 +224,11 @@ export function organizationFor(
             requiredModelCapabilities: ["model.text.generate"],
             execution: { preferred: "local" },
             concurrency: 1,
-            tools: { allow: ["work_read"] },
+            tools: {
+              allow: ["workspace.list_files", "workspace.read_file"],
+              workspaceRoots: ["."],
+              maxIterations: 4,
+            },
           },
         ]
       : [operator];

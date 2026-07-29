@@ -30,6 +30,19 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   outline: 3px solid rgba(11, 99, 230, .28);
   outline-offset: 2px;
 }
+.skip-link {
+  position: fixed;
+  z-index: 20;
+  top: 8px;
+  left: 8px;
+  padding: 10px 13px;
+  border-radius: 7px;
+  background: var(--ink);
+  color: #fff;
+  text-decoration: none;
+  transform: translateY(-150%);
+}
+.skip-link:focus { transform: translateY(0); }
 
 .app-shell {
   min-height: 100vh;

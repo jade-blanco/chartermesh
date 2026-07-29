@@ -5,6 +5,14 @@ work.
 
 When asked to apply this repository to another project, read BOOTSTRAP.md and
 use its inspect -> plan -> exact human approval -> apply -> verify protocol.
+With only the GitHub URL, the package-ready entry point is
+`npx --yes github:jade-blanco/chartermesh` after package-download approval.
+Tool execution is governed by OrgSpec allowlists, relative workspace roots,
+exact-call human approvals, evidence hashes, and bounded iterations.
+Any local executable can connect through the shell-free command-process JSON
+contract; its approved executable digest is pinned and it runs from a dedicated
+cwd. Unknown model cost follows the user's OrgSpec policy and is never silently
+zero. Allowlisted audit export and DB+artifact backup/restore remain local.
 
 Project architecture: docs/PRODUCT-DESIGN.md
 CLI and first run: docs/FIRST-RUN.md

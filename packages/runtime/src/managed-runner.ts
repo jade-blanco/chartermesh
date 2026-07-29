@@ -7,10 +7,15 @@ import type {
   ManagedRunnerManifest,
   ModelEngine,
 } from "../../adapter-sdk/src/types.ts";
+import type {
+  ToolExecutionEvidence,
+  ToolRuntime,
+} from "./tool-runtime.ts";
 
 export interface ManagedRunResult {
   hostRunId: string;
   inference: InferenceResult;
+  toolEvidence: ToolExecutionEvidence[];
 }
 
 export interface StructuredArtifact {
@@ -154,6 +159,19 @@ export class BuiltInManagedRunner implements ManagedRunner {
         stability: "stable",
       },
       {
+        name: "runner.tool_loop",
+        support: "native",
+        stability: "stable",
+        constraints: {
+          maxIterations: 12,
+          builtIns: [
+            "workspace.list_files",
+            "workspace.read_file",
+            "workspace.write_file",
+          ],
+        },
+      },
+      {
         name: "runner.repair_turn",
         support: "native",
         stability: "stable",
@@ -165,14 +183,21 @@ export class BuiltInManagedRunner implements ManagedRunner {
     string,
     {
       controller: AbortController;
-      promise: Promise<InferenceResult>;
+      promise: Promise<{
+        inference: InferenceResult;
+        toolEvidence: ToolExecutionEvidence[];
+      }>;
       cleanup: () => void;
     }
   >();
 
   async start(
     request: HostRunRequest,
-    options: { engine: ModelEngine; signal?: AbortSignal },
+    options: {
+      engine: ModelEngine;
+      signal?: AbortSignal;
+      toolRuntime?: ToolRuntime;
+    },
   ): Promise<HostRunHandle> {
     const hostRunId = `managed-${randomUUID()}`;
     const packet = request.taskPacket as {
@@ -222,20 +247,32 @@ export class BuiltInManagedRunner implements ManagedRunner {
       { role: "user" as const, content: prompt },
     ];
     const promise = (async () => {
-      const first = await options.engine.generate(
-        {
-          invocationId: `${request.attemptId}:1`,
-          messages,
-          responseSchema: structuredArtifactSchema,
-          maxOutputTokens: 1_500,
-        },
-        { signal: controller.signal },
-      );
+      const inferenceRequest = {
+        invocationId: `${request.attemptId}:1`,
+        messages,
+        responseSchema: structuredArtifactSchema,
+        maxOutputTokens: 1_500,
+      };
+      const toolLoop = options.toolRuntime
+        ? await options.toolRuntime.run(
+            options.engine,
+            inferenceRequest,
+            { signal: controller.signal },
+          )
+        : undefined;
+      const first =
+        toolLoop?.inference ??
+        (await options.engine.generate(inferenceRequest, {
+          signal: controller.signal,
+        }));
       let artifact = parseStructuredArtifact(first.text);
       if (artifact) {
         return {
-          ...first,
-          text: `${JSON.stringify(artifact, null, 2)}\n`,
+          inference: {
+            ...first,
+            text: `${JSON.stringify(artifact, null, 2)}\n`,
+          },
+          toolEvidence: toolLoop?.evidence ?? [],
         };
       }
       const repair = await options.engine.generate(
@@ -262,9 +299,12 @@ export class BuiltInManagedRunner implements ManagedRunner {
         );
       }
       return {
-        ...repair,
-        text: `${JSON.stringify(artifact, null, 2)}\n`,
-        usage: addUsage(first.usage, repair.usage),
+        inference: {
+          ...repair,
+          text: `${JSON.stringify(artifact, null, 2)}\n`,
+          usage: addUsage(first.usage, repair.usage),
+        },
+        toolEvidence: toolLoop?.evidence ?? [],
       };
     })();
     this.pending.set(hostRunId, { controller, promise, cleanup });
@@ -275,7 +315,8 @@ export class BuiltInManagedRunner implements ManagedRunner {
     const pending = this.pending.get(hostRunId);
     if (!pending) throw new Error(`Unknown managed run '${hostRunId}'.`);
     try {
-      return { hostRunId, inference: await pending.promise };
+      const result = await pending.promise;
+      return { hostRunId, ...result };
     } finally {
       pending.cleanup();
       this.pending.delete(hostRunId);

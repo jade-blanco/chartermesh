@@ -6,15 +6,77 @@ import type {
   ModelUsage,
 } from "../../../../packages/adapter-sdk/src/types.ts";
 
+const DEFAULT_MAX_RESPONSE_BYTES = 8_388_608;
+const MAX_CONFIGURABLE_RESPONSE_BYTES = 67_108_864;
+
 export interface OpenAICompatibleConfig {
   id: string;
   endpoint: string;
   model: string;
   apiKeyEnv?: string;
   timeoutMs?: number;
+  maxResponseBytes?: number;
   structuredOutputMode?: "prompt" | "json-schema";
   toolCalling?: boolean;
   reasoningMode?: "default" | "disabled";
+  pricing?: {
+    inputPerMillionTokensUsd: number;
+    outputPerMillionTokensUsd: number;
+  };
+}
+
+async function boundedJsonResponse(
+  response: Response,
+  maxBytes: number,
+): Promise<Record<string, unknown>> {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > maxBytes
+  ) {
+    await response.body?.cancel();
+    throw new Error("MODEL_RESPONSE_LIMIT_EXCEEDED");
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (response.body) {
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel();
+          throw new Error("MODEL_RESPONSE_LIMIT_EXCEEDED");
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("MODEL_RESPONSE_INVALID_JSON");
+    }
+    return value as Record<string, unknown>;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "MODEL_RESPONSE_INVALID_JSON"
+    ) {
+      throw error;
+    }
+    throw new Error("MODEL_RESPONSE_INVALID_JSON");
+  }
 }
 
 function completionUrl(endpoint: string): URL {
@@ -32,23 +94,34 @@ function completionUrl(endpoint: string): URL {
   return url;
 }
 
-function usageOf(value: unknown): ModelUsage {
+function usageOf(
+  value: unknown,
+  pricing?: OpenAICompatibleConfig["pricing"],
+): ModelUsage {
   const usage =
     value && typeof value === "object"
       ? (value as Record<string, unknown>)
       : {};
+  const inputTokens =
+    typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : null;
+  const outputTokens =
+    typeof usage.completion_tokens === "number"
+      ? usage.completion_tokens
+      : null;
+  const estimatedCost =
+    pricing && inputTokens !== null && outputTokens !== null
+      ? (inputTokens * pricing.inputPerMillionTokensUsd +
+          outputTokens * pricing.outputPerMillionTokensUsd) /
+        1_000_000
+      : null;
   return {
-    inputTokens:
-      typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : null,
-    outputTokens:
-      typeof usage.completion_tokens === "number"
-        ? usage.completion_tokens
-        : null,
+    inputTokens,
+    outputTokens,
     cacheReadTokens: null,
     cacheWriteTokens: null,
-    cost: null,
+    cost: estimatedCost,
     measurementStatus:
-      typeof usage.prompt_tokens === "number" ? "measured" : "unknown",
+      estimatedCost !== null ? "estimated" : "unknown",
   };
 }
 
@@ -155,19 +228,34 @@ export class OpenAICompatibleModelEngine implements ModelEngine {
     try {
       const response = await this.fetchImplementation(this.url, {
         method: "POST",
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           ...(key ? { authorization: `Bearer ${key}` } : {}),
         },
         body: JSON.stringify({
           model: this.config.model,
-          messages: request.messages.map(({ role, content, toolCallId }) => ({
-            role,
-            content,
-            ...(toolCallId ? { tool_call_id: toolCallId } : {}),
-          })),
+          messages: request.messages.map(
+            ({ role, content, toolCallId, toolCalls }) => ({
+              role,
+              content,
+              ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+              ...(toolCalls?.length
+                ? {
+                    tool_calls: toolCalls.map((call) => ({
+                      id: call.id,
+                      type: "function",
+                      function: {
+                        name: call.name,
+                        arguments: JSON.stringify(call.arguments),
+                      },
+                    })),
+                  }
+                : {}),
+            }),
+          ),
           stream: false,
-          ...(request.tools?.length
+          ...(this.config.toolCalling && request.tools?.length
             ? {
                 tools: request.tools.map((tool) => ({
                   type: "function",
@@ -208,7 +296,10 @@ export class OpenAICompatibleModelEngine implements ModelEngine {
         await response.body?.cancel();
         throw new Error(`Model endpoint returned HTTP ${response.status}.`);
       }
-      const payload = (await response.json()) as Record<string, unknown>;
+      const payload = await boundedJsonResponse(
+        response,
+        this.config.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+      );
       const choices = Array.isArray(payload.choices) ? payload.choices : [];
       const first = choices[0] as Record<string, unknown> | undefined;
       const message =
@@ -226,7 +317,7 @@ export class OpenAICompatibleModelEngine implements ModelEngine {
             : first?.finish_reason === "length"
               ? "length"
               : "stop",
-        usage: usageOf(payload.usage),
+        usage: usageOf(payload.usage, this.config.pricing),
       };
     } finally {
       clearTimeout(timeout);
@@ -255,6 +346,33 @@ export function validateOpenAICompatibleConfig(
     issues.push(error instanceof Error ? error.message : String(error));
   }
   if (!config.model.trim()) issues.push("Model id is required.");
+  if (
+    config.timeoutMs !== undefined &&
+    (!Number.isInteger(config.timeoutMs) ||
+      config.timeoutMs < 1_000 ||
+      config.timeoutMs > 600_000)
+  ) {
+    issues.push("Model timeout must be between 1000 and 600000 ms.");
+  }
+  if (
+    config.maxResponseBytes !== undefined &&
+    (!Number.isInteger(config.maxResponseBytes) ||
+      config.maxResponseBytes < 1_024 ||
+      config.maxResponseBytes > MAX_CONFIGURABLE_RESPONSE_BYTES)
+  ) {
+    issues.push(
+      "Model maxResponseBytes must be between 1024 and 67108864 bytes.",
+    );
+  }
+  if (
+    config.pricing &&
+    (!Number.isFinite(config.pricing.inputPerMillionTokensUsd) ||
+      config.pricing.inputPerMillionTokensUsd < 0 ||
+      !Number.isFinite(config.pricing.outputPerMillionTokensUsd) ||
+      config.pricing.outputPerMillionTokensUsd < 0)
+  ) {
+    issues.push("Pricing values must be finite non-negative numbers.");
+  }
   if (config.apiKeyEnv && !environment[config.apiKeyEnv]) {
     issues.push(`Environment variable '${config.apiKeyEnv}' is not set.`);
   }

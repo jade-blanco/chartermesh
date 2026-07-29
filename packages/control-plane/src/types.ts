@@ -112,4 +112,48 @@ export interface RuntimeBudgets {
   monthlyCostLimitUsd: number;
   maxConcurrentRuns: number;
   maxDailyModelStarts: number;
+  unknownCostPolicy?: "block" | "warn" | "estimate";
+  maxArtifactBytes?: number;
+  maxWorkItemArtifactBytes?: number;
+}
+
+export interface OperationalState {
+  paused: boolean;
+  pausedAt: string | null;
+  reason: string | null;
+  actor: string | null;
+}
+
+export interface ToolCallApproval {
+  id: string;
+  workItemId: string;
+  callHash: string;
+  toolName: string;
+  actor: string;
+  note: string;
+  createdAt: string;
+}
+
+export interface ToolExecutionEvidenceRecord {
+  id: string;
+  workItemId: string;
+  runId: string;
+  attemptId: string;
+  callHash: string;
+  toolName: string;
+  status: "succeeded" | "approval_required" | "denied" | "failed";
+  inputHash: string;
+  outputHash: string | null;
+  paths: string[];
+  durationMs: number;
+  createdAt: string;
+}
+
+export interface AuditRecord {
+  id: number;
+  type: string;
+  workItemId: string | null;
+  actor: string;
+  createdAt: string;
+  payload: Record<string, unknown>;
 }

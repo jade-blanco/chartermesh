@@ -8,7 +8,21 @@ const state = {
   selectedId: null,
   artifact: null,
   busy: false,
+  inspectorReturnFocus: null,
 };
+const inspector = document.querySelector("#inspector");
+const compactInspector = window.matchMedia("(max-width: 1100px)");
+
+function syncInspectorAccessibility() {
+  const hidden = compactInspector.matches && !inspector.classList.contains("open");
+  inspector.hidden = hidden;
+  inspector.toggleAttribute("inert", hidden);
+  if (hidden) inspector.setAttribute("aria-hidden", "true");
+  else inspector.removeAttribute("aria-hidden");
+}
+
+compactInspector.addEventListener("change", syncInspectorAccessibility);
+syncInspectorAccessibility();
 
 const statusLabels = {
   requested: ["요청됨", "amber"],
@@ -127,7 +141,7 @@ function renderWork() {
         <tr data-row-id="${escapeHtml(item.id)}" class="${item.id === state.selectedId ? "selected" : ""}">
           <td>${statusPill(item)}</td>
           <td>
-            <button class="work-title" type="button" data-select-id="${escapeHtml(item.id)}">
+            <button class="work-title" type="button" aria-controls="inspector" aria-current="${item.id === state.selectedId ? "true" : "false"}" data-select-id="${escapeHtml(item.id)}">
               ${escapeHtml(item.title)}
             </button>
             <span class="work-id">${escapeHtml(item.id)}</span>
@@ -141,7 +155,7 @@ function renderWork() {
   mobile.innerHTML = items
     .map(
       (item) => `
-        <button class="mobile-card" type="button" data-select-id="${escapeHtml(item.id)}">
+        <button class="mobile-card" type="button" aria-controls="inspector" aria-current="${item.id === state.selectedId ? "true" : "false"}" data-select-id="${escapeHtml(item.id)}">
           <span class="mobile-card-top">${statusPill(item)}<span class="work-id">${escapeHtml(item.id)}</span></span>
           <strong>${escapeHtml(item.title)}</strong>
           <p>${escapeHtml(item.nextAction)}</p>
@@ -208,7 +222,11 @@ function renderInspector() {
   content.hidden = false;
 }
 
-async function selectWork(id) {
+async function selectWork(id, focusInspector = true) {
+  const source = document.activeElement?.closest?.("[data-select-id]");
+  const sourceSelector = source?.classList.contains("mobile-card")
+    ? `.mobile-card[data-select-id="${CSS.escape(id)}"]`
+    : `.work-title[data-select-id="${CSS.escape(id)}"]`;
   state.selectedId = id;
   state.artifact = null;
   const item = state.projection?.workItems.find((entry) => entry.id === id);
@@ -222,8 +240,13 @@ async function selectWork(id) {
     }
   }
   renderWork();
+  state.inspectorReturnFocus = document.querySelector(sourceSelector);
   renderInspector();
-  document.querySelector("#inspector").classList.add("open");
+  inspector.classList.add("open");
+  syncInspectorAccessibility();
+  if (focusInspector) {
+    document.querySelector("#inspector-heading").focus();
+  }
 }
 
 async function loadDashboard() {
@@ -312,6 +335,7 @@ document.addEventListener("click", (event) => {
     state.filter = filter.dataset.filter;
     document.querySelectorAll("[data-filter]").forEach((button) => {
       button.classList.toggle("active", button === filter);
+      button.setAttribute("aria-pressed", String(button === filter));
     });
     renderWork();
   }
@@ -320,7 +344,8 @@ document.addEventListener("click", (event) => {
 });
 
 const dialog = document.querySelector("#request-dialog");
-document.querySelector("#new-request-button").addEventListener("click", () => {
+const newRequestButton = document.querySelector("#new-request-button");
+newRequestButton.addEventListener("click", () => {
   document.querySelector("#form-error").textContent = "";
   dialog.showModal();
   document.querySelector("#request-title").focus();
@@ -328,8 +353,26 @@ document.querySelector("#new-request-button").addEventListener("click", () => {
 for (const id of ["#dialog-close", "#dialog-cancel"]) {
   document.querySelector(id).addEventListener("click", () => dialog.close());
 }
-document.querySelector("#inspector-close").addEventListener("click", () => {
-  document.querySelector("#inspector").classList.remove("open");
+dialog.addEventListener("close", () => newRequestButton.focus());
+dialog.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    dialog.close();
+  }
+});
+function closeInspector() {
+  inspector.classList.remove("open");
+  syncInspectorAccessibility();
+  if (state.inspectorReturnFocus?.isConnected) {
+    state.inspectorReturnFocus.focus();
+  }
+}
+document.querySelector("#inspector-close").addEventListener("click", closeInspector);
+inspector.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeInspector();
+  }
 });
 
 document.querySelector("#request-form").addEventListener("submit", async (event) => {
@@ -346,10 +389,11 @@ document.querySelector("#request-form").addEventListener("submit", async (event)
         summary: form.get("summary"),
       }),
     });
-    dialog.close();
     formElement.reset();
     state.selectedId = result.id;
     await loadDashboard();
+    dialog.close();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
     await selectWork(result.id);
     toast("새 요청을 만들었습니다.");
   } catch (caught) {

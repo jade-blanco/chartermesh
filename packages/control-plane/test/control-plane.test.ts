@@ -172,6 +172,66 @@ test("idempotency replays the original response and rejects command reuse", () =
   }
 });
 
+test("human-controlled global pause blocks only new run claims", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Pause-aware work",
+      summary: "The item remains ready while run starts are paused.",
+      actor: "human:test",
+      idempotencyKey: "pause:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "pause:triage",
+    });
+    const paused = controlPlane.pauseOperations({
+      reason: "Operator requested a quiet window.",
+      actor: "human:test",
+      idempotencyKey: "pause:start",
+    });
+    assert.equal(paused.paused, true);
+    assert.equal(controlPlane.get(item.id).status, "ready");
+    assert.throws(
+      () =>
+        controlPlane.claim({
+          id: item.id,
+          actor: "role:operator",
+          idempotencyKey: "pause:blocked-claim",
+        }),
+      /OPERATIONS_PAUSED/u,
+    );
+    assert.throws(
+      () =>
+        controlPlane.resumeOperations({
+          actor: "role:operator",
+          idempotencyKey: "pause:invalid-resume",
+        }),
+      /REQUIRES_HUMAN/u,
+    );
+    assert.equal(
+      controlPlane.resumeOperations({
+        actor: "human:test",
+        idempotencyKey: "pause:resume",
+      }).paused,
+      false,
+    );
+    assert.equal(
+      controlPlane.claim({
+        id: item.id,
+        actor: "role:operator",
+        idempotencyKey: "pause:claim",
+      }).generation,
+      1,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("artifact evidence is fenced by run generation and exact hash", () => {
   const { database, controlPlane } = fixture();
   try {
@@ -232,6 +292,84 @@ test("artifact evidence is fenced by run generation and exact hash", () => {
       idempotencyKey: "fence:review",
     });
     assert.equal(approved.status, "approved");
+  } finally {
+    database.close();
+  }
+});
+
+test("artifact byte limits are enforced before evidence is written", () => {
+  const directory = mkdtempSync(join(tmpdir(), "chartermesh-artifact-limit-"));
+  const database = openControlPlaneDatabase(join(directory, "state.db"));
+  const controlPlane = new ControlPlane(database, join(directory, "artifacts"), {
+    budgets: {
+      monthlyCostLimitUsd: 10,
+      maxConcurrentRuns: 1,
+      maxDailyModelStarts: 10,
+      maxArtifactBytes: 8,
+      maxWorkItemArtifactBytes: 12,
+    },
+  });
+  try {
+    const item = controlPlane.intake({
+      title: "Bounded artifact",
+      summary: "Reject oversized evidence.",
+      actor: "human:test",
+      idempotencyKey: "artifact-limit:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "artifact-limit:triage",
+    });
+    const firstClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "artifact-limit:first-claim",
+    });
+    assert.throws(
+      () =>
+        controlPlane.submitArtifact({
+          id: item.id,
+          content: "123456789",
+          generation: firstClaim.generation,
+          actor: "runner:test",
+          idempotencyKey: "artifact-limit:oversized",
+        }),
+      /ARTIFACT_SIZE_LIMIT_EXCEEDED/u,
+    );
+    const first = controlPlane.submitArtifact({
+      id: item.id,
+      content: "12345678",
+      generation: firstClaim.generation,
+      actor: "runner:test",
+      idempotencyKey: "artifact-limit:first-submit",
+    });
+    controlPlane.decide({
+      id: item.id,
+      decision: "changes_requested",
+      artifactHash: first.sha256,
+      note: "Submit a revision.",
+      actor: "human:test",
+      idempotencyKey: "artifact-limit:changes",
+    });
+    const secondClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "artifact-limit:second-claim",
+    });
+    assert.throws(
+      () =>
+        controlPlane.submitArtifact({
+          id: item.id,
+          content: "12345",
+          generation: secondClaim.generation,
+          actor: "runner:test",
+          idempotencyKey: "artifact-limit:work-total",
+        }),
+      /WORK_ITEM_ARTIFACT_BUDGET_EXCEEDED/u,
+    );
   } finally {
     database.close();
   }
@@ -354,6 +492,187 @@ test("run starts enforce declared concurrency and daily budgets", () => {
         }),
       /BUDGET_CONCURRENT_RUNS_EXCEEDED/u,
     );
+  } finally {
+    database.close();
+  }
+});
+
+test("block cost policy refuses later claims after unknown monthly usage", () => {
+  const directory = mkdtempSync(join(tmpdir(), "chartermesh-cost-policy-"));
+  const database = openControlPlaneDatabase(join(directory, "state.db"));
+  const controlPlane = new ControlPlane(database, join(directory, "artifacts"), {
+    budgets: {
+      monthlyCostLimitUsd: 10,
+      maxConcurrentRuns: 2,
+      maxDailyModelStarts: 10,
+      unknownCostPolicy: "block",
+    },
+  });
+  try {
+    const prepare = (name: string) => {
+      const item = controlPlane.intake({
+        title: name,
+        summary: `Synthetic ${name} work.`,
+        actor: "human:test",
+        idempotencyKey: `cost-policy:intake:${name}`,
+      });
+      controlPlane.triage({
+        id: item.id,
+        ownerRole: "operator",
+        executionTarget: "local",
+        actor: "human:test",
+        idempotencyKey: `cost-policy:triage:${name}`,
+      });
+      return item;
+    };
+    const first = prepare("first");
+    const claim = controlPlane.claim({
+      id: first.id,
+      actor: "runner:test",
+      idempotencyKey: "cost-policy:first-claim",
+    });
+    controlPlane.recordInvocation({
+      attemptId: claim.attemptId,
+      engineId: "unknown-cost-engine",
+      modelId: "fixture",
+      status: "failed",
+      inputTokens: 10,
+      outputTokens: 5,
+      cost: null,
+      measurementStatus: "unknown",
+    });
+    controlPlane.failRun({
+      id: first.id,
+      generation: claim.generation,
+      attemptId: claim.attemptId,
+      errorCode: "FIXTURE_FAILURE",
+      errorMessage: "Synthetic failure.",
+      actor: "runner:test",
+      idempotencyKey: "cost-policy:first-fail",
+    });
+    const second = prepare("second");
+    assert.throws(
+      () =>
+        controlPlane.claim({
+          id: second.id,
+          actor: "runner:test",
+          idempotencyKey: "cost-policy:second-claim",
+        }),
+      /BUDGET_UNKNOWN_COST_BLOCKED/u,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("tool approval and execution evidence stay bound to exact hashes", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Approved tool call",
+      summary: "Record only hashes and safe path evidence.",
+      actor: "human:test",
+      idempotencyKey: "tool:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "tool:triage",
+    });
+    const claim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "tool:claim",
+    });
+    const callHash = "a".repeat(64);
+    assert.equal(
+      controlPlane.isToolCallApproved(
+        item.id,
+        callHash,
+        "workspace.write_file",
+      ),
+      false,
+    );
+    assert.throws(
+      () =>
+        controlPlane.approveToolCall({
+          id: item.id,
+          callHash,
+          toolName: "workspace.write_file",
+          actor: "role:model",
+          note: "A model cannot approve itself.",
+          idempotencyKey: "tool:invalid-approval",
+        }),
+      /human actor/u,
+    );
+    controlPlane.approveToolCall({
+      id: item.id,
+      callHash,
+      toolName: "workspace.write_file",
+      actor: "human:test",
+      note: "Exact arguments were reviewed.",
+      idempotencyKey: "tool:approval",
+    });
+    assert.equal(
+      controlPlane.isToolCallApproved(
+        item.id,
+        callHash,
+        "workspace.write_file",
+      ),
+      true,
+    );
+    controlPlane.recordToolEvidence({
+      evidenceId: "tool-evidence-test",
+      id: item.id,
+      runId: claim.runId,
+      attemptId: claim.attemptId,
+      callHash,
+      toolName: "workspace.write_file",
+      status: "succeeded",
+      inputHash: "b".repeat(64),
+      outputHash: "c".repeat(64),
+      paths: ["src/result.ts"],
+      durationMs: 12,
+      createdAt: new Date().toISOString(),
+      actor: "runner:test",
+    });
+    const evidence = controlPlane.listToolEvidence(item.id);
+    assert.equal(evidence.length, 1);
+    assert.equal(evidence[0]?.callHash, callHash);
+    assert.deepEqual(evidence[0]?.paths, ["src/result.ts"]);
+  } finally {
+    database.close();
+  }
+});
+
+test("audit export projection preserves allowlisted evidence and drops all other fields", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    database
+      .prepare(
+        `INSERT INTO events(
+          event_type, work_item_id, actor, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "fixture.audit",
+        null,
+        "must-not-export-actor-secret",
+        JSON.stringify({
+          sha256: "a".repeat(64),
+          token: "must-not-export",
+          nested: { arguments: { path: ".", content: "private" } },
+        }),
+        new Date().toISOString(),
+      );
+    const records = controlPlane.auditRecords();
+    assert.equal(records[0]?.payload.sha256, "a".repeat(64));
+    assert.equal(records[0]?.payload.token, undefined);
+    assert.equal(records[0]?.payload.nested, undefined);
+    assert.equal(records[0]?.actor, "system:unknown");
+    assert.doesNotMatch(JSON.stringify(records), /must-not-export|private/u);
   } finally {
     database.close();
   }

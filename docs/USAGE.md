@@ -37,6 +37,36 @@ at most one repair turn, and submits only from the active generation.
 Lease heartbeats protect active work. Expired leases recover to a visible
 `failed` state instead of leaving work permanently `in_progress`.
 
+## Safe tool execution
+
+The built-in tools are `workspace.list_files`, `workspace.read_file`, and
+`workspace.write_file`. The runtime:
+
+- offers only the assigned role's OrgSpec `tools.allow` entries;
+- resolves paths beneath the declared relative `workspaceRoots`;
+- rejects absolute paths, traversal, and symbolic-link targets;
+- always requires exact-call approval for workspace writes;
+- records call/input/output hashes, status, paths, and duration as Control
+  Plane evidence;
+- stops after OrgSpec `maxIterations`.
+
+An unapproved write fails visibly without touching the file and prints its
+canonical call hash. A human can approve that exact call, then start a fenced
+retry:
+
+```powershell
+node bin/chartermesh.mjs approve-tool `
+  --id work-000001 `
+  --call-hash CALL_SHA256 `
+  --tool workspace.write_file `
+  --note "Exact path and content hash reviewed." `
+  --target TARGET
+
+node bin/chartermesh.mjs retry --id work-000001 --target TARGET
+node bin/chartermesh.mjs run --id work-000001 --target TARGET
+node bin/chartermesh.mjs tool-evidence --id work-000001 --target TARGET --json
+```
+
 ## Failure and retry
 
 ```powershell
@@ -97,6 +127,8 @@ node bin/chartermesh.mjs dashboard --target TARGET --port 4173
 The inspector exposes the appropriate action for each state: triage, run,
 retry, review, or complete. Review shows artifact content and exact hash.
 Every action remains a Control Plane command with actor and idempotency.
+Loopback requests also have separate per-minute limits for all APIs, mutations,
+and model-run starts. A limited request returns `429` with `Retry-After`.
 
 ## Machine-readable CLI
 
@@ -122,9 +154,63 @@ Claims enforce the installed OrgSpec values:
 - `maxConcurrentRuns`
 - `maxDailyModelStarts`
 - `monthlyCostLimitUsd`
+- `unknownCostPolicy` (`warn`, `block`, or `estimate`)
+- `maxArtifactBytes`
+- `maxWorkItemArtifactBytes`
 
 Budget failures are stable error codes. They never trigger provider failover or
 silent permission expansion.
+
+Unknown cost is never converted to zero. The operator may provide input/output
+token prices in runtime configuration, producing an `estimated` cost. The
+`block` policy is conservative; `estimate` refuses to run without prices;
+`warn` preserves unknown cost while allowing execution.
+
+## Audit export
+
+```powershell
+node bin/chartermesh.mjs audit export --target TARGET --json
+```
+
+The output is JSONL under `.chartermesh/exports/` unless `--output` names
+another path inside the target. Only documented ids, hashes, state labels,
+engine/role labels, and timing evidence are exported. Unknown and nested
+payload fields are dropped rather than copied and redacted. Existing files are
+never overwritten.
+
+## Control Plane backup and restore
+
+```powershell
+node bin/chartermesh.mjs backup create --target TARGET --json
+node bin/chartermesh.mjs backup list --target TARGET --json
+node bin/chartermesh.mjs restore --backup BACKUP_ID --target TARGET --json
+```
+
+`restore` first returns a no-write plan containing current and backup hashes.
+Repeat with `--approve PLAN_HASH`. CharterMesh integrity-checks the selected
+SQLite snapshot and every content-addressed artifact blob, requires the current
+DB to still match the plan, creates a pre-restore safety backup, acquires a
+persistent maintenance lock, checkpoints SQLite, and replaces the database and
+referenced artifacts in one journaled file transaction. Existing processes may
+continue reading, but new and already-open writers fail with
+`CONTROL_PLANE_MAINTENANCE_ACTIVE` until restore releases the lock. Stop a
+dashboard if its open SQLite sidecar prevents checkpointing.
+
+This backs up `.chartermesh/state.db` and the artifacts it references, not the
+user's Git repository or project files. Artifact blobs are deduplicated by
+SHA-256 across backups. Unreferenced old artifact files may remain locally.
+
+## Pause and resume new runs
+
+```powershell
+node bin/chartermesh.mjs system status --target TARGET --json
+node bin/chartermesh.mjs system pause --reason "maintenance" --target TARGET
+node bin/chartermesh.mjs system resume --target TARGET
+```
+
+Pause is off by default and requires an explicit human command. It blocks only
+new claims with `OPERATIONS_PAUSED`; it does not cancel an active attempt,
+change WorkItem state, or contact a provider.
 
 ## Sources of truth
 

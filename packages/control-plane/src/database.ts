@@ -1,15 +1,50 @@
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createControlPlaneBackup } from "./backup.ts";
+import { assertMaintenanceInactive } from "./maintenance.ts";
 
-export function openControlPlaneDatabase(path: string): DatabaseSync {
-  mkdirSync(dirname(path), { recursive: true });
+export function openControlPlaneDatabase(
+  path: string,
+  options: { allowMaintenance?: boolean } = {},
+): DatabaseSync {
+  const existed = existsSync(path);
+  const stateDirectory = dirname(path);
+  mkdirSync(stateDirectory, { recursive: true });
+  if (!options.allowMaintenance) {
+    assertMaintenanceInactive(stateDirectory);
+  }
   const database = new DatabaseSync(path);
   database.exec(`
+    PRAGMA busy_timeout = 5000;
     PRAGMA foreign_keys = ON;
     PRAGMA journal_mode = WAL;
-    PRAGMA busy_timeout = 5000;
+  `);
+  if (existed) {
+    const hasMigrations = database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'table' AND name = 'schema_migrations'`,
+      )
+      .get() as { count: number };
+    if (Number(hasMigrations.count) > 0) {
+      const row = database
+        .prepare(
+          "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+        )
+        .get() as { version: number };
+      const priorVersion = Number(row.version);
+      if (priorVersion > 0 && priorVersion < 6) {
+        createControlPlaneBackup(
+          database,
+          join(dirname(path), "backups"),
+          "migration",
+        );
+      }
+    }
+  }
 
+  database.exec(`
     CREATE TABLE IF NOT EXISTS metadata (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -232,5 +267,57 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
       `)
       .run(new Date().toISOString());
   }
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS tool_approvals (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      call_hash TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      note TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(work_item_id, call_hash),
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS tool_evidence (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      call_hash TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      output_hash TEXT,
+      paths_json TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id),
+      FOREIGN KEY(run_id) REFERENCES runs(id),
+      FOREIGN KEY(attempt_id) REFERENCES attempts(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS tool_evidence_work_idx
+      ON tool_evidence(work_item_id, created_at);
+  `);
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (4, ?)
+    `)
+    .run(new Date().toISOString());
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (5, ?)
+    `)
+    .run(new Date().toISOString());
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (6, ?)
+    `)
+    .run(new Date().toISOString());
   return database;
 }

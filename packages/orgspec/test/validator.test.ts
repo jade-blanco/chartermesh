@@ -253,3 +253,24 @@ test("role concurrency cannot exceed the global budget", async () => {
 
   assert.ok(codes(candidate).includes("ROLE_EXCEEDS_GLOBAL_CONCURRENCY"));
 });
+
+test("tool policy requires write approval and project-relative roots", async () => {
+  const candidate = structuredClone(await loadOrganization());
+  const role = candidate.spec.roles[1]!;
+  role.tools.approvalRequired = [];
+  role.tools.workspaceRoots = ["../outside"];
+
+  const issueCodes = codes(candidate);
+  assert.ok(issueCodes.includes("WORKSPACE_WRITE_REQUIRES_APPROVAL"));
+  assert.ok(issueCodes.includes("INVALID_TOOL_WORKSPACE_ROOT"));
+});
+
+test("older v1alpha1 tool policies receive safe runtime defaults", async () => {
+  const candidate = structuredClone(await loadOrganization());
+  for (const role of candidate.spec.roles) {
+    delete role.tools.workspaceRoots;
+    delete role.tools.maxIterations;
+  }
+
+  assert.equal(validateOrgSpec(candidate, runtimeManifests).ok, true);
+});

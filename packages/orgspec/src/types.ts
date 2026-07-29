@@ -31,6 +31,8 @@ export interface ExecutionSelection {
 export interface ToolPolicy {
   allow: string[];
   approvalRequired?: string[];
+  workspaceRoots?: string[];
+  maxIterations?: number;
 }
 
 export interface RoleSpec {
@@ -137,6 +139,9 @@ export interface OrganizationSpec {
       monthlyCostLimitUsd: number;
       maxConcurrentRuns: number;
       maxDailyModelStarts: number;
+      unknownCostPolicy?: "block" | "warn" | "estimate";
+      maxArtifactBytes?: number;
+      maxWorkItemArtifactBytes?: number;
     };
     modelEngines: ModelEngineProfile[];
     agentHosts: AgentHostProfile[];

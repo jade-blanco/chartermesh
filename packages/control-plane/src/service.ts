@@ -8,16 +8,23 @@ import {
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  AuditRecord,
   ArtifactEvidence,
   DashboardProjection,
+  OperationalState,
   RuntimeBudgets,
+  ToolCallApproval,
+  ToolExecutionEvidenceRecord,
   UserAction,
   WaitCondition,
   WorkItem,
   WorkStatus,
 } from "./types.ts";
+import { assertMaintenanceInactive } from "./maintenance.ts";
 
 type Row = Record<string, unknown>;
+const DEFAULT_MAX_ARTIFACT_BYTES = 1_048_576;
+const DEFAULT_MAX_WORK_ITEM_ARTIFACT_BYTES = 10_485_760;
 
 function now(): string {
   return new Date().toISOString();
@@ -75,23 +82,100 @@ function transaction<T>(database: DatabaseSync, operation: () => T): T {
   }
 }
 
+const AUDIT_PAYLOAD_FIELDS = new Set([
+  "paused",
+  "rootId",
+  "ownerRole",
+  "executionTarget",
+  "predecessorId",
+  "runId",
+  "attemptId",
+  "leaseId",
+  "generation",
+  "expiresAt",
+  "errorCode",
+  "artifactId",
+  "sha256",
+  "approvalId",
+  "decision",
+  "artifactHash",
+  "completedPredecessor",
+  "callHash",
+  "toolName",
+  "evidenceId",
+  "status",
+  "inputHash",
+  "outputHash",
+]);
+
+function allowlistedAuditPayload(
+  value: unknown,
+): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).flatMap(
+      ([key, entryValue]) => {
+        if (!AUDIT_PAYLOAD_FIELDS.has(key)) return [];
+        if (
+          entryValue === null ||
+          typeof entryValue === "boolean" ||
+          (typeof entryValue === "number" &&
+            Number.isFinite(entryValue)) ||
+          (typeof entryValue === "string" &&
+            entryValue.length <= 512)
+        ) {
+          return [[key, entryValue]];
+        }
+        return [];
+      },
+    ),
+  );
+}
+
+function safeAuditActor(value: unknown): string {
+  const actor = String(value);
+  return /^(?:human|role|runner|system):[A-Za-z0-9._-]{1,96}$/u.test(actor)
+    ? actor
+    : "system:unknown";
+}
+
 export class ControlPlane {
   private readonly database: DatabaseSync;
   private readonly artifactDirectory: string;
   private readonly budgets?: RuntimeBudgets;
+  private readonly maintenanceDirectory: string;
 
   constructor(
     database: DatabaseSync,
     artifactDirectory: string,
-    options: { budgets?: RuntimeBudgets } = {},
+    options: {
+      budgets?: RuntimeBudgets;
+      maintenanceDirectory?: string;
+    } = {},
   ) {
     this.database = database;
     this.artifactDirectory = artifactDirectory;
     this.budgets = options.budgets;
+    this.maintenanceDirectory =
+      options.maintenanceDirectory ?? join(artifactDirectory, "..");
     mkdirSync(artifactDirectory, { recursive: true });
   }
 
+  private assertWritable(): void {
+    assertMaintenanceInactive(this.maintenanceDirectory);
+  }
+
+  private transact<T>(operation: () => T): T {
+    this.assertWritable();
+    return transaction(this.database, operation);
+  }
+
   private assertRunBudgets(): void {
+    if (this.operationalState().paused) {
+      throw new Error("OPERATIONS_PAUSED");
+    }
     if (!this.budgets) return;
     const active = this.database
       .prepare(
@@ -121,6 +205,92 @@ export class ControlPlane {
     if (Number(spend.cost) >= this.budgets.monthlyCostLimitUsd) {
       throw new Error("BUDGET_MONTHLY_COST_EXCEEDED");
     }
+    if (this.budgets.unknownCostPolicy === "block") {
+      const unknown = this.database
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM model_invocations
+           WHERE started_at >= ? AND cost IS NULL`,
+        )
+        .get(monthStart.toISOString()) as Row;
+      if (Number(unknown.count) > 0) {
+        throw new Error("BUDGET_UNKNOWN_COST_BLOCKED");
+      }
+    }
+  }
+
+  operationalState(): OperationalState {
+    const row = this.database
+      .prepare("SELECT value FROM metadata WHERE key = 'operations:pause'")
+      .get() as Row | undefined;
+    if (!row) {
+      return {
+        paused: false,
+        pausedAt: null,
+        reason: null,
+        actor: null,
+      };
+    }
+    try {
+      const value = JSON.parse(String(row.value)) as {
+        pausedAt?: unknown;
+        reason?: unknown;
+        actor?: unknown;
+      };
+      return {
+        paused: true,
+        pausedAt:
+          typeof value.pausedAt === "string" ? value.pausedAt : null,
+        reason: typeof value.reason === "string" ? value.reason : null,
+        actor: typeof value.actor === "string" ? value.actor : null,
+      };
+    } catch {
+      throw new Error("OPERATIONS_PAUSE_STATE_INVALID");
+    }
+  }
+
+  pauseOperations(input: {
+    reason: string;
+    actor: string;
+    idempotencyKey: string;
+  }): OperationalState {
+    return this.command(input.idempotencyKey, "operations.pause", () => {
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("OPERATIONS_PAUSE_REQUIRES_HUMAN");
+      }
+      const state: OperationalState = {
+        paused: true,
+        pausedAt: now(),
+        reason: assertText(input.reason, "reason"),
+        actor: input.actor,
+      };
+      this.database
+        .prepare(`
+          INSERT INTO metadata(key, value) VALUES ('operations:pause', ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `)
+        .run(JSON.stringify(state));
+      this.event("operations.paused", null, input.actor, { paused: true });
+      return state;
+    });
+  }
+
+  resumeOperations(input: {
+    actor: string;
+    idempotencyKey: string;
+  }): OperationalState {
+    return this.command(input.idempotencyKey, "operations.resume", () => {
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("OPERATIONS_RESUME_REQUIRES_HUMAN");
+      }
+      this.database
+        .prepare("DELETE FROM metadata WHERE key = 'operations:pause'")
+        .run();
+      this.event("operations.resumed", null, input.actor, {
+        paused: false,
+      });
+      return this.operationalState();
+    });
   }
 
   private nextId(prefix: string): string {
@@ -159,13 +329,38 @@ export class ControlPlane {
       .run(result.lastInsertRowid, type, JSON.stringify(payload), stamp);
   }
 
+  auditRecords(): AuditRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT id, event_type, work_item_id, actor, payload_json, created_at
+         FROM events ORDER BY id ASC`,
+      )
+      .all() as Row[];
+    return rows.map((row) => {
+      let payload: unknown = {};
+      try {
+        payload = JSON.parse(String(row.payload_json));
+      } catch {
+        payload = { parseError: true };
+      }
+      return {
+        id: Number(row.id),
+        type: String(row.event_type),
+        workItemId: row.work_item_id ? String(row.work_item_id) : null,
+        actor: safeAuditActor(row.actor),
+        createdAt: String(row.created_at),
+        payload: allowlistedAuditPayload(payload),
+      };
+    });
+  }
+
   private command<T>(
     idempotencyKey: string,
     command: string,
     operation: () => T,
   ): T {
     assertText(idempotencyKey, "idempotencyKey");
-    return transaction(this.database, () => {
+    return this.transact(() => {
       const replay = this.database
         .prepare(`
           SELECT command, response_json
@@ -552,7 +747,7 @@ export class ControlPlane {
   }
 
   recoverExpiredLeases(actor = "system:recovery"): string[] {
-    return transaction(this.database, () => {
+    return this.transact(() => {
       const expired = this.database
         .prepare(`
           SELECT l.id AS lease_id, l.run_id, l.attempt_id, l.generation,
@@ -761,7 +956,26 @@ export class ControlPlane {
         throw new Error("Only in-progress work can submit an artifact.");
       }
       this.assertActiveGeneration(input.id, input.generation);
-      const content = assertText(input.content, "artifact content");
+      const content = input.content;
+      if (!content.trim()) throw new Error("artifact content is required.");
+      const byteSize = Buffer.byteLength(content);
+      const maxArtifactBytes =
+        this.budgets?.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
+      if (byteSize > maxArtifactBytes) {
+        throw new Error("ARTIFACT_SIZE_LIMIT_EXCEEDED");
+      }
+      const priorBytes = this.database
+        .prepare(
+          `SELECT COALESCE(SUM(byte_size), 0) AS bytes
+           FROM artifacts WHERE work_item_id = ?`,
+        )
+        .get(input.id) as Row;
+      const maxWorkItemArtifactBytes =
+        this.budgets?.maxWorkItemArtifactBytes ??
+        DEFAULT_MAX_WORK_ITEM_ARTIFACT_BYTES;
+      if (Number(priorBytes.bytes) + byteSize > maxWorkItemArtifactBytes) {
+        throw new Error("WORK_ITEM_ARTIFACT_BUDGET_EXCEEDED");
+      }
       const run = this.database
         .prepare(`
           SELECT id FROM runs
@@ -794,7 +1008,7 @@ export class ControlPlane {
           digest,
           storageName,
           input.mediaType ?? "text/plain",
-          Buffer.byteLength(content),
+          byteSize,
           now(),
         );
       this.database
@@ -970,7 +1184,7 @@ export class ControlPlane {
     cost: number | null;
     measurementStatus: "measured" | "estimated" | "unknown";
   }): string {
-    return transaction(this.database, () => {
+    return this.transact(() => {
       const id = this.nextId("invocation");
       const stamp = now();
       this.database
@@ -995,6 +1209,185 @@ export class ControlPlane {
         );
       return id;
     });
+  }
+
+  approveToolCall(input: {
+    id: string;
+    callHash: string;
+    toolName: string;
+    actor: string;
+    note: string;
+    idempotencyKey: string;
+  }): ToolCallApproval {
+    return this.command(input.idempotencyKey, "tool.approve", () => {
+      this.get(input.id);
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("Tool approval authority must be a human actor.");
+      }
+      if (!/^[a-f0-9]{64}$/u.test(input.callHash)) {
+        throw new Error("callHash must be a SHA-256 digest.");
+      }
+      const toolName = assertText(input.toolName, "toolName");
+      const approvalId = this.nextId("tool-approval");
+      const createdAt = now();
+      this.database
+        .prepare(`
+          INSERT INTO tool_approvals(
+            id, work_item_id, call_hash, tool_name, actor, note, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          approvalId,
+          input.id,
+          input.callHash,
+          toolName,
+          input.actor,
+          assertText(input.note, "note"),
+          createdAt,
+        );
+      this.event("tool.approved", input.id, input.actor, {
+        approvalId,
+        callHash: input.callHash,
+        toolName,
+      });
+      return {
+        id: approvalId,
+        workItemId: input.id,
+        callHash: input.callHash,
+        toolName,
+        actor: input.actor,
+        note: input.note.trim(),
+        createdAt,
+      };
+    });
+  }
+
+  isToolCallApproved(
+    id: string,
+    callHash: string,
+    toolName: string,
+  ): boolean {
+    const row = this.database
+      .prepare(`
+        SELECT 1
+        FROM tool_approvals
+        WHERE work_item_id = ? AND call_hash = ? AND tool_name = ?
+      `)
+      .get(id, callHash, toolName);
+    return Boolean(row);
+  }
+
+  recordToolEvidence(input: {
+    evidenceId: string;
+    id: string;
+    runId: string;
+    attemptId: string;
+    callHash: string;
+    toolName: string;
+    status: ToolExecutionEvidenceRecord["status"];
+    inputHash: string;
+    outputHash: string | null;
+    paths: string[];
+    durationMs: number;
+    createdAt: string;
+    actor: string;
+  }): ToolExecutionEvidenceRecord {
+    return this.command(
+      `tool-evidence:${input.evidenceId}`,
+      "tool.evidence.record",
+      () => {
+        this.get(input.id);
+        for (const hash of [
+          input.callHash,
+          input.inputHash,
+          ...(input.outputHash ? [input.outputHash] : []),
+        ]) {
+          if (!/^[a-f0-9]{64}$/u.test(hash)) {
+            throw new Error("Tool evidence contains an invalid SHA-256 digest.");
+          }
+        }
+        if (
+          !["succeeded", "approval_required", "denied", "failed"].includes(
+            input.status,
+          )
+        ) {
+          throw new Error("Tool evidence status is invalid.");
+        }
+        const record: ToolExecutionEvidenceRecord = {
+          id: input.evidenceId,
+          workItemId: input.id,
+          runId: input.runId,
+          attemptId: input.attemptId,
+          callHash: input.callHash,
+          toolName: assertText(input.toolName, "toolName"),
+          status: input.status,
+          inputHash: input.inputHash,
+          outputHash: input.outputHash,
+          paths: input.paths.map((path) =>
+            assertText(path, "evidence path").slice(0, 1_000)
+          ),
+          durationMs: Math.max(0, Math.floor(input.durationMs)),
+          createdAt: input.createdAt,
+        };
+        this.database
+          .prepare(`
+            INSERT INTO tool_evidence(
+              id, work_item_id, run_id, attempt_id, call_hash, tool_name,
+              status, input_hash, output_hash, paths_json, duration_ms,
+              created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `)
+          .run(
+            record.id,
+            record.workItemId,
+            record.runId,
+            record.attemptId,
+            record.callHash,
+            record.toolName,
+            record.status,
+            record.inputHash,
+            record.outputHash,
+            JSON.stringify(record.paths),
+            record.durationMs,
+            record.createdAt,
+          );
+        this.event("tool.executed", input.id, input.actor, {
+          evidenceId: record.id,
+          callHash: record.callHash,
+          toolName: record.toolName,
+          status: record.status,
+          inputHash: record.inputHash,
+          outputHash: record.outputHash,
+        });
+        return record;
+      },
+    );
+  }
+
+  listToolEvidence(id: string): ToolExecutionEvidenceRecord[] {
+    this.get(id);
+    const rows = this.database
+      .prepare(`
+        SELECT *
+        FROM tool_evidence
+        WHERE work_item_id = ?
+        ORDER BY created_at, id
+      `)
+      .all(id) as Row[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      workItemId: String(row.work_item_id),
+      runId: String(row.run_id),
+      attemptId: String(row.attempt_id),
+      callHash: String(row.call_hash),
+      toolName: String(row.tool_name),
+      status: String(row.status) as ToolExecutionEvidenceRecord["status"],
+      inputHash: String(row.input_hash),
+      outputHash: row.output_hash ? String(row.output_hash) : null,
+      paths: JSON.parse(String(row.paths_json)) as string[],
+      durationMs: Number(row.duration_ms),
+      createdAt: String(row.created_at),
+    }));
   }
 
   latestArtifact(id: string): ArtifactEvidence | null {

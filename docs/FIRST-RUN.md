@@ -5,6 +5,18 @@ review loop, and only then connects a live model.
 
 ## 1. Prepare CharterMesh
 
+GitHub package path, with no manual source checkout:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh version --json
+npx --yes github:jade-blanco/chartermesh propose `
+  --target C:\path\to\target `
+  --profile balanced
+```
+
+This requires an explicitly authorized package download. For source
+development:
+
 ```powershell
 git clone https://github.com/jade-blanco/chartermesh.git chartermesh
 cd chartermesh
@@ -61,6 +73,9 @@ node bin/chartermesh.mjs bootstrap `
 ```
 
 Changed target state produces a new hash and invalidates the old approval.
+The apply journal survives process termination. `doctor` and the next plan
+command automatically recover an incomplete replacement; `recover` is also
+available as an explicit diagnostic command.
 
 ## 4. Diagnose and exercise the offline workflow
 
@@ -73,7 +88,8 @@ node bin/chartermesh.mjs dashboard --target C:\path\to\target
 The dashboard can triage, run, retry, inspect the exact artifact and SHA-256,
 approve or request changes, and complete work. It binds only to loopback. All
 API reads require the per-process browser session token; mutations additionally
-require same-origin JSON and an idempotency key.
+require same-origin JSON and an idempotency key. General API, mutation, and
+model-run request rates are bounded independently.
 
 ## 5. Configure a live engine
 
@@ -90,6 +106,34 @@ node bin/chartermesh.mjs configure-engine `
 Review and approve the new plan hash, then run `doctor` again. Use
 `--structured-output json-schema` only if the serving engine supports the
 OpenAI JSON Schema response-format extension.
+
+Add `--tool-calling` only when the engine implements OpenAI-style function
+calls. The common Tool Runtime still exposes only tools allowed by the
+assigned OrgSpec role. It confines paths to `workspaceRoots`, requires exact
+human approval for writes, records hash-only evidence, and stops at
+`maxIterations`.
+
+For a local runtime wrapper with no compatible HTTP endpoint:
+
+```powershell
+node bin/chartermesh.mjs configure-engine `
+  --target C:\path\to\target `
+  --engine command-process `
+  --command C:\absolute\path\to\engine.exe `
+  --command-arg --chartermesh-json `
+  --pass-env LOCAL_MODEL_HOME
+```
+
+The process must implement the neutral JSON contract in
+`LLM-CONNECTIONS.md`. No shell is used and the full parent environment is not
+inherited. The approved plan pins the executable SHA-256 and execution uses an
+ignored per-engine cwd. If that executable is upgraded, approve a new
+`configure-engine` plan before running it again.
+
+Before paid use, review `organization.json` and choose
+`unknownCostPolicy: warn|block|estimate`. For `estimate`, configure both
+`--input-price-per-million` and `--output-price-per-million`; these are the
+operator's model/account prices, not CharterMesh pricing.
 
 ## 6. Run the synthetic model evaluation
 

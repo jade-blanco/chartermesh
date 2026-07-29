@@ -8,6 +8,8 @@ importers:
 
   .: {}
 
+  adapters/model-engines/command-process: {}
+
   adapters/model-engines/fake: {}
 
   adapters/model-engines/openai-compatible: {}

@@ -197,6 +197,43 @@ function validateRoleOrchestrationShape(
 ): void {
   const path = `/spec/roles/${index}`;
   const orchestration = role.orchestration;
+  const approvals = new Set(role.tools.approvalRequired ?? []);
+  for (const tool of approvals) {
+    if (!role.tools.allow.includes(tool)) {
+      add(
+        issues,
+        "TOOL_APPROVAL_NOT_ALLOWED",
+        `${path}/tools/approvalRequired`,
+        `Approval-required tool '${tool}' must also appear in allow.`,
+      );
+    }
+  }
+  for (const root of role.tools.workspaceRoots ?? ["."]) {
+    if (
+      root.startsWith("/") ||
+      root.startsWith("\\") ||
+      /^[a-zA-Z]:/u.test(root) ||
+      root.split(/[\\/]/u).includes("..")
+    ) {
+      add(
+        issues,
+        "INVALID_TOOL_WORKSPACE_ROOT",
+        `${path}/tools/workspaceRoots`,
+        `Workspace root '${root}' must be a project-relative path without '..'.`,
+      );
+    }
+  }
+  if (
+    role.tools.allow.includes("workspace.write_file") &&
+    !approvals.has("workspace.write_file")
+  ) {
+    add(
+      issues,
+      "WORKSPACE_WRITE_REQUIRES_APPROVAL",
+      `${path}/tools/approvalRequired`,
+      "workspace.write_file must require exact-call human approval.",
+    );
+  }
   if (!orchestration) return;
 
   if (orchestration.maxWorkers < 1) {
@@ -228,7 +265,12 @@ function validateRoleOrchestrationShape(
   }
 
   const writesWorkspace = role.tools.allow.some((tool) =>
-    ["repo_write", "file_write", "code_change"].includes(tool),
+    [
+      "repo_write",
+      "file_write",
+      "code_change",
+      "workspace.write_file",
+    ].includes(tool),
   );
   const isolated =
     orchestration.workspaceIsolation === "required" ||
@@ -741,6 +783,35 @@ export function validateOrgSpec(
       "INVALID_BUDGET",
       "/spec/budgets",
       "Budget values must be non-negative and run/start limits must be positive integers.",
+    );
+  }
+  if (
+    budgets.unknownCostPolicy !== undefined &&
+    !["block", "warn", "estimate"].includes(budgets.unknownCostPolicy)
+  ) {
+    add(
+      issues,
+      "INVALID_UNKNOWN_COST_POLICY",
+      "/spec/budgets/unknownCostPolicy",
+      "unknownCostPolicy must be block, warn, or estimate.",
+    );
+  }
+  if (
+    (budgets.maxArtifactBytes !== undefined &&
+      (!Number.isInteger(budgets.maxArtifactBytes) ||
+        budgets.maxArtifactBytes < 1)) ||
+    (budgets.maxWorkItemArtifactBytes !== undefined &&
+      (!Number.isInteger(budgets.maxWorkItemArtifactBytes) ||
+        budgets.maxWorkItemArtifactBytes < 1)) ||
+    (budgets.maxArtifactBytes !== undefined &&
+      budgets.maxWorkItemArtifactBytes !== undefined &&
+      budgets.maxWorkItemArtifactBytes < budgets.maxArtifactBytes)
+  ) {
+    add(
+      issues,
+      "INVALID_ARTIFACT_BUDGET",
+      "/spec/budgets",
+      "Artifact limits must be positive integers and the work-item limit must not be smaller than the per-artifact limit.",
     );
   }
 

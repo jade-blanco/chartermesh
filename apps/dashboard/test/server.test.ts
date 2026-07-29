@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createProposal } from "../../cli/src/proposal.ts";
 import { startDashboard } from "../src/server.ts";
 
 function initializedTarget(): string {
@@ -23,6 +24,10 @@ function initializedTarget(): string {
       ],
     }),
   );
+  writeFileSync(
+    join(state, "organization.json"),
+    `${JSON.stringify(createProposal(target, "balanced").organization, null, 2)}\n`,
+  );
   return target;
 }
 
@@ -40,6 +45,13 @@ test("dashboard serves one projection and protects mutations", async () => {
       /name="chartermesh-session" content="([^"]+)"/u,
     )?.[1];
     assert.ok(token);
+    assert.match(html, /class="skip-link" href="#main-content"/u);
+    assert.match(html, /aria-pressed="true">전체/u);
+    assert.match(html, /<th scope="col">상태<\/th>/u);
+    assert.match(
+      html,
+      /id="request-dialog" aria-labelledby="request-dialog-heading"/u,
+    );
 
     const rejectedRead = await fetch(`${dashboard.url}/api/dashboard`);
     assert.equal(rejectedRead.status, 403);
@@ -143,6 +155,33 @@ test("dashboard serves one projection and protects mutations", async () => {
     assert.equal(completed.status, 200);
     const final = await completed.json();
     assert.equal(final.workItem.status, "done");
+  } finally {
+    await dashboard.close();
+  }
+});
+
+test("dashboard API applies a bounded loopback rate limit", async () => {
+  const dashboard = await startDashboard({
+    target: initializedTarget(),
+    port: 0,
+    quiet: true,
+  });
+  try {
+    const html = await fetch(dashboard.url).then((response) => response.text());
+    const token = html.match(
+      /name="chartermesh-session" content="([^"]+)"/u,
+    )?.[1];
+    assert.ok(token);
+    const headers = { "x-chartermesh-session": token };
+    for (let index = 0; index < 120; index += 1) {
+      const response = await fetch(`${dashboard.url}/api/runtime`, {
+        headers,
+      });
+      assert.equal(response.status, 200);
+    }
+    const limited = await fetch(`${dashboard.url}/api/runtime`, { headers });
+    assert.equal(limited.status, 429);
+    assert.ok(Number(limited.headers.get("retry-after")) >= 1);
   } finally {
     await dashboard.close();
   }

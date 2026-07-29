@@ -1,10 +1,28 @@
 {
   "name": "chartermesh",
-  "version": "0.0.2-alpha.1",
-  "private": true,
+  "version": "0.0.5-alpha.1",
+  "private": false,
   "description": "Provider-neutral organization-as-code control plane for AI work",
   "license": "Apache-2.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jade-blanco/chartermesh.git"
+  },
+  "homepage": "https://github.com/jade-blanco/chartermesh#readme",
+  "bugs": {
+    "url": "https://github.com/jade-blanco/chartermesh/issues"
+  },
+  "files": [
+    "bin/",
+    "dist/**",
+    "scripts/build-package.mjs",
+    "BOOTSTRAP.md",
+    "README.md",
+    "LICENSE",
+    "llms.txt",
+    "AGENTS.md"
+  ],
   "bin": {
     "chartermesh": "bin/chartermesh.mjs"
   },
@@ -14,10 +32,14 @@
   },
   "scripts": {
     "chartermesh": "node bin/chartermesh.mjs",
+    "build:package": "node scripts/build-package.mjs",
     "lint": "node scripts/check-boundaries.mjs",
-    "test": "node --test packages/adapter-sdk/test/negotiate.test.ts packages/orgspec/test/validator.test.ts packages/compiler/test/plan.test.ts packages/control-plane/test/control-plane.test.ts packages/runtime/test/managed-runner.test.ts adapters/model-engines/openai-compatible/test/adapter.test.ts apps/cli/test/cli-e2e.test.ts apps/dashboard/test/server.test.ts",
+    "test": "node --test packages/adapter-sdk/test/negotiate.test.ts packages/orgspec/test/validator.test.ts packages/compiler/test/plan.test.ts packages/compiler/test/file-transaction.test.ts packages/control-plane/test/control-plane.test.ts packages/control-plane/test/backup.test.ts packages/control-plane/test/multiprocess.test.ts packages/runtime/test/managed-runner.test.ts packages/runtime/test/tool-runtime.test.ts adapters/model-engines/openai-compatible/test/adapter.test.ts adapters/model-engines/command-process/test/adapter.test.ts apps/cli/test/cli-e2e.test.ts apps/dashboard/test/server.test.ts",
     "smoke": "node --test apps/cli/test/cli-e2e.test.ts",
-    "verify": "pnpm lint && pnpm test"
+    "prepare": "node scripts/build-package.mjs",
+    "prepack": "node scripts/build-package.mjs",
+    "pack:check": "pnpm build:package && node scripts/test-package-install.mjs",
+    "verify": "pnpm lint && pnpm test && pnpm pack:check"
   },
   "workspaces": [
     "apps/*",

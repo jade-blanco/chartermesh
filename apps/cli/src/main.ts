@@ -4,14 +4,20 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
-  renameSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, resolve, join } from "node:path";
+import { dirname, resolve, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FakeModelEngine } from "../../../adapters/model-engines/fake/src/index.ts";
+import {
+  CommandProcessModelEngine,
+  sha256Executable,
+  validateCommandProcessConfig,
+  type CommandProcessConfig,
+} from "../../../adapters/model-engines/command-process/src/index.ts";
 import {
   OpenAICompatibleModelEngine,
   validateOpenAICompatibleConfig,
@@ -19,14 +25,26 @@ import {
 } from "../../../adapters/model-engines/openai-compatible/src/index.ts";
 import {
   ControlPlane,
+  acquireMaintenanceLock,
+  createControlPlaneBackup,
+  listControlPlaneBackups,
   openControlPlaneDatabase,
+  readControlPlaneBackup,
+  validateControlPlaneDatabase,
   type WaitCondition,
 } from "../../../packages/control-plane/src/index.ts";
 import {
   parseOrgSpec,
   sha256,
 } from "../../../packages/orgspec/src/index.ts";
-import { BuiltInManagedRunner } from "../../../packages/runtime/src/index.ts";
+import {
+  applyFileTransaction,
+  recoverFileTransactions,
+} from "../../../packages/compiler/src/index.ts";
+import {
+  BuiltInManagedRunner,
+  createWorkspaceToolRuntime,
+} from "../../../packages/runtime/src/index.ts";
 import {
   createProposal,
   type OrganizationProposal,
@@ -35,12 +53,15 @@ import {
 import { evaluateModelEngine } from "./evaluate-model.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
-const CHARTERMESH_VERSION = "0.0.2-alpha.1";
+const CHARTERMESH_VERSION = "0.0.5-alpha.1";
 
 interface RuntimeConfig {
   apiVersion: "chartermesh.dev/runtime/v1alpha1";
   modelEngines: Array<
     | { id: string; adapter: "fake" }
+    | ({
+        adapter: "command-process";
+      } & CommandProcessConfig)
     | ({
         adapter: "openai-compatible";
       } & OpenAICompatibleConfig)
@@ -68,6 +89,19 @@ interface BootstrapPlan {
   planHash: string;
 }
 
+interface RestorePlan {
+  apiVersion: "chartermesh.dev/restore-plan/v1alpha1";
+  operation: "restore-control-plane";
+  target: string;
+  backupId: string;
+  backupSha256: string;
+  currentSha256: string;
+  backupSchemaVersion: number;
+  backupArtifactCount: number;
+  backupArtifactSetSha256: string;
+  planHash: string;
+}
+
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
   if (index < 0) return undefined;
@@ -80,6 +114,18 @@ function option(args: string[], name: string): string | undefined {
 
 function has(args: string[], name: string): boolean {
   return args.includes(name);
+}
+
+function options(args: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== name) continue;
+    const value = args[index + 1];
+    if (!value) throw new Error(`${name} requires a value.`);
+    values.push(value);
+    index += 1;
+  }
+  return values;
 }
 
 function writeJsonEnvelope(
@@ -101,6 +147,46 @@ function writeJsonEnvelope(
   );
 }
 
+export function compareVersions(left: string, right: string): number {
+  const parse = (value: string) => {
+    const match = value
+      .replace(/^v/u, "")
+      .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/u);
+    if (!match) return null;
+    return {
+      core: [Number(match[1]), Number(match[2]), Number(match[3])],
+      prerelease: match[4]?.split(".") ?? [],
+    };
+  };
+  const a = parse(left);
+  const b = parse(right);
+  if (!a || !b) return left.localeCompare(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a.core[index] !== b.core[index]) {
+      return (a.core[index] ?? 0) - (b.core[index] ?? 0);
+    }
+  }
+  if (a.prerelease.length === 0 && b.prerelease.length > 0) return 1;
+  if (a.prerelease.length > 0 && b.prerelease.length === 0) return -1;
+  const length = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = a.prerelease[index];
+    const rightPart = b.prerelease[index];
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    if (leftPart === rightPart) continue;
+    const leftNumber = /^\d+$/u.test(leftPart) ? Number(leftPart) : null;
+    const rightNumber = /^\d+$/u.test(rightPart) ? Number(rightPart) : null;
+    if (leftNumber !== null && rightNumber !== null) {
+      return leftNumber - rightNumber;
+    }
+    if (leftNumber !== null) return -1;
+    if (rightNumber !== null) return 1;
+    return leftPart.localeCompare(rightPart);
+  }
+  return 0;
+}
+
 function targetOf(args: string[]): string {
   return resolve(option(args, "--target") ?? process.cwd());
 }
@@ -115,6 +201,9 @@ function statePaths(target: string) {
     organization: join(root, "organization.json"),
     proposal: join(root, "proposal.json"),
     runtime: join(root, "runtime.json"),
+    exports: join(root, "exports"),
+    backups: join(root, "backups"),
+    engineWork: join(root, "engine-work"),
   };
 }
 
@@ -126,6 +215,9 @@ function controlPlaneFor(target: string) {
         monthlyCostLimitUsd: number;
         maxConcurrentRuns: number;
         maxDailyModelStarts: number;
+        unknownCostPolicy?: "block" | "warn" | "estimate";
+        maxArtifactBytes?: number;
+        maxWorkItemArtifactBytes?: number;
       }
     | undefined;
   if (existsSync(paths.organization)) {
@@ -157,12 +249,34 @@ function readRuntime(target: string): RuntimeConfig {
   return JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
 }
 
-function configuredEngine(config: RuntimeConfig, engineId?: string) {
+function readOrganization(target: string) {
+  const path = statePaths(target).organization;
+  if (!existsSync(path)) {
+    throw new Error(
+      "Organization configuration is missing. Run 'chartermesh bootstrap' first.",
+    );
+  }
+  return parseOrgSpec(readFileSync(path, "utf8"));
+}
+
+function configuredEngine(
+  config: RuntimeConfig,
+  target: string,
+  engineId?: string,
+) {
   const profile = engineId
     ? config.modelEngines.find(({ id }) => id === engineId)
     : config.modelEngines[0];
   if (!profile) throw new Error(`Unknown model engine '${engineId}'.`);
   if (profile.adapter === "fake") return new FakeModelEngine();
+  if (profile.adapter === "command-process") {
+    const workingDirectory = join(
+      statePaths(target).engineWork,
+      profile.id.replace(/[^A-Za-z0-9._-]/gu, "_"),
+    );
+    mkdirSync(workingDirectory, { recursive: true });
+    return new CommandProcessModelEngine(profile, workingDirectory);
+  }
   const issues = validateOpenAICompatibleConfig(profile);
   if (issues.length > 0) throw new Error(issues.join("\n"));
   return new OpenAICompatibleModelEngine(profile);
@@ -174,6 +288,31 @@ function profileOf(args: string[]): ProposalProfile {
     throw new Error("--profile must be lean, balanced, or controlled.");
   }
   return value as ProposalProfile;
+}
+
+function pricingFrom(args: string[]) {
+  const input = option(args, "--input-price-per-million");
+  const output = option(args, "--output-price-per-million");
+  if ((input === undefined) !== (output === undefined)) {
+    throw new Error(
+      "--input-price-per-million and --output-price-per-million must be provided together.",
+    );
+  }
+  if (input === undefined || output === undefined) return undefined;
+  const inputValue = Number(input);
+  const outputValue = Number(output);
+  if (
+    !Number.isFinite(inputValue) ||
+    inputValue < 0 ||
+    !Number.isFinite(outputValue) ||
+    outputValue < 0
+  ) {
+    throw new Error("Model pricing must use finite non-negative numbers.");
+  }
+  return {
+    inputPerMillionTokensUsd: inputValue,
+    outputPerMillionTokensUsd: outputValue,
+  };
 }
 
 function proposalFor(args: string[]): OrganizationProposal {
@@ -195,8 +334,39 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
       ],
     };
   }
+  if (adapter === "command-process") {
+    const command = option(args, "--command");
+    if (!command) {
+      throw new Error("command-process requires --command ABSOLUTE_PATH.");
+    }
+    const config: CommandProcessConfig = {
+      id: "primary-model",
+      command,
+      executableSha256: sha256Executable(command),
+      args: options(args, "--command-arg"),
+      model: option(args, "--model") ?? "command-process",
+      timeoutMs: Number(option(args, "--timeout-ms") ?? 60_000),
+      environmentAllowlist: options(args, "--pass-env"),
+      ...(pricingFrom(args) ? { pricing: pricingFrom(args) } : {}),
+    };
+    const issues = validateCommandProcessConfig(config);
+    if (issues.length > 0) throw new Error(issues.join("\n"));
+    return {
+      apiVersion: "chartermesh.dev/runtime/v1alpha1",
+      modelEngines: [{ adapter: "command-process", ...config }],
+      managedRunners: [
+        {
+          id: "local-runner",
+          adapter: "builtin-managed-runner",
+          modelEngineRef: "primary-model",
+        },
+      ],
+    };
+  }
   if (adapter !== "openai-compatible") {
-    throw new Error("--engine must be fake or openai-compatible.");
+    throw new Error(
+      "--engine must be fake, command-process, or openai-compatible.",
+    );
   }
   const endpoint = option(args, "--endpoint");
   const model = option(args, "--model");
@@ -226,11 +396,15 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
           ? { apiKeyEnv: option(args, "--api-key-env") }
           : {}),
         timeoutMs: Number(option(args, "--timeout-ms") ?? 60_000),
+        maxResponseBytes: Number(
+          option(args, "--max-response-bytes") ?? 8_388_608,
+        ),
         structuredOutputMode: structuredOutputMode as
           | "prompt"
           | "json-schema",
         ...(has(args, "--tool-calling") ? { toolCalling: true } : {}),
         reasoningMode: reasoningMode as "default" | "disabled",
+        ...(pricingFrom(args) ? { pricing: pricingFrom(args) } : {}),
       },
     ],
     managedRunners: [
@@ -245,6 +419,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
 
 function bootstrapPlan(args: string[]): BootstrapPlan {
   const target = targetOf(args);
+  recoverFileTransactions(target);
   const runtime = runtimeTemplate(args);
   const paths = statePaths(target);
   const proposal = proposalFor(args);
@@ -281,7 +456,12 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
         "state.db",
         "state.db-*",
         "artifacts/",
+        "backups/",
+        "engine-work/",
+        "exports/",
         "dashboard.port",
+        ".transactions/",
+        ".apply-lock/",
         "",
       ].join("\n"),
     },
@@ -293,6 +473,7 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
         "- `proposal.json`, `organization.json`, and `runtime.json` are reviewable desired configuration.",
         "- `installation.json` pins the CharterMesh version and proposal hashes.",
         "- `state.db` is the local mutable ledger and is ignored by Git.",
+        "- `backups/` and `exports/` can contain private operational metadata and are ignored by Git.",
         "- Credentials are read only from the environment variable named in `runtime.json`.",
         "- Run `chartermesh doctor --target .` before live model use.",
         "",
@@ -321,6 +502,7 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
 
 function runtimePlan(args: string[]): BootstrapPlan {
   const target = targetOf(args);
+  recoverFileTransactions(target);
   if (!existsSync(statePaths(target).organization)) {
     throw new Error("CharterMesh is not initialized. Run bootstrap first.");
   }
@@ -406,98 +588,13 @@ function applyBootstrap(args: string[], plan: BootstrapPlan): void {
   if (approved !== plan.planHash) {
     throw new Error("Approval hash does not match the current bootstrap plan.");
   }
-  for (const file of plan.files) {
-    if (file.beforeHash === null && existsSync(file.path)) {
-      throw new Error(`Target changed after planning: '${file.path}' now exists.`);
-    }
-    if (file.beforeHash !== null) {
-      if (!existsSync(file.path)) {
-        throw new Error(`Target changed after planning: '${file.path}' was removed.`);
-      }
-      const current = createHash("sha256").update(readFileSync(file.path)).digest("hex");
-      if (current !== file.beforeHash) {
-        throw new Error(`Target changed after planning: '${file.path}'.`);
-      }
-    }
-  }
-  const changed = plan.files.filter(
-    ({ beforeHash, afterHash }) => beforeHash !== afterHash,
+  applyFileTransaction(
+    plan.target,
+    plan.planHash,
+    plan.files,
   );
-  const stageDirectory = join(
-    statePaths(plan.target).root,
-    `.apply-${plan.planHash.slice(0, 16)}`,
-  );
-  const staged = changed.map((file, index) => ({
-    file,
-    nextPath: join(stageDirectory, `${index}.next`),
-    backupPath: join(stageDirectory, `${index}.before`),
-  }));
-  const applied: typeof staged = [];
-  mkdirSync(stageDirectory, { recursive: true });
-  try {
-    for (const entry of staged) {
-      writeFileSync(entry.nextPath, entry.file.content, {
-        encoding: "utf8",
-        flag: "wx",
-      });
-      const stagedHash = createHash("sha256")
-        .update(readFileSync(entry.nextPath))
-        .digest("hex");
-      if (stagedHash !== entry.file.afterHash) {
-        throw new Error(`Staged content hash mismatch for '${entry.file.path}'.`);
-      }
-    }
-    writeFileSync(
-      join(stageDirectory, "journal.json"),
-      `${JSON.stringify(
-        {
-          apiVersion: "chartermesh.dev/apply-journal/v1alpha1",
-          planHash: plan.planHash,
-          files: staged.map(({ file, nextPath, backupPath }) => ({
-            target: file.path,
-            nextPath,
-            backupPath: file.beforeHash === null ? null : backupPath,
-          })),
-        },
-        null,
-        2,
-      )}\n`,
-      { encoding: "utf8", flag: "wx" },
-    );
-    for (const entry of staged) {
-      mkdirSync(dirname(entry.file.path), { recursive: true });
-      if (entry.file.beforeHash !== null) {
-        renameSync(entry.file.path, entry.backupPath);
-      }
-      try {
-        renameSync(entry.nextPath, entry.file.path);
-      } catch (error) {
-        if (
-          entry.file.beforeHash !== null &&
-          existsSync(entry.backupPath) &&
-          !existsSync(entry.file.path)
-        ) {
-          renameSync(entry.backupPath, entry.file.path);
-        }
-        throw error;
-      }
-      applied.push(entry);
-    }
-    const { database } = controlPlaneFor(plan.target);
-    database.close();
-  } catch (error) {
-    for (const entry of [...applied].reverse()) {
-      if (existsSync(entry.file.path)) {
-        rmSync(entry.file.path, { force: true });
-      }
-      if (entry.file.beforeHash !== null && existsSync(entry.backupPath)) {
-        renameSync(entry.backupPath, entry.file.path);
-      }
-    }
-    throw error;
-  } finally {
-    rmSync(stageDirectory, { recursive: true, force: true });
-  }
+  const { database } = controlPlaneFor(plan.target);
+  database.close();
   if (has(args, "--json")) {
     writeJsonEnvelope(plan.operation, {
       applied: true,
@@ -562,13 +659,29 @@ function seedDemo(target: string): void {
 }
 
 function doctor(target: string, args: string[]): number {
+  const recovered = recoverFileTransactions(target);
   const issues: string[] = [];
   const paths = statePaths(target);
+  let organization: ReturnType<typeof readOrganization> | undefined;
+  if (existsSync(paths.installation)) {
+    try {
+      const installed = JSON.parse(
+        readFileSync(paths.installation, "utf8"),
+      ) as { charterMeshVersion?: string };
+      if (installed.charterMeshVersion !== CHARTERMESH_VERSION) {
+        issues.push(
+          `installation.json pins ${installed.charterMeshVersion ?? "an unknown version"} but this CLI is ${CHARTERMESH_VERSION}`,
+        );
+      }
+    } catch {
+      issues.push("installation.json is invalid");
+    }
+  }
   if (!existsSync(paths.organization)) {
     issues.push("organization.json is missing");
   } else {
     try {
-      parseOrgSpec(readFileSync(paths.organization, "utf8"));
+      organization = parseOrgSpec(readFileSync(paths.organization, "utf8"));
     } catch (error) {
       issues.push(
         error instanceof Error
@@ -585,6 +698,36 @@ function doctor(target: string, args: string[]): number {
       if (engine.adapter === "openai-compatible") {
         issues.push(...validateOpenAICompatibleConfig(engine));
       }
+      if (engine.adapter === "command-process") {
+        issues.push(...validateCommandProcessConfig(engine));
+        try {
+          if (
+            sha256Executable(engine.command) !==
+            engine.executableSha256
+          ) {
+            issues.push(
+              `Command-process executable digest changed for '${engine.id}'.`,
+            );
+          }
+        } catch {
+          issues.push(
+            `Command-process executable is unavailable for '${engine.id}'.`,
+          );
+        }
+      }
+      const policy =
+        organization?.spec.budgets.unknownCostPolicy ?? "warn";
+      if (
+        engine.adapter !== "fake" &&
+        !("pricing" in engine && engine.pricing) &&
+        ["block", "estimate"].includes(policy)
+      ) {
+        issues.push(
+          policy === "block"
+            ? `Engine '${engine.id}' has unknown cost but OrgSpec blocks unknown-cost runs`
+            : `Engine '${engine.id}' needs pricing for the OrgSpec estimate policy`,
+        );
+      }
     }
   }
   const result = {
@@ -594,6 +737,7 @@ function doctor(target: string, args: string[]): number {
     controlPlane: existsSync(paths.database) ? "ready" : "not_initialized",
     runtimeConfiguration: issues.length === 0 ? "ready" : "attention_required",
     issues,
+    recovery: recovered,
   };
   if (has(args, "--json")) {
     writeJsonEnvelope("doctor", result, issues.length === 0);
@@ -609,6 +753,335 @@ function doctor(target: string, args: string[]): number {
   console.log("Runtime configuration requires attention:");
   for (const issue of issues) console.log(`- ${issue}`);
   return 1;
+}
+
+async function version(args: string[]): Promise<number> {
+  const target = targetOf(args);
+  let installationVersion: string | null = null;
+  const installation = statePaths(target).installation;
+  if (existsSync(installation)) {
+    try {
+      installationVersion = String(
+        (
+          JSON.parse(readFileSync(installation, "utf8")) as {
+            charterMeshVersion?: string;
+          }
+        ).charterMeshVersion ?? "",
+      ) || null;
+    } catch {
+      // Doctor reports malformed installation metadata.
+    }
+  }
+  let latestVersion: string | null = null;
+  let updateCheck: "not_requested" | "current" | "update_available" | "failed" =
+    "not_requested";
+  if (has(args, "--check")) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error("Version check timed out.")),
+      3_000,
+    );
+    try {
+      const response = await fetch(
+        "https://api.github.com/repos/jade-blanco/chartermesh/releases/latest",
+        {
+          headers: {
+            accept: "application/vnd.github+json",
+            "user-agent": `chartermesh/${CHARTERMESH_VERSION}`,
+          },
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) throw new Error(`GitHub returned ${response.status}.`);
+      const payload = (await response.json()) as { tag_name?: string };
+      latestVersion = payload.tag_name?.replace(/^v/u, "") ?? null;
+      updateCheck =
+        latestVersion &&
+        compareVersions(latestVersion, CHARTERMESH_VERSION) > 0
+          ? "update_available"
+          : "current";
+    } catch {
+      updateCheck = "failed";
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  const data = {
+    currentVersion: CHARTERMESH_VERSION,
+    installationVersion,
+    installationMatches:
+      installationVersion === null ||
+      installationVersion === CHARTERMESH_VERSION,
+    updateCheck,
+    latestVersion,
+  };
+  if (has(args, "--json")) writeJsonEnvelope("version", data);
+  else {
+    console.log(`CharterMesh ${CHARTERMESH_VERSION}`);
+    if (installationVersion) {
+      console.log(
+        `Target installation: ${installationVersion}` +
+          (data.installationMatches ? " (matches)" : " (mismatch)"),
+      );
+    }
+    if (has(args, "--check")) {
+      console.log(
+        updateCheck === "failed"
+          ? "Latest release check failed."
+          : `Latest release: ${latestVersion ?? CHARTERMESH_VERSION} (${updateCheck.replace("_", " ")})`,
+      );
+    }
+  }
+  return data.installationMatches ? 0 : 1;
+}
+
+function recover(target: string, args: string[]): void {
+  const results = recoverFileTransactions(target);
+  if (has(args, "--json")) {
+    writeJsonEnvelope("recover", { recovered: results });
+    return;
+  }
+  if (results.length === 0) {
+    console.log("No incomplete file transaction was found.");
+    return;
+  }
+  for (const result of results) {
+    console.log(
+      `${result.transactionId}: ${result.action.replace("_", " ")}`,
+    );
+  }
+}
+
+function exportAudit(target: string, args: string[]): void {
+  if (args[1] !== "export") {
+    throw new Error("audit requires the 'export' subcommand.");
+  }
+  const paths = statePaths(target);
+  const timestamp = new Date().toISOString().replaceAll(/[:.]/gu, "-");
+  const requested = option(args, "--output");
+  const output = requested
+    ? resolve(target, requested)
+    : join(paths.exports, `audit-${timestamp}.jsonl`);
+  const normalizedTarget = target.toLowerCase();
+  const normalizedOutput = output.toLowerCase();
+  if (
+    normalizedOutput !== normalizedTarget &&
+    !normalizedOutput.startsWith(`${normalizedTarget}${sep}`)
+  ) {
+    throw new Error("Audit output must stay inside the target project.");
+  }
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const organization = readOrganization(target);
+    const records = controlPlane.auditRecords();
+    const header = {
+      apiVersion: "chartermesh.dev/audit-export/v1alpha1",
+      recordType: "export",
+      charterMeshVersion: CHARTERMESH_VERSION,
+      exportedAt: new Date().toISOString(),
+      organizationId: organization.metadata.id,
+      organizationRevision: organization.metadata.revision,
+      recordCount: records.length,
+    };
+    const content = [header, ...records]
+      .map((record) => JSON.stringify(record))
+      .join("\n")
+      .concat("\n");
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, content, { encoding: "utf8", flag: "wx" });
+    const result = { output, recordCount: records.length };
+    if (has(args, "--json")) writeJsonEnvelope("audit export", result);
+    else console.log(`Exported ${records.length} audit records to ${output}.`);
+  } finally {
+    database.close();
+  }
+}
+
+function backupCommand(target: string, args: string[]): void {
+  const subcommand = args[1];
+  const paths = statePaths(target);
+  if (subcommand === "list") {
+    const backups = listControlPlaneBackups(paths.backups);
+    if (has(args, "--json")) writeJsonEnvelope("backup list", backups);
+    else if (backups.length === 0) console.log("No Control Plane backups.");
+    else {
+      for (const backup of backups) {
+        console.log(
+          `${backup.id} ${backup.reason} schema=${backup.schemaVersion} ` +
+            `workItems=${backup.workItemCount} ` +
+            `artifacts=${backup.artifacts?.length ?? 0} ` +
+            `sha256=${backup.sha256}`,
+        );
+      }
+    }
+    return;
+  }
+  if (subcommand !== "create") {
+    throw new Error("backup requires the 'create' or 'list' subcommand.");
+  }
+  const database = openControlPlaneDatabase(paths.database);
+  try {
+    const backup = createControlPlaneBackup(
+      database,
+      paths.backups,
+      "manual",
+    );
+    if (has(args, "--json")) writeJsonEnvelope("backup create", backup);
+    else {
+      console.log(
+        `Created Control Plane backup ${backup.id} (${backup.sha256}).`,
+      );
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function restorePlan(target: string, args: string[]): RestorePlan {
+  recoverFileTransactions(target);
+  const id = option(args, "--backup");
+  if (!id) throw new Error("restore requires --backup BACKUP_ID.");
+  const paths = statePaths(target);
+  if (!existsSync(paths.database)) {
+    throw new Error("Control Plane database is missing.");
+  }
+  const backup = readControlPlaneBackup(paths.backups, id);
+  const body = {
+    apiVersion: "chartermesh.dev/restore-plan/v1alpha1" as const,
+    operation: "restore-control-plane" as const,
+    target,
+    backupId: backup.manifest.id,
+    backupSha256: backup.manifest.sha256,
+    currentSha256: createHash("sha256")
+      .update(readFileSync(paths.database))
+      .digest("hex"),
+    backupSchemaVersion: backup.manifest.schemaVersion,
+    backupArtifactCount: backup.artifacts.length,
+    backupArtifactSetSha256:
+      backup.manifest.artifactSetSha256 ??
+      sha256(backup.manifest.artifacts ?? []),
+  };
+  return { ...body, planHash: sha256(body) };
+}
+
+function restoreControlPlane(target: string, args: string[]): void {
+  const plan = restorePlan(target, args);
+  const approval = option(args, "--approve");
+  if (!approval) {
+    if (has(args, "--json")) writeJsonEnvelope("restore", plan);
+    else {
+      console.log(JSON.stringify(plan, null, 2));
+      console.log("");
+      console.log(
+        `Review the exact plan, then repeat with --approve ${plan.planHash}`,
+      );
+    }
+    return;
+  }
+  if (approval !== plan.planHash) {
+    throw new Error(
+      `Restore approval hash does not match the current plan (${plan.planHash}).`,
+    );
+  }
+  const paths = statePaths(target);
+  const releaseMaintenance = acquireMaintenanceLock(paths.root, "restore");
+  try {
+    const selected = readControlPlaneBackup(paths.backups, plan.backupId);
+    if (
+      selected.artifacts.length !== plan.backupArtifactCount ||
+      (selected.manifest.artifactSetSha256 ??
+        sha256(selected.manifest.artifacts ?? [])) !==
+        plan.backupArtifactSetSha256
+    ) {
+      throw new Error("Backup artifact set changed after approval.");
+    }
+    const approvedCurrentHash = createHash("sha256")
+      .update(readFileSync(paths.database))
+      .digest("hex");
+    if (approvedCurrentHash !== plan.currentSha256) {
+      throw new Error(
+        "Control Plane changed after the restore plan was approved.",
+      );
+    }
+    const database = openControlPlaneDatabase(paths.database, {
+      allowMaintenance: true,
+    });
+    let safetyBackup;
+    try {
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      database.exec("BEGIN EXCLUSIVE");
+      database.exec("COMMIT");
+      safetyBackup = createControlPlaneBackup(
+        database,
+        paths.backups,
+        "pre_restore",
+      );
+    } finally {
+      database.close();
+    }
+    for (const sidecar of [`${paths.database}-wal`, `${paths.database}-shm`]) {
+      if (!existsSync(sidecar)) continue;
+      if (statSync(sidecar).size > 0) {
+        throw new Error(
+          "Control Plane sidecar is still active. Stop dashboards and retry.",
+        );
+      }
+      rmSync(sidecar, { force: true });
+    }
+    mkdirSync(paths.artifacts, { recursive: true });
+    const replacementBeforeHash = createHash("sha256")
+      .update(readFileSync(paths.database))
+      .digest("hex");
+    applyFileTransaction(target, `restore-${plan.planHash.slice(0, 20)}`, [
+      {
+        path: paths.database,
+        content: selected.bytes,
+        beforeHash: replacementBeforeHash,
+        afterHash: plan.backupSha256,
+      },
+      ...selected.artifacts.map((artifact) => {
+        const path = join(paths.artifacts, artifact.manifest.storageName);
+        return {
+          path,
+          content: artifact.bytes,
+          beforeHash: existsSync(path)
+            ? createHash("sha256")
+                .update(readFileSync(path))
+                .digest("hex")
+            : null,
+          afterHash: artifact.manifest.sha256,
+        };
+      }),
+    ]);
+    validateControlPlaneDatabase(paths.database);
+    for (const artifact of selected.artifacts) {
+      const restored = readFileSync(
+        join(paths.artifacts, artifact.manifest.storageName),
+      );
+      if (
+        restored.byteLength !== artifact.manifest.byteSize ||
+        createHash("sha256").update(restored).digest("hex") !==
+          artifact.manifest.sha256
+      ) {
+        throw new Error("CONTROL_PLANE_RESTORE_ARTIFACT_MISMATCH");
+      }
+    }
+    const result = {
+      restoredBackup: plan.backupId,
+      restoredSha256: plan.backupSha256,
+      restoredArtifactCount: selected.artifacts.length,
+      safetyBackup: safetyBackup.id,
+    };
+    if (has(args, "--json")) writeJsonEnvelope("restore", result);
+    else {
+      console.log(
+        `Restored ${plan.backupId} with ${selected.artifacts.length} ` +
+          `artifact(s). Pre-restore safety backup: ${safetyBackup.id}.`,
+      );
+    }
+  } finally {
+    releaseMaintenance();
+  }
 }
 
 export interface RunWorkResult {
@@ -636,6 +1109,29 @@ export async function runWork(
     | undefined;
   try {
     controlPlane.recoverExpiredLeases();
+    const organization = readOrganization(target);
+    const engine = configuredEngine(runtime, target);
+    const configuredProfile = runtime.modelEngines.find(
+      ({ id: engineId }) => engineId === engine.manifest.profileId,
+    );
+    const costVisibility =
+      configuredProfile?.adapter === "fake"
+        ? "measured"
+        : "pricing" in (configuredProfile ?? {}) && configuredProfile?.pricing
+          ? "estimated"
+          : "unknown";
+    const unknownCostPolicy =
+      organization.spec.budgets.unknownCostPolicy ?? "warn";
+    if (
+      costVisibility === "unknown" &&
+      ["block", "estimate"].includes(unknownCostPolicy)
+    ) {
+      throw new Error(
+        unknownCostPolicy === "block"
+          ? "COST_POLICY_BLOCKS_UNKNOWN_ENGINE"
+          : "COST_POLICY_REQUIRES_PRICING",
+      );
+    }
     const candidate =
       (id ? controlPlane.get(id) : undefined) ??
       controlPlane
@@ -666,8 +1162,43 @@ export async function runWork(
     }, 60_000);
     heartbeat.unref();
     try {
-      const engine = configuredEngine(runtime);
       const runner = new BuiltInManagedRunner();
+      const role = organization.spec.roles.find(
+        ({ id: roleId }) => roleId === candidate.ownerRole,
+      );
+      if (!role) {
+        throw new Error(
+          `OrgSpec does not define the assigned role '${candidate.ownerRole}'.`,
+        );
+      }
+      const toolRuntime = createWorkspaceToolRuntime({
+        workspaceRoot: target,
+        workItemId: candidate.id,
+        policy: role.tools,
+        isApproved: (callHash, toolName) =>
+          controlPlane.isToolCallApproved(
+            candidate.id,
+            callHash,
+            toolName,
+          ),
+        onEvidence: (evidence) => {
+          controlPlane.recordToolEvidence({
+            evidenceId: evidence.id,
+            id: candidate.id,
+            runId: claim!.runId,
+            attemptId: claim!.attemptId,
+            callHash: evidence.callHash,
+            toolName: evidence.toolName,
+            status: evidence.status,
+            inputHash: evidence.inputHash,
+            outputHash: evidence.outputHash,
+            paths: evidence.paths,
+            durationMs: evidence.durationMs,
+            createdAt: evidence.createdAt,
+            actor: "runner:local",
+          });
+        },
+      });
       const handle = await runner.start(
         {
           taskPacket: {
@@ -685,7 +1216,7 @@ export async function runWork(
           attemptId: claim.attemptId,
           generation: claim.generation,
         },
-        { engine },
+        { engine, toolRuntime },
       );
       const result = await runner.result(handle.hostRunId);
       controlPlane.recordInvocation({
@@ -740,9 +1271,13 @@ export async function runWork(
       const rawMessage = error instanceof Error ? error.message : String(error);
       const errorCode = rawMessage.startsWith("STRUCTURED_ARTIFACT_INVALID")
         ? "STRUCTURED_ARTIFACT_INVALID"
-        : rawMessage.toLowerCase().includes("abort")
-          ? "RUN_CANCELED"
-          : "MODEL_INVOCATION_FAILED";
+        : rawMessage.startsWith("TOOL_APPROVAL_REQUIRED")
+          ? "TOOL_APPROVAL_REQUIRED"
+          : rawMessage.startsWith("TOOL_ITERATION_LIMIT")
+            ? "TOOL_ITERATION_LIMIT"
+            : rawMessage.toLowerCase().includes("abort")
+              ? "RUN_CANCELED"
+              : "MODEL_INVOCATION_FAILED";
       controlPlane.failRun({
         id: candidate.id,
         generation: claim.generation,
@@ -751,9 +1286,13 @@ export async function runWork(
         errorMessage:
           errorCode === "STRUCTURED_ARTIFACT_INVALID"
             ? "The model did not return a valid structured artifact."
-            : errorCode === "RUN_CANCELED"
-              ? "The model invocation was canceled."
-              : "The configured model invocation failed.",
+            : errorCode === "TOOL_APPROVAL_REQUIRED"
+              ? rawMessage
+              : errorCode === "TOOL_ITERATION_LIMIT"
+                ? "The model exceeded the OrgSpec tool iteration limit."
+                : errorCode === "RUN_CANCELED"
+                  ? "The model invocation was canceled."
+                  : "The configured model invocation failed.",
         actor: "runner:local",
         idempotencyKey: `cli:fail:${candidate.id}:${claim.generation}`,
       });
@@ -944,6 +1483,94 @@ function completeWork(target: string, args: string[]): void {
   }
 }
 
+function approveTool(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  const callHash = option(args, "--call-hash");
+  const toolName = option(args, "--tool");
+  if (!id || !callHash || !toolName) {
+    throw new Error(
+      "approve-tool requires --id, --call-hash, and --tool.",
+    );
+  }
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const approval = controlPlane.approveToolCall({
+      id,
+      callHash,
+      toolName,
+      actor: "human:cli",
+      note:
+        option(args, "--note") ??
+        "Approved exact tool call from the local CLI.",
+      idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+    });
+    if (has(args, "--json")) writeJsonEnvelope("approve-tool", approval);
+    else {
+      console.log(
+        `Approved ${approval.toolName} call ${approval.callHash} for ${approval.workItemId}.`,
+      );
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function systemCommand(target: string, args: string[]): void {
+  const subcommand = args[1] ?? "status";
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    let state;
+    if (subcommand === "status") {
+      state = controlPlane.operationalState();
+    } else if (subcommand === "pause") {
+      const reason = option(args, "--reason");
+      if (!reason) throw new Error("system pause requires --reason TEXT.");
+      state = controlPlane.pauseOperations({
+        reason,
+        actor: "human:cli",
+        idempotencyKey:
+          option(args, "--idempotency-key") ?? randomUUID(),
+      });
+    } else if (subcommand === "resume") {
+      state = controlPlane.resumeOperations({
+        actor: "human:cli",
+        idempotencyKey:
+          option(args, "--idempotency-key") ?? randomUUID(),
+      });
+    } else {
+      throw new Error("system requires status, pause, or resume.");
+    }
+    if (has(args, "--json")) writeJsonEnvelope(`system ${subcommand}`, state);
+    else if (state.paused) {
+      console.log(`New runs are paused: ${state.reason}`);
+    } else {
+      console.log("New runs are enabled.");
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function printToolEvidence(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  if (!id) throw new Error("tool-evidence requires --id.");
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const evidence = controlPlane.listToolEvidence(id);
+    if (has(args, "--json")) {
+      writeJsonEnvelope("tool-evidence", { items: evidence });
+      return;
+    }
+    for (const item of evidence) {
+      console.log(
+        `${item.id} | ${item.status} | ${item.toolName} | ${item.callHash}`,
+      );
+    }
+  } finally {
+    database.close();
+  }
+}
+
 async function evaluateModel(target: string, args: string[]): Promise<number> {
   if (!has(args, "--live")) {
     throw new Error(
@@ -951,7 +1578,11 @@ async function evaluateModel(target: string, args: string[]): Promise<number> {
     );
   }
   const runtime = readRuntime(target);
-  const engine = configuredEngine(runtime, option(args, "--engine-id"));
+  const engine = configuredEngine(
+    runtime,
+    target,
+    option(args, "--engine-id"),
+  );
   const report = await evaluateModelEngine(engine);
   if (has(args, "--json")) writeJsonEnvelope("evaluate-model", report);
   else {
@@ -978,18 +1609,36 @@ The same safe flow is used by humans, Codex, Claude, and other coding agents:
 inspect -> plan -> approve exact hash -> apply -> doctor -> run -> review.
 
 Commands:
+  chartermesh version [--target PATH] [--check] [--json]
   chartermesh propose --target PATH [--profile lean|balanced|controlled] [--json]
   chartermesh bootstrap --target PATH [--profile balanced] [--engine fake] [--json]
   chartermesh bootstrap --target PATH --engine openai-compatible \\
     --endpoint URL --model MODEL [--api-key-env ENV_NAME] \\
     [--structured-output prompt|json-schema] [--tool-calling] \\
-    [--reasoning default|disabled]
+    [--reasoning default|disabled] \\
+    [--max-response-bytes 8388608] \\
+    [--input-price-per-million USD --output-price-per-million USD]
+  chartermesh bootstrap --target PATH --engine command-process \\
+    --command ABSOLUTE_EXECUTABLE [--command-arg ARG] [--model LABEL] \\
+    [--pass-env ENV_NAME] [--timeout-ms 60000] \\
+    [--input-price-per-million USD --output-price-per-million USD]
   chartermesh bootstrap ... --approve PLAN_HASH
   chartermesh configure-engine --target PATH --engine fake
   chartermesh configure-engine --target PATH --engine openai-compatible \\
     --endpoint URL --model MODEL [--api-key-env ENV_NAME]
+  chartermesh configure-engine --target PATH --engine command-process \\
+    --command ABSOLUTE_EXECUTABLE [--command-arg ARG] [--pass-env ENV_NAME]
   chartermesh configure-engine ... --approve PLAN_HASH
   chartermesh doctor --target PATH [--json]
+  chartermesh recover --target PATH [--json]
+  chartermesh audit export --target PATH [--output RELATIVE_PATH] [--json]
+  chartermesh backup create --target PATH [--json]
+  chartermesh backup list --target PATH [--json]
+  chartermesh restore --backup BACKUP_ID --target PATH
+  chartermesh restore ... --approve PLAN_HASH
+  chartermesh system status --target PATH [--json]
+  chartermesh system pause --reason TEXT --target PATH
+  chartermesh system resume --target PATH
   chartermesh seed-demo --target PATH
   chartermesh request "work title" --target PATH [--json]
   chartermesh triage --id WORK --role ROLE --target PATH [--json]
@@ -998,6 +1647,9 @@ Commands:
   chartermesh wait --id WORK --type user_input --reason TEXT --target PATH
   chartermesh resume --id WORK --target PATH
   chartermesh retry --id WORK --target PATH
+  chartermesh approve-tool --id WORK --call-hash SHA256 --tool TOOL \\
+    --note TEXT --target PATH
+  chartermesh tool-evidence --id WORK --target PATH [--json]
   chartermesh decide --id WORK --decision approve --artifact-hash SHA256 \\
     --note TEXT --target PATH
   chartermesh complete --id WORK --target PATH
@@ -1019,6 +1671,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     printProposal(args);
     return 0;
   }
+  if (command === "version") return version(args);
   if (command === "bootstrap") {
     applyBootstrap(args, bootstrapPlan(args));
     return 0;
@@ -1028,6 +1681,26 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (command === "doctor") return doctor(target, args);
+  if (command === "recover") {
+    recover(target, args);
+    return 0;
+  }
+  if (command === "audit") {
+    exportAudit(target, args);
+    return 0;
+  }
+  if (command === "backup") {
+    backupCommand(target, args);
+    return 0;
+  }
+  if (command === "restore") {
+    restoreControlPlane(target, args);
+    return 0;
+  }
+  if (command === "system") {
+    systemCommand(target, args);
+    return 0;
+  }
   if (command === "seed-demo") {
     seedDemo(target);
     return 0;
@@ -1058,6 +1731,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   }
   if (command === "retry") {
     retryWork(target, args);
+    return 0;
+  }
+  if (command === "approve-tool") {
+    approveTool(target, args);
+    return 0;
+  }
+  if (command === "tool-evidence") {
+    printToolEvidence(target, args);
     return 0;
   }
   if (command === "decide") {

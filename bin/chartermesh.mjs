@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
-import { main } from "../apps/cli/src/main.ts";
+import { existsSync } from "node:fs";
+
+const built = new URL("../dist/apps/cli/src/main.js", import.meta.url);
+const source = new URL("../apps/cli/src/main.ts", import.meta.url);
+const { main } = await import(existsSync(source) ? source.href : built.href);
 
 main().then(
   (code) => {

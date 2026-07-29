@@ -28,10 +28,12 @@ and a report of every changed file. No model call is required to bootstrap.
 
 ## Protocol
 
-### 1. Locate and inspect
+### 1. Locate the executable and inspect
 
-1. Locate the CharterMesh checkout containing this file and
-   `bin/chartermesh.mjs`.
+1. Prefer an already available CharterMesh executable. A source checkout may
+   use `node bin/chartermesh.mjs`. With only the GitHub URL, and after the user
+   authorizes the one-time package download, use
+   `npx --yes github:jade-blanco/chartermesh`.
 2. Resolve the intended target repository.
 3. Read the target's applicable agent instructions.
 4. Inspect its Git status and existing `.chartermesh` directory without
@@ -43,10 +45,10 @@ model call, publish, deploy, or modify target files during this step.
 
 ### 2. Propose an operating profile
 
-Run from the CharterMesh checkout:
+Run with the selected executable prefix:
 
 ```text
-node bin/chartermesh.mjs propose --target TARGET --profile balanced --json
+chartermesh propose --target TARGET --profile balanced --json
 ```
 
 Use `lean`, `balanced`, or `controlled` when the user requested one. Otherwise,
@@ -58,6 +60,9 @@ signals. This command performs no target writes.
 - Without a user-supplied endpoint, use `--engine fake`.
 - With an OpenAI-compatible endpoint and model id, use
   `--engine openai-compatible --endpoint URL --model MODEL`.
+- With a local executable that implements the neutral JSON contract, use
+  `--engine command-process --command ABSOLUTE_PATH` and repeat
+  `--command-arg` as needed.
 - If authentication is required, add `--api-key-env ENV_NAME`. Never place the
   credential value in a command, config, plan, chat summary, or commit.
 - Do not infer or create a remote provider account.
@@ -65,7 +70,7 @@ signals. This command performs no target writes.
 ### 4. Generate the no-write plan
 
 ```text
-node bin/chartermesh.mjs bootstrap --target TARGET --profile balanced --engine fake --json
+chartermesh bootstrap --target TARGET --profile balanced --engine fake --json
 ```
 
 Or use the chosen engine options. Parse the versioned JSON response and show:
@@ -98,20 +103,22 @@ After approval, repeat the identical bootstrap command and append:
 ```
 
 Do not reproduce file changes manually. The CLI preflights current target
-hashes, stages proposed content, verifies staged hashes, and rolls back applied
-files if an in-process exception occurs.
+hashes, stages and verifies proposed content, writes an immutable journal
+before the first replacement, and either finalizes a committed transaction or
+rolls back an interrupted one on the next `bootstrap`, `configure-engine`,
+`doctor`, or `recover` command.
 
 ### 7. Verify
 
 ```text
-node bin/chartermesh.mjs doctor --target TARGET --json
+chartermesh doctor --target TARGET --json
 ```
 
 For an offline functional check:
 
 ```text
-node bin/chartermesh.mjs seed-demo --target TARGET
-node bin/chartermesh.mjs list --target TARGET --json
+chartermesh seed-demo --target TARGET
+chartermesh list --target TARGET --json
 ```
 
 Do not start a live model call unless the user asked for it and understands
@@ -141,6 +148,13 @@ Never report credential values or unrelated absolute paths.
 - Claim atomically creates Run, Attempt, Lease, and generation.
 - Stale generations cannot submit artifacts.
 - Human review binds the exact immutable artifact hash.
+- Tool availability, workspace roots, and iteration limits come from OrgSpec.
+- Workspace writes require approval of the exact canonical tool-call hash.
+- Tool evidence records hashes, status, bounded paths, and timing, not raw
+  arguments or output.
+- Unknown model cost follows OrgSpec `warn`, `block`, or `estimate` policy and
+  is never silently converted to zero.
+- Artifact byte limits come from OrgSpec.
 - External side effects require their own human approval.
 - Provider features enter through adapters and capability manifests.
 - Default bootstrap and tests are offline and free.
@@ -157,3 +171,12 @@ Never report credential values or unrelated absolute paths.
   `ModelEngine` adapter; do not add provider fields to OrgSpec.
 - Failed or expired run: preserve the failure, use `retry`, and create a new
   generation.
+- `TOOL_APPROVAL_REQUIRED`: show the exact call hash and tool name, obtain a
+  human `approve-tool` command, then use `retry` and start a new generation.
+- Interrupted file apply: run `doctor` or `recover`; do not delete the journal
+  or backup files manually.
+- Restore: generate the exact `restore --backup BACKUP_ID` plan, including the
+  DB and artifact-set hashes, obtain human approval for its current hash, and
+  repeat with `--approve PLAN_HASH`. Restore takes the maintenance lock and
+  rejects concurrent writers; stop another process only if its SQLite sidecar
+  prevents checkpointing.

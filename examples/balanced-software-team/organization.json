@@ -12,7 +12,10 @@
     "budgets": {
       "monthlyCostLimitUsd": 100,
       "maxConcurrentRuns": 3,
-      "maxDailyModelStarts": 24
+      "maxDailyModelStarts": 24,
+      "unknownCostPolicy": "warn",
+      "maxArtifactBytes": 1048576,
+      "maxWorkItemArtifactBytes": 10485760
     },
     "modelEngines": [
       {
@@ -89,14 +92,13 @@
         "concurrency": 1,
         "tools": {
           "allow": [
-            "work_read",
-            "work_create",
-            "proposal_write"
+            "workspace.list_files",
+            "workspace.read_file"
           ],
-          "approvalRequired": [
-            "policy_apply",
-            "schedule_activate"
-          ]
+          "workspaceRoots": [
+            "."
+          ],
+          "maxIterations": 4
         },
         "orchestration": {
           "strategy": "single",
@@ -132,14 +134,17 @@
         "concurrency": 2,
         "tools": {
           "allow": [
-            "repo_read",
-            "repo_write",
-            "test_run"
+            "workspace.list_files",
+            "workspace.read_file",
+            "workspace.write_file"
           ],
           "approvalRequired": [
-            "deploy",
-            "destructive_action"
-          ]
+            "workspace.write_file"
+          ],
+          "workspaceRoots": [
+            "."
+          ],
+          "maxIterations": 6
         },
         "orchestration": {
           "strategy": "delegated",

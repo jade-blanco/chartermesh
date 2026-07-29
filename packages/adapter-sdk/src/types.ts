@@ -60,6 +60,7 @@ export interface ModelMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   toolCallId?: string;
+  toolCalls?: ModelToolCall[];
 }
 
 export interface ModelTool {

@@ -44,6 +44,57 @@
                 "type": "integer",
                 "minimum": 1000,
                 "maximum": 600000
+              },
+              "maxResponseBytes": {
+                "type": "integer",
+                "minimum": 1024,
+                "maximum": 67108864
+              },
+              "pricing": {
+                "$ref": "#/$defs/pricing"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "adapter",
+              "command",
+              "executableSha256"
+            ],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "adapter": { "const": "command-process" },
+              "command": {
+                "type": "string",
+                "minLength": 1
+              },
+              "executableSha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "model": { "type": "string", "minLength": 1 },
+              "environmentAllowlist": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                }
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 1000,
+                "maximum": 600000
+              },
+              "pricing": {
+                "$ref": "#/$defs/pricing"
               }
             }
           }
@@ -61,6 +112,26 @@
           "id": { "type": "string", "minLength": 1 },
           "adapter": { "const": "builtin-managed-runner" },
           "modelEngineRef": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputPerMillionTokensUsd",
+        "outputPerMillionTokensUsd"
+      ],
+      "properties": {
+        "inputPerMillionTokensUsd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "outputPerMillionTokensUsd": {
+          "type": "number",
+          "minimum": 0
         }
       }
     }

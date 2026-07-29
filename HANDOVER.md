@@ -5,13 +5,15 @@
 - Product design is in `docs/PRODUCT-DESIGN.md` with native collaboration,
   engine/host separation, universal bootstrap, Control Plane, and action
   projection boundaries.
-- Phase 0, OrgSpec, and a dependency-free runnable local vertical slice are
-  present.
+- OrgSpec, the SQLite Control Plane, the safe Tool Runtime, recoverable apply,
+  operational backup/audit controls, the reviewed-work dashboard, and a
+  dependency-free package build are present at `0.0.5-alpha.1`.
 - `ModelEngine`, `AgentHost`, and `ManagedRunner` are separate contracts;
   generic and fake engines are the primary foundation, while Codex and Claude
   Code remain optional host adapters.
-- No package publication, provider login, paid call, deployment, or cloud
-  resource is required.
+- The repository is package-ready and clean-install tested. No registry
+  publication, provider login, paid call, deployment, or cloud resource has
+  been performed.
 - Apache-2.0 is selected and the standard license text is in `LICENSE`.
 
 ## Verify
@@ -25,20 +27,34 @@ git status --short
 
 1. Agent-readable exact-hash bootstrap protocol.
 2. SQLite Control Plane and action projection.
-3. Fake and OpenAI-compatible model engines.
-4. Built-in single-turn managed runner.
-5. CLI lifecycle and responsive loopback dashboard.
+3. Fake, OpenAI-compatible, and shell-free command-process model engines.
+4. Built-in managed runner with structured output, one repair turn, bounded
+   tool execution, exact-call write approval, and evidence hashes.
+5. Crash-recoverable file transactions and multi-process SQLite stress tests.
+6. CLI lifecycle and responsive loopback dashboard.
+7. Dependency-free JavaScript package build and temporary-consumer install
+   verification.
+8. Unknown-cost policy and estimates, artifact limits, dashboard rate limits,
+   allowlisted audit export, and approved DB+artifact restore.
+9. Executable-digest-pinned command engines, dedicated engine cwd,
+   maintenance lock, explicit new-run pause/resume, and bounded no-redirect
+   HTTP responses.
 
 ## Next implementation slice
 
-1. Add versioned SQL migrations and transactional outbox.
-2. Add heartbeat, lease expiry, retry, and crash recovery.
-3. Add result-review controls to the dashboard.
-4. Add a second protocol-native ModelEngine adapter.
-5. Add optional AgentHost adapters without changing the core ledger.
+1. Add attempt-level dead-letter policy and active-run cancellation semantics.
+2. Add no-work scheduling and empty-start accounting.
+3. Add provider failover canaries with permission revalidation.
+4. Add command/network tools only behind separate policy and sandbox ADRs.
+5. Add a second protocol-native HTTP ModelEngine adapter and optional AgentHost
+   adapters without changing the core ledger.
+6. Add signed release/SBOM automation and a clean-OS compatibility matrix.
 
 ## Rollback
 
-There is no database migration or provider installation in this slice. Revert
-future changes with a new commit; do not delete user files or rewrite Git
-history when rolling back.
+Database migration 6 marks the trust-boundary slice; older known schemas
+receive an automatic SQLite snapshot before migration. File transactions
+recover automatically from `.chartermesh/.transactions`; use
+`chartermesh recover` rather than deleting journal or backup files. Revert
+future source changes with a new commit; do not delete user files or rewrite
+Git history when rolling back.

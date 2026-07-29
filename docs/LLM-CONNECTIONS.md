@@ -1,8 +1,9 @@
 # Connecting model engines
 
 CharterMesh core does not depend on a model vendor or agent product. The first
-live adapter implements OpenAI-compatible `POST /v1/chat/completions`. The
-endpoint may be a local process, self-hosted service, or remote API.
+live HTTP adapter implements OpenAI-compatible `POST /v1/chat/completions`.
+The command-process adapter also connects an arbitrary local executable over a
+neutral JSON stdin/stdout contract.
 
 The adapter sends the bounded system instruction, WorkItem title and summary,
 acceptance criteria, response schema when enabled, and configured model id. It
@@ -45,6 +46,43 @@ Typical local ports include:
 Ports and model identifiers are runtime configuration, not CharterMesh
 assumptions. Confirm them in the selected runtime.
 
+## Arbitrary local command process
+
+Use this when a local runtime or wrapper does not expose an OpenAI-compatible
+HTTP endpoint:
+
+```powershell
+node bin/chartermesh.mjs configure-engine `
+  --target TARGET `
+  --engine command-process `
+  --command C:\absolute\path\to\engine.exe `
+  --command-arg --chartermesh-json `
+  --model LOCAL_MODEL_LABEL `
+  --pass-env LOCAL_MODEL_HOME `
+  --timeout-ms 60000
+```
+
+The executable receives one JSON document on stdin with
+`apiVersion: chartermesh.dev/command-process-request/v1alpha1` and the neutral
+`InferenceRequest`. It must write one JSON object to stdout containing `text`,
+optional `toolCalls`, `finishReason`, and optional token/cost `usage`. The
+complete `text` value still has to satisfy the managed runner's structured
+artifact schema.
+
+The no-write configuration plan calculates and stores the executable's
+SHA-256. CharterMesh verifies that digest when loading the engine, immediately
+before spawn, and after exit. A legitimate executable upgrade therefore
+requires a new `configure-engine` plan and human approval.
+
+CharterMesh starts the absolute executable directly with `shell: false`, uses
+`.chartermesh/engine-work/ENGINE_ID` rather than the project root as cwd,
+allows at most 1 MiB combined stdout/stderr, applies a timeout, and does not
+inherit the whole parent environment. Repeat `--command-arg` and `--pass-env`
+as needed. stderr content is not surfaced in Control Plane errors. The digest
+and dedicated cwd are tamper detection and accidental-exposure reduction, not
+an operating-system sandbox; the operator must trust the executable and its
+explicit arguments.
+
 ## Native JSON Schema mode
 
 By default CharterMesh requests JSON in the prompt and validates it locally:
@@ -74,12 +112,26 @@ structured work. The adapter sends `reasoning_effort: none` and
 `chat_template_kwargs.enable_thinking: false`; compatible servers honor the
 field they support. `default` preserves server/model behavior.
 
-## Tool-call transport
+## Tool execution
 
 `--tool-calling` advertises native OpenAI-style tool-call transport for an
 endpoint that supports it. This only declares the engine capability; it does
-not grant tools or bypass OrgSpec tool policy. Unsupported features remain
-explicitly unsupported rather than silently downgraded.
+not grant tools or bypass OrgSpec tool policy.
+
+The built-in ManagedRunner drives a common bounded loop. It passes allowed
+tool definitions to the engine, transports assistant tool calls and tool
+results, and stops when the engine emits a final structured artifact. OrgSpec
+enforces:
+
+- exact tool allowlist;
+- project-relative `workspaceRoots`;
+- exact-call human approval for writes;
+- `maxIterations` from 1 through 12.
+
+The first built-ins list a directory, read bounded UTF-8 text, and create or
+replace bounded UTF-8 text. There is no shell or network tool. Tool execution
+evidence stores hashes and bounded relative paths; raw inputs and results are
+not copied into the audit ledger.
 
 ## Remote provider
 
@@ -93,11 +145,15 @@ node bin/chartermesh.mjs configure-engine `
   --engine openai-compatible `
   --endpoint https://provider.example/v1 `
   --model SUPPORTED_MODEL_ID `
-  --api-key-env CHARTERMESH_MODEL_API_KEY
+  --api-key-env CHARTERMESH_MODEL_API_KEY `
+  --max-response-bytes 8388608
 ```
 
 CharterMesh rejects sending configured credentials to non-loopback plain HTTP.
-It never writes the credential value.
+It never writes the credential value. Redirect following is disabled so an
+endpoint cannot forward the request or credential to another origin. Response
+bodies default to an 8 MiB ceiling and may be configured from 1 KiB through
+64 MiB; oversized bodies fail before JSON parsing.
 
 ## Apply and diagnose
 
@@ -110,6 +166,26 @@ node bin/chartermesh.mjs doctor --target TARGET
 
 `doctor` validates configuration without making a model call.
 
+## Cost visibility is a user policy
+
+CharterMesh itself has no model price. The operator who chooses the engine
+also chooses how unknown cost is handled in OrgSpec:
+
+- `warn` allows a run and preserves cost as unknown;
+- `block` refuses engines without known/estimated cost and later claims when
+  the current month already contains unknown-cost invocations;
+- `estimate` requires operator-supplied token prices.
+
+Supply prices only when they match the selected model/account:
+
+```text
+--input-price-per-million 0.20 --output-price-per-million 0.60
+```
+
+Both values are required together. They are configuration, not CharterMesh
+product pricing. Estimates cannot reserve a provider bill in advance, so
+provider-side account limits remain the hard outer control.
+
 ## Protocol requirements
 
 - HTTP or HTTPS endpoint.
@@ -117,10 +193,12 @@ node bin/chartermesh.mjs doctor --target TARGET
 - JSON request with `model`, `messages`, and `stream: false`.
 - JSON response with `choices[0].message.content` or tool calls.
 - Optional OpenAI-style prompt/completion token usage.
+- No redirect response; the configured endpoint must answer directly.
+- Response body within `maxResponseBytes` (8 MiB by default).
 
-Usage is `measured` only when the endpoint returns token counts. Cost remains
-unknown unless an adapter can report it without embedding volatile vendor
-pricing in the core.
+Token counts are retained when the endpoint returns them. Cost remains unknown
+unless the process reports a measured cost or the user supplies both token
+prices, in which case it is explicitly marked `estimated`.
 
 ## Security checklist
 
@@ -137,8 +215,11 @@ pricing in the core.
 
 - Text-only, non-streaming Chat Completions.
 - Structured artifact generation with at most one repair turn.
-- Tool-call transport exists, but a general tool-execution loop is not yet
-  enabled.
+- Built-in tools cover bounded workspace list/read/write only; command,
+  network, package-manager, and deployment tools are not implemented.
+- An approval-required call ends the current attempt; approval is followed by
+  an explicit retry with a new fenced generation.
 - No automatic account creation or provider discovery.
-- A different protocol requires a bounded `ModelEngine` adapter and manifest;
-  it must not add vendor fields to OrgSpec.
+- A protocol that cannot use HTTP or the command-process JSON contract requires
+  a bounded `ModelEngine` adapter and manifest; it must not add vendor fields
+  to OrgSpec.

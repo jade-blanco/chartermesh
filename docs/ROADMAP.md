@@ -1,6 +1,7 @@
 # Implementation roadmap
 
-Current milestone: `0.0.2-alpha.1`, provider-neutral structured execution.
+Current milestone: `0.0.5-alpha.1`, local trust-boundary hardening and
+consistent Control Plane recovery.
 
 ## Completed foundation
 
@@ -10,38 +11,50 @@ Current milestone: `0.0.2-alpha.1`, provider-neutral structured execution.
   validation, canonical hashes, and capability negotiation
 - Universal `BOOTSTRAP.md` application protocol
 - Project-aware lean/balanced/controlled proposals
-- Exact hash-bound plan and staged rollback-on-error apply
+- Exact hash-bound plan and crash-recoverable journaled apply
 - SQLite Control Plane with idempotency, append-only events, transactional
   outbox, runs, attempts, leases, artifacts, approvals, and usage
 - Fencing, heartbeat, lease recovery, visible failure, retry, and budgets
 - Fake and OpenAI-compatible engines
+- Shell-free command-process ModelEngine with a bounded JSON contract,
+  approved executable digest, and dedicated cwd
 - Structured artifacts, repair turn, and cancellation propagation
 - CLI and dashboard complete reviewed-work path
 - Synthetic model evaluation
+- Common Tool Runtime with OrgSpec allowlist, exact-call approval, workspace
+  roots, evidence, and bounded iterations
+- Crash-recoverable file transactions and automatic journal recovery
+- Cross-process claim, idempotency, and SQLite lock stress suites
+- Dependency-free JavaScript package build and clean-consumer install test
+- Offline installation-version matching and explicit latest-release check
+- Unknown-cost policy, user-supplied price estimates, and artifact limits
+- Dashboard API rate limits and keyboard/mobile accessibility validation
+- Allowlisted audit JSONL export
+- Integrity-checked Control Plane DB+artifact backup, migration snapshots, and
+  maintenance-locked approved restore with a pre-restore safety backup
+- Explicit human pause/resume for new run claims
+- Redirect-disabled and size-bounded HTTP model responses
 
 ## Next: execution hardening
 
-- Crash-safe apply recovery after process termination, not only exceptions
-- General tool-execution loop with policy enforcement and tool evidence
-- Attempt-level dead-letter policy and global kill switch
+- Attempt-level dead-letter policy and active-run cancellation semantics
 - No-work scheduler and empty-start accounting
 - Provider failover canary with permission/capability revalidation
-- Cross-process concurrency and idempotency stress suites
+- More adversarial filesystem races and cross-user local-host testing
 
 ## Next: integration surfaces
 
 - MCP server over the same Control Plane application service
-- Command-based local model adapter
 - Optional external AgentHost adapters
 - Runtime capability discovery and drift reporting
-- Package-manager distribution and clean-machine install/uninstall
+- Registry release automation and clean-machine install/uninstall matrix
 
 ## Next: dashboard and release
 
 - Run/attempt/usage history
 - Organization and proposal diff views
 - Schedule and audit views
-- Keyboard, responsive, browser accessibility, and visual regression suites
+- Automated screen-reader and visual-regression matrices
 - Compatibility matrix for small/local and remote models
 - Security review and release automation
 

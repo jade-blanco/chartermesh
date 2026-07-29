@@ -24,22 +24,36 @@ can use the same versioned CLI contract.
   usage, and events stay in CharterMesh rather than a provider chat.
 
 The included OpenAI-compatible adapter works with local or remote servers that
-implement Chat Completions. Provider-specific features enter through adapter
-capability manifests, never through the core OrgSpec schema.
+implement Chat Completions. The command-process adapter can connect any local
+executable that implements CharterMesh's neutral stdin/stdout JSON contract.
+Provider-specific features enter through adapter capability manifests, never
+through the core OrgSpec schema.
 
-## 0.0.2-alpha.1 runnable slice
+## 0.0.5-alpha.1 runnable slice
 
 - Project-aware `lean`, `balanced`, and `controlled` proposals
-- Exact plan-hash approval and staged, rollback-on-error apply
+- Exact plan-hash approval and crash-recoverable journaled apply
 - Dependency-free OrgSpec JSON Schema plus semantic validation
 - SQLite Control Plane with transactional commands and outbox
 - Generation fencing, lease heartbeat/recovery, visible failure, and retry
+- Multi-process claim, idempotency, and database-lock stress coverage
 - Enforced concurrency, daily-start, and monthly-cost budgets
-- Structured artifacts with one bounded repair turn and real cancellation
-- Fake and generic OpenAI-compatible model engines
+- User-owned unknown-cost policy, optional token-price estimation, and
+  per-artifact/work-item byte limits
+- Policy-gated tool execution with path containment, exact-call approval,
+  hash-only evidence, and bounded iterations
+- Structured artifacts with one bounded repair turn and cancellation
+- Fake, generic OpenAI-compatible, and shell-free, executable-hash-pinned
+  command-process engines with dedicated working directories
+- Rate-limited local dashboard APIs and keyboard/mobile accessibility flow
+- Allowlisted JSONL audit export plus hashed SQLite+artifact backup and
+  maintenance-locked approved restore
+- Human-controlled pause/resume for new run starts and bounded,
+  no-redirect HTTP model responses
 - Versioned `--json` CLI output for coding agents and automation
 - Dashboard request, triage, run, artifact review, retry, approval, and complete
 - Synthetic local-model evaluation for comparing small models
+- Buildable dependency-free npm package and clean-install verification
 
 This is pre-alpha software, not a production authorization system.
 
@@ -50,7 +64,23 @@ This is pre-alpha software, not a production authorization system.
 
 There are no runtime npm dependencies in this slice.
 
-## Five-minute offline start
+## One-command entry from the GitHub URL
+
+On a machine with Node.js 24 or newer, a human, coding agent, or shell can run
+CharterMesh without manually checking out this source tree:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh propose --target C:\path\to\project --profile balanced --json
+npx --yes github:jade-blanco/chartermesh bootstrap --target C:\path\to\project --profile balanced --engine fake --json
+```
+
+`bootstrap` returns the exact plan hash and still performs no target writes.
+After a human approves that value, repeat the same command with
+`--approve PLAN_HASH`. The GitHub package path builds dependency-free
+JavaScript before execution. Downloading the package requires network access
+and should be explicitly authorized in managed agent environments.
+
+## Five-minute offline source start
 
 First inspect the project-aware proposal:
 
@@ -74,6 +104,11 @@ node bin/chartermesh.mjs dashboard --target C:\path\to\project
 ```
 
 The fake engine is deterministic, free, and offline.
+
+`doctor` automatically compares the target's pinned installation version with
+the running CLI and recovers any incomplete apply journal. Use
+`chartermesh version --check` for an explicit network check of the latest
+GitHub release.
 
 ## Connect a local or remote model
 
@@ -109,6 +144,21 @@ credential is rejected unless the endpoint is loopback.
 
 See [`docs/LLM-CONNECTIONS.md`](docs/LLM-CONNECTIONS.md).
 
+To connect an arbitrary local engine wrapper without a vendor API:
+
+```powershell
+node bin/chartermesh.mjs configure-engine `
+  --target C:\path\to\project `
+  --engine command-process `
+  --command C:\absolute\path\to\engine.exe `
+  --command-arg --serve-chartermesh `
+  --pass-env LOCAL_MODEL_HOME
+```
+
+The executable path must be absolute. CharterMesh uses no shell, passes only
+explicitly allowed environment variables plus minimal OS temporary-directory
+variables, and caps execution time and output size.
+
 ## Evaluate a local model
 
 After the engine is configured and serving:
@@ -135,6 +185,16 @@ node bin/chartermesh.mjs complete --id work-000001 --target TARGET
 Add `--json` to agent-facing commands for the
 `chartermesh.dev/cli/v1alpha1` envelope.
 
+If a model requests `workspace.write_file`, CharterMesh does not execute it
+until a human approves the exact call hash:
+
+```powershell
+node bin/chartermesh.mjs approve-tool --id work-000001 --call-hash CALL_SHA256 --tool workspace.write_file --target TARGET
+node bin/chartermesh.mjs retry --id work-000001 --target TARGET
+node bin/chartermesh.mjs run --id work-000001 --target TARGET
+node bin/chartermesh.mjs tool-evidence --id work-000001 --target TARGET --json
+```
+
 ## Local files added to a target
 
 ```text
@@ -146,7 +206,10 @@ Add `--json` to agent-facing commands for the
 ├─ README.md
 ├─ .gitignore
 ├─ state.db            # mutable source of truth; ignored
-└─ artifacts/          # content-addressed review artifacts; ignored
+├─ artifacts/          # content-addressed review artifacts; ignored
+├─ backups/            # hashed DB snapshots + deduplicated artifact blobs
+├─ engine-work/        # isolated cwd for local command engines; ignored
+└─ exports/            # allowlisted audit JSONL; ignored
 ```
 
 CharterMesh does not create a Markdown task ledger or treat a provider chat as
