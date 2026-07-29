@@ -6,6 +6,8 @@ const state = {
   projection: null,
   filter: "all",
   selectedId: null,
+  artifact: null,
+  busy: false,
 };
 
 const statusLabels = {
@@ -27,6 +29,28 @@ const waitLabels = {
   manual_resume: "수동 재개",
   approval: "사람 승인",
 };
+
+const apiHeaders = (mutation = false) => ({
+  accept: "application/json",
+  "x-chartermesh-session": sessionToken,
+  ...(mutation
+    ? {
+        "content-type": "application/json",
+        "x-idempotency-key": crypto.randomUUID(),
+      }
+    : {}),
+});
+
+async function api(path, options = {}) {
+  const mutation = options.method && options.method !== "GET";
+  const response = await fetch(path, {
+    ...options,
+    headers: { ...apiHeaders(mutation), ...(options.headers ?? {}) },
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error ?? "요청을 처리하지 못했습니다.");
+  return result;
+}
 
 const relativeTime = (value) => {
   const elapsed = Date.now() - Date.parse(value);
@@ -73,7 +97,9 @@ function filteredItems() {
     return items.filter((item) => actionFor(item.id)?.actionable);
   }
   if (state.filter === "waiting") {
-    return items.filter((item) => item.wait && !["done", "canceled"].includes(item.status));
+    return items.filter(
+      (item) => item.wait && !["done", "canceled"].includes(item.status),
+    );
   }
   if (state.filter === "completed") {
     return items.filter((item) => ["done", "canceled"].includes(item.status));
@@ -94,8 +120,7 @@ function renderWork() {
   const items = filteredItems();
   const table = document.querySelector("#work-table-body");
   const mobile = document.querySelector("#mobile-work-list");
-  const empty = document.querySelector("#empty-state");
-  empty.hidden = items.length > 0;
+  document.querySelector("#empty-state").hidden = items.length > 0;
   table.innerHTML = items
     .map(
       (item) => `
@@ -125,6 +150,35 @@ function renderWork() {
     .join("");
 }
 
+function renderActions(item) {
+  const actions = document.querySelector("#inspector-actions");
+  const disabled = state.busy ? "disabled" : "";
+  if (item.status === "requested") {
+    actions.innerHTML = `<button class="primary-button" data-action="triage" ${disabled}>담당 지정</button>`;
+  } else if (["ready", "changes_requested"].includes(item.status)) {
+    actions.innerHTML = `<button class="primary-button" data-action="run" ${disabled}>모델 실행</button>`;
+  } else if (item.status === "failed") {
+    actions.innerHTML = `<button class="secondary-button" data-action="retry" ${disabled}>재시도 준비</button>`;
+  } else if (item.status === "review_pending") {
+    actions.innerHTML = `
+      <button class="primary-button" data-action="approve" ${disabled}>승인</button>
+      <button class="secondary-button" data-action="changes_requested" ${disabled}>수정 요청</button>
+      <button class="secondary-button danger" data-action="reject" ${disabled}>거절</button>`;
+  } else if (item.status === "approved") {
+    actions.innerHTML = `<button class="primary-button" data-action="complete" ${disabled}>완료 확정</button>`;
+  } else {
+    actions.innerHTML = "";
+  }
+}
+
+function renderArtifact() {
+  const block = document.querySelector("#artifact-block");
+  block.hidden = !state.artifact;
+  if (!state.artifact) return;
+  document.querySelector("#artifact-hash").textContent = state.artifact.sha256;
+  document.querySelector("#artifact-content").textContent = state.artifact.content;
+}
+
 function renderInspector() {
   const item = state.projection?.workItems.find(({ id }) => id === state.selectedId);
   const content = document.querySelector("#inspector-content");
@@ -143,26 +197,42 @@ function renderInspector() {
   const waitBlock = document.querySelector("#inspector-wait-block");
   waitBlock.hidden = !item.wait;
   if (item.wait) {
-    const resume = item.wait.resumeAt ? ` · ${new Date(item.wait.resumeAt).toLocaleString("ko-KR")}` : "";
+    const resume = item.wait.resumeAt
+      ? ` · ${new Date(item.wait.resumeAt).toLocaleString("ko-KR")}`
+      : "";
     document.querySelector("#inspector-wait").textContent =
       `${waitLabels[item.wait.type] ?? item.wait.type}: ${item.wait.reason}${resume}`;
   }
+  renderArtifact();
+  renderActions(item);
   content.hidden = false;
 }
 
-function selectWork(id) {
+async function selectWork(id) {
   state.selectedId = id;
+  state.artifact = null;
+  const item = state.projection?.workItems.find((entry) => entry.id === id);
+  if (item?.status === "review_pending") {
+    try {
+      state.artifact = await api(
+        `/api/work-items/${encodeURIComponent(id)}/artifact`,
+      );
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "산출물을 읽지 못했습니다.");
+    }
+  }
   renderWork();
   renderInspector();
   document.querySelector("#inspector").classList.add("open");
 }
 
 async function loadDashboard() {
-  const response = await fetch("/api/dashboard", { headers: { accept: "application/json" } });
-  if (!response.ok) throw new Error("대시보드를 읽지 못했습니다.");
-  state.projection = await response.json();
-  if (!state.selectedId && state.projection.workItems.length > 0) {
-    state.selectedId = state.projection.workItems[0].id;
+  state.projection = await api("/api/dashboard");
+  if (
+    !state.selectedId ||
+    !state.projection.workItems.some(({ id }) => id === state.selectedId)
+  ) {
+    state.selectedId = state.projection.workItems[0]?.id ?? null;
   }
   renderSummary();
   renderWork();
@@ -170,9 +240,7 @@ async function loadDashboard() {
 }
 
 async function loadRuntime() {
-  const response = await fetch("/api/runtime", { headers: { accept: "application/json" } });
-  if (!response.ok) return;
-  const entries = await response.json();
+  const entries = await api("/api/runtime");
   document.querySelector("#runtime-items").innerHTML = entries
     .map(
       (entry) => `
@@ -190,12 +258,55 @@ function toast(message) {
   window.clearTimeout(toast.timer);
   toast.timer = window.setTimeout(() => {
     element.hidden = true;
-  }, 2500);
+  }, 3000);
+}
+
+async function mutateSelected(action) {
+  if (!state.selectedId || state.busy) return;
+  state.busy = true;
+  renderInspector();
+  try {
+    let path = `/api/work-items/${encodeURIComponent(state.selectedId)}/${action}`;
+    let body = {};
+    if (["approve", "changes_requested", "reject"].includes(action)) {
+      path = `/api/work-items/${encodeURIComponent(state.selectedId)}/decision`;
+      if (!state.artifact) throw new Error("검토할 산출물이 없습니다.");
+      body = {
+        decision: action,
+        artifactHash: state.artifact.sha256,
+        note: "로컬 대시보드에서 정확한 해시를 확인하고 결정했습니다.",
+      };
+    }
+    await api(path, { method: "POST", body: JSON.stringify(body) });
+    if (action === "retry") {
+      toast("작업을 다시 실행할 수 있도록 준비했습니다.");
+    } else if (action === "run") {
+      toast("모델 실행 결과가 검토 대기 상태로 제출되었습니다.");
+    } else {
+      toast("작업 상태를 업데이트했습니다.");
+    }
+    await loadDashboard();
+    if (
+      state.projection.workItems.find(({ id }) => id === state.selectedId)
+        ?.status === "review_pending"
+    ) {
+      await selectWork(state.selectedId);
+    } else {
+      state.artifact = null;
+      renderInspector();
+    }
+  } catch (error) {
+    toast(error instanceof Error ? error.message : "작업을 처리하지 못했습니다.");
+    await loadDashboard().catch(() => {});
+  } finally {
+    state.busy = false;
+    renderInspector();
+  }
 }
 
 document.addEventListener("click", (event) => {
   const selection = event.target.closest("[data-select-id]");
-  if (selection) selectWork(selection.dataset.selectId);
+  if (selection) void selectWork(selection.dataset.selectId);
   const filter = event.target.closest("[data-filter]");
   if (filter) {
     state.filter = filter.dataset.filter;
@@ -204,6 +315,8 @@ document.addEventListener("click", (event) => {
     });
     renderWork();
   }
+  const action = event.target.closest("[data-action]");
+  if (action) void mutateSelected(action.dataset.action);
 });
 
 const dialog = document.querySelector("#request-dialog");
@@ -226,27 +339,22 @@ document.querySelector("#request-form").addEventListener("submit", async (event)
   const error = document.querySelector("#form-error");
   error.textContent = "";
   try {
-    const response = await fetch("/api/work-items", {
+    const result = await api("/api/work-items", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-chartermesh-session": sessionToken,
-        "x-idempotency-key": crypto.randomUUID(),
-      },
       body: JSON.stringify({
         title: form.get("title"),
         summary: form.get("summary"),
       }),
     });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error ?? "요청을 만들지 못했습니다.");
     dialog.close();
     formElement.reset();
     state.selectedId = result.id;
     await loadDashboard();
+    await selectWork(result.id);
     toast("새 요청을 만들었습니다.");
   } catch (caught) {
-    error.textContent = caught instanceof Error ? caught.message : "요청을 만들지 못했습니다.";
+    error.textContent =
+      caught instanceof Error ? caught.message : "요청을 만들지 못했습니다.";
   }
 });
 

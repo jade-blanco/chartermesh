@@ -96,3 +96,20 @@ export interface RuntimeHealth {
   status: "ready" | "configuration_required" | "unavailable";
   detail: string;
 }
+
+export interface ArtifactEvidence {
+  id: string;
+  workItemId: string;
+  runId: string;
+  sha256: string;
+  mediaType: string;
+  byteSize: number;
+  content: string;
+  createdAt: string;
+}
+
+export interface RuntimeBudgets {
+  monthlyCostLimitUsd: number;
+  maxConcurrentRuns: number;
+  maxDailyModelStarts: number;
+}

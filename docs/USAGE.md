@@ -1,27 +1,20 @@
 # Operating workflow
 
-CharterMesh operates one command-driven lifecycle. The CLI and dashboard are
-two views over the same SQLite Control Plane.
+The CLI and dashboard are two clients of the same SQLite Control Plane.
 
 ```text
-request → triage → claim/run → submit immutable artifact
-        → exact human review → complete → resurface successors
+request → triage → claim/run → immutable artifact → exact human review
+        → complete → resurface successors
+                      ↘ fail → retry → new generation
 ```
 
-## 1. Intake
+## Intake and triage
 
 ```powershell
 node bin/chartermesh.mjs request "Prepare release notes" `
   --summary "Draft concise notes for human review." `
   --target TARGET
-```
 
-The WorkItem starts as `requested`. Its next action is assignment, not model
-execution.
-
-## 2. Triage
-
-```powershell
 node bin/chartermesh.mjs triage `
   --id work-000001 `
   --role operator `
@@ -29,29 +22,33 @@ node bin/chartermesh.mjs triage `
   --target TARGET
 ```
 
-Triage selects a role and an execution target. A role never binds directly to
-a raw model engine.
+A role selects an execution target, not a raw model engine.
 
-## 3. Run
+## Run
 
 ```powershell
 node bin/chartermesh.mjs run --id work-000001 --target TARGET
 ```
 
-Claiming atomically creates:
+Claiming atomically creates a Run, Attempt, time-bounded Lease, and increasing
+generation. The runner requests a structured artifact, validates it, performs
+at most one repair turn, and submits only from the active generation.
 
-- a `Run`;
-- an `Attempt`;
-- a time-bounded `Lease`;
-- a monotonically increasing generation.
+Lease heartbeats protect active work. Expired leases recover to a visible
+`failed` state instead of leaving work permanently `in_progress`.
 
-The built-in managed runner calls the configured model engine once. The result
-can be submitted only by the active generation. CharterMesh stores it under a
-content hash and prints that SHA-256 hash.
+## Failure and retry
 
-## 4. Review the exact artifact
+```powershell
+node bin/chartermesh.mjs retry --id work-000001 --target TARGET
+node bin/chartermesh.mjs run --id work-000001 --target TARGET
+```
 
-Inspect the submitted result, then bind the decision to the printed hash:
+Each retry creates a new generation. Old workers cannot submit into it.
+
+## Exact review
+
+Inspect the artifact content and SHA-256, then bind the decision to that hash:
 
 ```powershell
 node bin/chartermesh.mjs decide `
@@ -62,22 +59,19 @@ node bin/chartermesh.mjs decide `
   --target TARGET
 ```
 
-Decisions are `approve`, `changes_requested`, or `reject`. A model, subagent,
-or host permission prompt cannot supply the human decision. A hash mismatch is
-rejected.
+Choices are `approve`, `changes_requested`, and `reject`. A model, subagent, or
+host permission dialog cannot make the human decision.
 
-## 5. Complete
+## Complete
 
 ```powershell
 node bin/chartermesh.mjs complete --id work-000001 --target TARGET
 ```
 
-Only approved work can complete. Completion checks dependent WorkItems and
-resurfaces each newly unblocked successor exactly once.
+Only approved work can complete. Newly unblocked successors resurface exactly
+once.
 
 ## Explicit waits
-
-Every wait has a type and a reason:
 
 ```powershell
 node bin/chartermesh.mjs wait `
@@ -87,25 +81,12 @@ node bin/chartermesh.mjs wait `
   --target TARGET
 ```
 
-Supported types are:
-
-- `predecessor`
-- `not_before` with `--resume-at`
-- `user_input`
-- `manual_resume`
-- `approval`
-
-Waiting work remains visible in the dashboard but is excluded from the
-actionable count unless the user must provide input or review.
-
-After the stated condition is satisfied, resume it explicitly:
+Wait types are `predecessor`, `not_before`, `user_input`, `manual_resume`, and
+`approval`. Resume explicitly after the condition is satisfied:
 
 ```powershell
 node bin/chartermesh.mjs resume --id work-000001 --target TARGET
 ```
-
-`not_before` and predecessor waits refuse early resume while their conditions
-remain unsatisfied.
 
 ## Dashboard
 
@@ -113,35 +94,44 @@ remain unsatisfied.
 node bin/chartermesh.mjs dashboard --target TARGET --port 4173
 ```
 
-The Today view orders user actions as:
+The inspector exposes the appropriate action for each state: triage, run,
+retry, review, or complete. Review shows artifact content and exact hash.
+Every action remains a Control Plane command with actor and idempotency.
 
-1. human review;
-2. user input;
-3. failures and retry;
-4. unassigned intake;
-5. requested changes and resume;
-6. ready-to-start work;
-7. visible non-actionable waits.
+## Machine-readable CLI
 
-Selecting a row opens its inspector. Creating a request sends one idempotent
-Control Plane command; the browser never edits state rows directly.
+Agent-facing commands accept `--json` and return:
 
-## Useful commands
-
-```powershell
-node bin/chartermesh.mjs help
-node bin/chartermesh.mjs doctor --target TARGET
-node bin/chartermesh.mjs list --target TARGET
-node bin/chartermesh.mjs seed-demo --target TARGET
+```json
+{
+  "apiVersion": "chartermesh.dev/cli/v1alpha1",
+  "command": "list",
+  "ok": true,
+  "data": {}
+}
 ```
 
-## What is authoritative
+Use `propose --json` before bootstrap. Parse `data.planHash` from the bootstrap
+preview, show it to the human, and only apply after the human approves that
+exact value.
 
-- Desired organization and runtime configuration: reviewable JSON files.
+## Budgets
+
+Claims enforce the installed OrgSpec values:
+
+- `maxConcurrentRuns`
+- `maxDailyModelStarts`
+- `monthlyCostLimitUsd`
+
+Budget failures are stable error codes. They never trigger provider failover or
+silent permission expansion.
+
+## Sources of truth
+
+- Desired organization/runtime: reviewable `.chartermesh/*.json`.
 - Mutable runtime state: `.chartermesh/state.db`.
-- Review evidence: content-addressed artifacts and immutable hashes.
-- UI counts: server-generated Control Plane projection.
+- Review evidence: content-addressed artifacts and hashes.
+- UI counts: server-generated `DashboardProjection`.
 
-Provider chats, native task lists, agent-team messages, goals, threads,
-worktrees, and schedules are integrations or runtime capabilities. They are
-not a second WorkItem ledger.
+Provider chats, native task lists, subagent messages, goals, threads,
+worktrees, and schedules are capabilities or projections—not another ledger.

@@ -146,10 +146,27 @@ export async function startDashboard(
   }
 
   const database = openControlPlaneDatabase(resolve(stateDirectory, "state.db"));
+  let budgets:
+    | {
+        monthlyCostLimitUsd: number;
+        maxConcurrentRuns: number;
+        maxDailyModelStarts: number;
+      }
+    | undefined;
+  try {
+    const organization = JSON.parse(
+      readFileSync(resolve(stateDirectory, "organization.json"), "utf8"),
+    ) as { spec?: { budgets?: typeof budgets } };
+    budgets = organization.spec?.budgets;
+  } catch {
+    // The dashboard remains available so the user can diagnose configuration.
+  }
   const controlPlane = new ControlPlane(
     database,
     resolve(stateDirectory, "artifacts"),
+    { budgets },
   );
+  controlPlane.recoverExpiredLeases("system:dashboard-start");
   const sessionToken = randomBytes(32).toString("base64url");
   let port = options.port ?? 4173;
 
@@ -167,7 +184,15 @@ export async function startDashboard(
 
     const url = new URL(request.url ?? "/", `http://${host}`);
     const method = request.method ?? "GET";
+    const isApi = url.pathname.startsWith("/api/");
     const isMutation = !["GET", "HEAD", "OPTIONS"].includes(method);
+    if (
+      isApi &&
+      request.headers["x-chartermesh-session"] !== sessionToken
+    ) {
+      json(response, 403, { error: "Invalid dashboard session." });
+      return;
+    }
     if (isMutation) {
       const allowedOrigins = new Set([
         `http://127.0.0.1:${port}`,
@@ -176,10 +201,6 @@ export async function startDashboard(
       ]);
       if (!allowedOrigins.has(request.headers.origin ?? "")) {
         json(response, 403, { error: "Invalid mutation origin." });
-        return;
-      }
-      if (request.headers["x-chartermesh-session"] !== sessionToken) {
-        json(response, 403, { error: "Invalid dashboard session." });
         return;
       }
       if (
@@ -221,6 +242,107 @@ export async function startDashboard(
           idempotencyKey,
         });
         json(response, 201, item);
+        return;
+      }
+      const actionMatch = url.pathname.match(
+        /^\/api\/work-items\/([^/]+)\/(triage|run|retry|decision|complete)$/u,
+      );
+      if (method === "POST" && actionMatch) {
+        const id = decodeURIComponent(actionMatch[1]);
+        const action = actionMatch[2];
+        const body = await readJson(request);
+        const idempotencyKey =
+          typeof request.headers["x-idempotency-key"] === "string"
+            ? request.headers["x-idempotency-key"]
+            : randomUUID();
+        if (action === "triage") {
+          const item = controlPlane.triage({
+            id,
+            ownerRole:
+              typeof body.ownerRole === "string" ? body.ownerRole : "operator",
+            executionTarget:
+              typeof body.executionTarget === "string"
+                ? body.executionTarget
+                : "local",
+            actor: "human:dashboard",
+            idempotencyKey,
+          });
+          json(response, 200, item);
+          return;
+        }
+        if (action === "run") {
+          const { runWork } = await import("../../cli/src/main.ts");
+          json(response, 200, await runWork(target, id, { quiet: true }));
+          return;
+        }
+        if (action === "retry") {
+          json(
+            response,
+            200,
+            controlPlane.retry({
+              id,
+              actor: "human:dashboard",
+              idempotencyKey,
+            }),
+          );
+          return;
+        }
+        if (action === "decision") {
+          const decision = body.decision;
+          if (
+            decision !== "approve" &&
+            decision !== "changes_requested" &&
+            decision !== "reject"
+          ) {
+            throw new Error(
+              "decision must be approve, changes_requested, or reject.",
+            );
+          }
+          const artifactHash =
+            typeof body.artifactHash === "string" ? body.artifactHash : "";
+          const note =
+            typeof body.note === "string"
+              ? body.note
+              : "Reviewed from the local dashboard.";
+          json(
+            response,
+            200,
+            controlPlane.decide({
+              id,
+              decision,
+              artifactHash,
+              note,
+              actor: "human:dashboard",
+              idempotencyKey,
+            }),
+          );
+          return;
+        }
+        if (action === "complete") {
+          json(
+            response,
+            200,
+            controlPlane.complete({
+              id,
+              actor: "human:dashboard",
+              idempotencyKey,
+            }),
+          );
+          return;
+        }
+      }
+      const artifactMatch = url.pathname.match(
+        /^\/api\/work-items\/([^/]+)\/artifact$/u,
+      );
+      if (method === "GET" && artifactMatch) {
+        const artifact = controlPlane.latestArtifact(
+          decodeURIComponent(artifactMatch[1]),
+        );
+        if (!artifact) {
+          json(response, 404, { error: "Artifact not found." });
+          return;
+        }
+        json(response, 200, artifact);
         return;
       }
       if (method === "GET" && url.pathname === "/") {

@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { RuntimeManifestSet } from "../../adapter-sdk/src/types.ts";
-import { parseOrgSpec, validateOrgSpec } from "../src/index.ts";
+import {
+  OrgSpecParseError,
+  parseOrgSpec,
+  validateOrgSpec,
+} from "../src/index.ts";
 import type { OrganizationSpec } from "../src/types.ts";
 import { loadOrganization, runtimeManifests } from "./fixtures.ts";
 
@@ -50,6 +54,34 @@ test("dependency-free parser and semantic validator accept the fixture", async (
   const result = validateOrgSpec(parsed, runtimeManifests);
 
   assert.equal(result.ok, true, JSON.stringify(result.issues, null, 2));
+});
+
+test("parser enforces the machine-readable schema before semantic validation", async () => {
+  const fixtureUrl = new URL(
+    "../../../examples/balanced-software-team/organization.json",
+    import.meta.url,
+  );
+  const candidate = JSON.parse(await readFile(fixtureUrl, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  candidate.unexpected = true;
+  assert.throws(
+    () => parseOrgSpec(JSON.stringify(candidate)),
+    (error: unknown) =>
+      error instanceof OrgSpecParseError &&
+      error.message.includes("/unexpected [additionalProperties]"),
+  );
+
+  const wrongType = structuredClone(candidate);
+  delete wrongType.unexpected;
+  (wrongType.metadata as Record<string, unknown>).revision = "one";
+  assert.throws(
+    () => parseOrgSpec(JSON.stringify(wrongType)),
+    (error: unknown) =>
+      error instanceof OrgSpecParseError &&
+      error.message.includes("/metadata/revision [type]"),
+  );
 });
 
 test("reference integrity rejects unknown execution targets and roles", async () => {

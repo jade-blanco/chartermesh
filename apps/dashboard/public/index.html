@@ -20,24 +20,24 @@
             <span aria-hidden="true">⌂</span> 오늘
           </a>
           <button class="nav-item" type="button" data-filter-nav="all">
-            <span aria-hidden="true">▤</span> 작업
+            <span aria-hidden="true">≡</span> 작업
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
             <span aria-hidden="true">✓</span> 승인 <small>준비 중</small>
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
-            <span aria-hidden="true">↻</span> 실행·일정 <small>준비 중</small>
+            <span aria-hidden="true">◷</span> 실행·일정 <small>준비 중</small>
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
             <span aria-hidden="true">◇</span> 조직 <small>준비 중</small>
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
-            <span aria-hidden="true">◷</span> 활동 <small>준비 중</small>
+            <span aria-hidden="true">⚙</span> 설정 <small>준비 중</small>
           </button>
         </nav>
         <div class="local-note">
           <span class="health-dot"></span>
-          <div><strong>로컬 제어평면</strong><small>단일 상태 원장</small></div>
+          <div><strong>로컬 제어면</strong><small>단일 상태 저장소</small></div>
         </div>
       </aside>
 
@@ -55,23 +55,23 @@
 
         <section class="summary-grid" aria-label="운영 요약">
           <article class="summary-card blue">
-            <div><span class="summary-icon">↗</span><span>지금 필요한 조치</span></div>
-            <strong id="summary-actionable">–</strong>
+            <div><span class="summary-icon">→</span><span>지금 필요한 조치</span></div>
+            <strong id="summary-actionable">—</strong>
             <small>실행 또는 결정 가능</small>
           </article>
           <article class="summary-card violet">
             <div><span class="summary-icon">✓</span><span>사람 검토</span></div>
-            <strong id="summary-approvals">–</strong>
+            <strong id="summary-approvals">—</strong>
             <small>불변 산출물 검토</small>
           </article>
           <article class="summary-card amber">
             <div><span class="summary-icon">?</span><span>사용자 입력</span></div>
-            <strong id="summary-input">–</strong>
-            <small>답변이 있어야 재개</small>
+            <strong id="summary-input">—</strong>
+            <small>응답이 있어야 재개</small>
           </article>
           <article class="summary-card red">
             <div><span class="summary-icon">!</span><span>실패</span></div>
-            <strong id="summary-failed">–</strong>
+            <strong id="summary-failed">—</strong>
             <small>검사와 재시도 필요</small>
           </article>
         </section>
@@ -80,7 +80,7 @@
           <div class="section-heading">
             <div>
               <h2 id="work-heading">작업 흐름</h2>
-              <p>상태가 아닌 다음 조치를 기준으로 정렬됩니다.</p>
+              <p>상태보다 다음 조치를 기준으로 정렬합니다.</p>
             </div>
             <div class="filters" role="group" aria-label="작업 필터">
               <button class="filter active" data-filter="all" type="button">전체</button>
@@ -102,7 +102,7 @@
                 </tr>
               </thead>
               <tbody id="work-table-body">
-                <tr><td class="loading-cell" colspan="5">제어평면을 읽는 중…</td></tr>
+                <tr><td class="loading-cell" colspan="5">제어면을 읽는 중…</td></tr>
               </tbody>
             </table>
             <div class="mobile-list" id="mobile-work-list"></div>
@@ -116,8 +116,8 @@
 
         <section class="runtime-band" aria-labelledby="runtime-heading">
           <div>
-            <span class="runtime-symbol">⌁</span>
-            <div><h2 id="runtime-heading">런타임 상태</h2><p>엔진과 실행기의 연결 준비 상태</p></div>
+            <span class="runtime-symbol">◎</span>
+            <div><h2 id="runtime-heading">런타임 상태</h2><p>모델 엔진과 실행기의 연결 준비 상태</p></div>
           </div>
           <div class="runtime-items" id="runtime-items">
             <span class="runtime-item"><i></i> 확인 중…</span>
@@ -153,6 +153,12 @@
             <label>계보</label>
             <p class="mono" id="inspector-lineage"></p>
           </div>
+          <div class="inspector-block" id="artifact-block" hidden>
+            <label>검토 산출물 · 정확한 해시</label>
+            <p class="mono" id="artifact-hash"></p>
+            <pre class="artifact-preview" id="artifact-content"></pre>
+          </div>
+          <div class="inspector-actions" id="inspector-actions"></div>
         </div>
       </aside>
     </div>

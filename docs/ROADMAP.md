@@ -1,114 +1,49 @@
 # Implementation roadmap
 
-Current milestone: `0.0.1-alpha.1` runnable local vertical slice.
+Current milestone: `0.0.2-alpha.1`, provider-neutral structured execution.
 
-## Phase 0 — independent foundation
+## Completed foundation
 
-Deliverables:
+- Apache-2.0 TypeScript/pnpm monorepo
+- Offline verification and private-data boundary scan
+- Provider-neutral OrgSpec schema, dependency-free schema validation, semantic
+  validation, canonical hashes, and capability negotiation
+- Universal `BOOTSTRAP.md` application protocol
+- Project-aware lean/balanced/controlled proposals
+- Exact hash-bound plan and staged rollback-on-error apply
+- SQLite Control Plane with idempotency, append-only events, transactional
+  outbox, runs, attempts, leases, artifacts, approvals, and usage
+- Fencing, heartbeat, lease recovery, visible failure, retry, and budgets
+- Fake and OpenAI-compatible engines
+- Structured artifacts, repair turn, and cancellation propagation
+- CLI and dashboard complete reviewed-work path
+- Synthetic model evaluation
 
-- Git repository, CharterMesh name, safety guidance
-- TypeScript/pnpm monorepo boundary
-- CI, offline test command, private-data boundary scan
-- Product design, ADRs, requirements traceability, handover
-- Apache-2.0 license and public name recorded
+## Next: execution hardening
 
-Done when `pnpm verify` passes on the supported local Node.js version and no
-forbidden private marker exists in distributable paths.
+- Crash-safe apply recovery after process termination, not only exceptions
+- General tool-execution loop with policy enforcement and tool evidence
+- Attempt-level dead-letter policy and global kill switch
+- No-work scheduler and empty-start accounting
+- Provider failover canary with permission/capability revalidation
+- Cross-process concurrency and idempotency stress suites
 
-## Phase 1 — OrgSpec vertical slice
+## Next: integration surfaces
 
-Deliverables:
+- MCP server over the same Control Plane application service
+- Command-based local model adapter
+- Optional external AgentHost adapters
+- Runtime capability discovery and drift reporting
+- Package-manager distribution and clean-machine install/uninstall
 
-- OrgSpec v1alpha1 schema, parser, types, canonical hash
-- Deterministic semantic validator
-- Synthetic balanced organization
-- Structural diff and InstallPlan
-- Exact spec/plan hash approval gate
-- Rollback plan contract
+## Next: dashboard and release
 
-Done when valid fixtures pass, unsafe fixtures fail with stable error codes,
-unapproved apply fails, changed candidates invalidate approval, and tests use no
-network or paid model.
+- Run/attempt/usage history
+- Organization and proposal diff views
+- Schedule and audit views
+- Keyboard, responsive, browser accessibility, and visual regression suites
+- Compatibility matrix for small/local and remote models
+- Security review and release automation
 
-## Phase 2 — Control Plane
-
-Deliverables:
-
-- SQLite WAL migrations and repository boundary
-- WorkItem, Run, Attempt, Lease, Artifact, Approval, Event, UsageRecord
-- Transactional outbox, optimistic concurrency, idempotency
-- Scheduler, heartbeat, retry, dead letter, pause and kill switch
-- CLI, MCP, and REST over one application service layer
-
-Current status: the SQLite command service, core lifecycle, CLI, and
-loopback-only dashboard API are implemented. Transactional outbox, heartbeat,
-dead letter, kill switch, and MCP remain.
-
-Done when concurrency, fencing, crash recovery, approval pause/resume,
-no-change reads, and no-work-no-model tests pass.
-
-## Phase 3 — C-level bootstrap
-
-Deliverables:
-
-- Read-only environment capability inspection
-- Goal, risk, approval, budget, and schedule interview
-- Lean, balanced, and controlled proposals
-- Structured OrgSpec-only model output
-- UserAction generation for unsupported or manual setup
-
-Done when unsafe or invalid model output cannot reach plan/apply.
-
-## Phase 4 — engines and hosts
-
-Order:
-
-1. Fake `ModelEngine` and fake `ManagedRunner`
-2. Built-in `ManagedRunner`
-3. Generic model API and command `ModelEngine` adapters
-4. User-selected external `AgentHost`
-5. A second engine or host compatibility adapter
-
-Model and host manifests are discovered independently. The managed runner must
-work without Codex or Claude Code. Optional Codex and Claude Code manifests
-distinguish stable, beta, experimental, manual-only, local, hosted, and
-chat-continuation capabilities. Native subagents, agent teams, goals, threads,
-worktrees, and schedules remain host-adapter implementation choices.
-
-Done when the generic engine plus built-in runner completes the baseline E2E,
-and contract, drift, permission non-escalation, child cleanup, usage accounting,
-and failover canary tests pass.
-
-Current status: items 1–3 have a single-turn text implementation and offline
-E2E. Tool loops, command-based engines, external AgentHosts, cancellation
-propagation, and failover remain.
-
-## Phase 5 — dashboard
-
-Priority:
-
-1. User actions and blockers
-2. Proposal and plan diff
-3. Approvals and artifact evidence
-4. Work and dependencies
-5. Schedules and runs
-6. Usage, retries, handoffs, and empty starts
-7. Audit history
-
-Done when keyboard, responsive, accessibility, and E2E tests pass.
-
-Current status: the Today action projection, filters, inspector, runtime health,
-new-request dialog, responsive layout, and API security test are implemented.
-Full review, run history, schedule, usage, and browser accessibility suites
-remain.
-
-## Phase 6 — burn-in and release
-
-- Synthetic software-development and research packs
-- Clean-machine install and uninstall
-- Crash/resume, provider failover, schedule drift, rollback
-- Compatibility matrix and security review
-- Public name, disclosure address, release and telemetry policy
-
-Remote publication and package publication remain separately authorized
-actions. A public source repository does not imply an npm package release.
+Remote publication and npm publication are separately authorized actions. A
+public source repository does not imply a package release.

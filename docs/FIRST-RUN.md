@@ -1,106 +1,111 @@
 # First run
 
-This guide starts with the offline fake engine, verifies the complete local
-path, and then shows where to configure a live model.
+This guide starts offline, applies an exact approved plan, exercises the whole
+review loop, and only then connects a live model.
 
 ## 1. Prepare CharterMesh
 
-Clone the public repository and verify the source:
-
 ```powershell
-git clone CHARTERMESH_REPOSITORY_URL chartermesh
+git clone https://github.com/jade-blanco/chartermesh.git chartermesh
 cd chartermesh
 node --version
 pnpm verify
 ```
 
-Node.js 24 or newer is required. The current runtime has no external npm
-dependencies.
+Node.js 24 or newer is required. No runtime npm dependency is needed.
 
-If you are using a coding agent, give it the repository URL and say:
+With a coding agent, provide the repository URL and say:
 
 > Apply CharterMesh to this project.
 
-The agent must follow `BOOTSTRAP.md`; it should not improvise target files.
+The agent must follow `BOOTSTRAP.md` and use the repository CLI.
 
-## 2. Preview the target plan
-
-From the CharterMesh checkout:
+## 2. Inspect the proposed organization
 
 ```powershell
-node bin/chartermesh.mjs bootstrap --target C:\path\to\target --engine fake
+node bin/chartermesh.mjs propose `
+  --target C:\path\to\target `
+  --profile balanced
 ```
 
-The preview:
+`propose` reads filenames and directory metadata only. It detects language,
+package manager, tests, CI, and deployment/infrastructure signals. It does not
+write to the target.
 
-- reads the target;
-- calculates before and after hashes;
-- lists the proposed `.chartermesh` files;
-- prints one plan hash;
-- performs no target writes.
+Profiles:
 
-Review the target and hashes. Then repeat the same command with the exact
-approval token:
+- `lean`: one worker and conservative budgets.
+- `balanced`: one worker with moderate local budgets.
+- `controlled`: worker plus verifier and a separate verification stage.
+
+## 3. Preview and approve the exact plan
 
 ```powershell
-node bin/chartermesh.mjs bootstrap --target C:\path\to\target --engine fake --approve PLAN_HASH
+node bin/chartermesh.mjs bootstrap `
+  --target C:\path\to\target `
+  --profile balanced `
+  --engine fake
 ```
 
-If the target changed after preview, the hash changes and the old approval is
-rejected.
+The command lists every file, its current hash or absence, its proposed hash,
+and one plan hash. It performs no target writes.
 
-## 3. Diagnose and seed offline work
+After review, repeat the identical command with the exact token:
+
+```powershell
+node bin/chartermesh.mjs bootstrap `
+  --target C:\path\to\target `
+  --profile balanced `
+  --engine fake `
+  --approve PLAN_HASH
+```
+
+Changed target state produces a new hash and invalidates the old approval.
+
+## 4. Diagnose and exercise the offline workflow
 
 ```powershell
 node bin/chartermesh.mjs doctor --target C:\path\to\target
 node bin/chartermesh.mjs seed-demo --target C:\path\to\target
-node bin/chartermesh.mjs list --target C:\path\to\target
-```
-
-`doctor` validates configuration only. It deliberately does not make a paid or
-remote model call.
-
-## 4. Start the local dashboard
-
-```powershell
 node bin/chartermesh.mjs dashboard --target C:\path\to\target
 ```
 
-Open the printed `http://127.0.0.1:PORT` URL. The server:
+The dashboard can triage, run, retry, inspect the exact artifact and SHA-256,
+approve or request changes, and complete work. It binds only to loopback. All
+API reads require the per-process browser session token; mutations additionally
+require same-origin JSON and an idempotency key.
 
-- binds to loopback only;
-- checks Host and mutation Origin;
-- requires a per-process browser session token for mutations;
-- returns no database, artifact, credential, or target paths.
-
-The pre-alpha dashboard creates and inspects requests. Use the CLI for triage,
-run, review, and completion.
-
-## 5. Reconfigure the engine
-
-Reconfiguration uses its own plan and approval hash. For example:
+## 5. Configure a live engine
 
 ```powershell
 node bin/chartermesh.mjs configure-engine `
   --target C:\path\to\target `
   --engine openai-compatible `
-  --endpoint http://127.0.0.1:11434/v1 `
-  --model YOUR_MODEL_ID
+  --endpoint http://127.0.0.1:8080/v1 `
+  --model YOUR_MODEL_ID `
+  --structured-output prompt `
+  --reasoning disabled
 ```
 
-Review the runtime-file before/after hashes, then repeat the identical command
-with `--approve PLAN_HASH`.
+Review and approve the new plan hash, then run `doctor` again. Use
+`--structured-output json-schema` only if the serving engine supports the
+OpenAI JSON Schema response-format extension.
 
-See `LLM-CONNECTIONS.md` for tested protocol shapes and security guidance.
+## 6. Run the synthetic model evaluation
 
-## 6. Remove local runtime state
+```powershell
+node bin/chartermesh.mjs evaluate-model `
+  --target C:\path\to\target `
+  --live `
+  --json
+```
 
-CharterMesh does not provide a destructive uninstall command in pre-alpha.
-Desired configuration is in `.chartermesh/organization.json` and
-`.chartermesh/runtime.json`; mutable state and artifacts are ignored by the
-target's nested `.gitignore`.
+The `--live` flag is an explicit model-call opt-in. The evaluation uses
+synthetic prompts only. See `MODEL-EVALUATION.md`.
 
-If removal is needed, stop the dashboard, back up anything that must be
-retained, and have a human explicitly approve the exact `.chartermesh`
-directory before deleting it. Removing that directory permanently removes the
-local WorkItem ledger and review artifacts.
+## Removal
+
+There is no destructive uninstall command. Stop the dashboard, retain any
+required evidence, and have a human explicitly approve deletion of the exact
+target `.chartermesh` directory. Removing it permanently removes the local
+ledger and artifacts.

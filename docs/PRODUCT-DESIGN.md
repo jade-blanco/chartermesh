@@ -1578,3 +1578,27 @@ Dify, Microsoft Agent Framework와 불필요하게 경쟁한다. 이 제품은 �
 비공개 레거시 시스템은 이 폐루프의 첫 dogfooding 사례였다. CharterMesh는
 그 시스템의 복제품이 아니라 누구나 자기 업무에 맞는 AI 조직을 생성할 수
 있는 범용 Organization-as-Code 제품으로 설계한다.
+# 0.0.2 authoritative implementation amendment — 2026-07-29
+
+This amendment supersedes earlier implementation-status statements without
+changing the core architecture:
+
+- Bootstrap begins with a deterministic, metadata-only target assessment and a
+  hash-bound `lean`, `balanced`, or `controlled` organization proposal.
+- Agent-facing CLI commands use the versioned
+  `chartermesh.dev/cli/v1alpha1` envelope.
+- OrgSpec JSON is checked against the machine-readable schema before semantic
+  capability and reference validation.
+- The built-in ManagedRunner requires a versioned structured artifact, permits
+  one bounded repair turn, and propagates cancellation to the engine.
+- The Control Plane transactionally records outbox entries, heartbeats active
+  leases, recovers expired leases to visible failure, retries with a new
+  generation, and enforces installed run/start/cost budgets.
+- The dashboard executes the reviewed-work lifecycle through Control Plane
+  commands and requires a process-session token for every API response.
+- Synthetic model evaluation is the compatibility harness for local and small
+  engines; it never makes the model the ledger or human approval authority.
+
+The general tool-execution loop, process-death recovery during filesystem
+apply, scheduler/dead-letter/kill-switch behavior, and package publication are
+not complete and must not be represented as complete.

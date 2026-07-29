@@ -6,6 +6,7 @@ coverage/
 .vite/
 playwright-report/
 test-results/
+.tools/
 
 .chartermesh/state.db
 .chartermesh/state.db-*

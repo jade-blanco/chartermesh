@@ -41,6 +41,9 @@ test("dashboard serves one projection and protects mutations", async () => {
     )?.[1];
     assert.ok(token);
 
+    const rejectedRead = await fetch(`${dashboard.url}/api/dashboard`);
+    assert.equal(rejectedRead.status, 403);
+
     const rejected = await fetch(`${dashboard.url}/api/work-items`, {
       method: "POST",
       headers: {
@@ -77,12 +80,69 @@ test("dashboard serves one projection and protects mutations", async () => {
     });
     assert.equal(created.status, 201);
 
-    const projection = await fetch(`${dashboard.url}/api/dashboard`).then(
-      (response) => response.json(),
-    );
+    const projection = await fetch(`${dashboard.url}/api/dashboard`, {
+      headers: { "x-chartermesh-session": token },
+    }).then((response) => response.json());
     assert.equal(projection.summary.actionable, 1);
     assert.equal(projection.workItems[0].title, "Create a secure local request");
     assert.equal("path" in projection.workItems[0], false);
+
+    const mutationHeaders = (key: string) => ({
+      "content-type": "application/json",
+      origin: dashboard.url,
+      "x-chartermesh-session": token,
+      "x-idempotency-key": key,
+    });
+    const id = projection.workItems[0].id;
+    const triaged = await fetch(
+      `${dashboard.url}/api/work-items/${id}/triage`,
+      {
+        method: "POST",
+        headers: mutationHeaders("dashboard-test-triage"),
+        body: "{}",
+      },
+    );
+    assert.equal(triaged.status, 200);
+
+    const ran = await fetch(`${dashboard.url}/api/work-items/${id}/run`, {
+      method: "POST",
+      headers: mutationHeaders("dashboard-test-run"),
+      body: "{}",
+    });
+    assert.equal(ran.status, 200, await ran.text());
+
+    const artifact = await fetch(
+      `${dashboard.url}/api/work-items/${id}/artifact`,
+      { headers: { "x-chartermesh-session": token } },
+    ).then((response) => response.json());
+    assert.match(artifact.sha256, /^[a-f0-9]{64}$/u);
+    assert.match(artifact.content, /Simulated CharterMesh result/u);
+
+    const approved = await fetch(
+      `${dashboard.url}/api/work-items/${id}/decision`,
+      {
+        method: "POST",
+        headers: mutationHeaders("dashboard-test-approve"),
+        body: JSON.stringify({
+          decision: "approve",
+          artifactHash: artifact.sha256,
+          note: "Exact hash reviewed in dashboard test.",
+        }),
+      },
+    );
+    assert.equal(approved.status, 200);
+
+    const completed = await fetch(
+      `${dashboard.url}/api/work-items/${id}/complete`,
+      {
+        method: "POST",
+        headers: mutationHeaders("dashboard-test-complete"),
+        body: "{}",
+      },
+    );
+    assert.equal(completed.status, 200);
+    const final = await completed.json();
+    assert.equal(final.workItem.status, "done");
   } finally {
     await dashboard.close();
   }

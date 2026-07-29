@@ -236,3 +236,125 @@ test("artifact evidence is fenced by run generation and exact hash", () => {
     database.close();
   }
 });
+
+test("failed runs are retryable with a new fenced generation", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Retry a failed model call",
+      summary: "Preserve failure evidence and create a new generation.",
+      actor: "human:test",
+      idempotencyKey: "retry:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "retry:triage",
+    });
+    const first = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "retry:claim:1",
+    });
+    controlPlane.failRun({
+      id: item.id,
+      generation: first.generation,
+      attemptId: first.attemptId,
+      errorCode: "MODEL_INVOCATION_FAILED",
+      errorMessage: "Synthetic model failure.",
+      actor: "runner:test",
+      idempotencyKey: "retry:fail",
+    });
+    assert.equal(controlPlane.get(item.id).status, "failed");
+    controlPlane.retry({
+      id: item.id,
+      actor: "human:test",
+      idempotencyKey: "retry:ready",
+    });
+    const second = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "retry:claim:2",
+    });
+    assert.equal(second.generation, 2);
+  } finally {
+    database.close();
+  }
+});
+
+test("expired leases recover to a visible failed state", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Recover abandoned work",
+      summary: "An expired worker must not leave work in progress forever.",
+      actor: "human:test",
+      idempotencyKey: "lease:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "lease:triage",
+    });
+    controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "lease:claim",
+      leaseMinutes: -1,
+    });
+    assert.deepEqual(controlPlane.recoverExpiredLeases(), [item.id]);
+    assert.equal(controlPlane.get(item.id).status, "failed");
+  } finally {
+    database.close();
+  }
+});
+
+test("run starts enforce declared concurrency and daily budgets", () => {
+  const directory = mkdtempSync(join(tmpdir(), "chartermesh-budget-"));
+  const database = openControlPlaneDatabase(join(directory, "state.db"));
+  const controlPlane = new ControlPlane(database, join(directory, "artifacts"), {
+    budgets: {
+      monthlyCostLimitUsd: 10,
+      maxConcurrentRuns: 1,
+      maxDailyModelStarts: 1,
+    },
+  });
+  try {
+    const items = ["first", "second"].map((name) => {
+      const item = controlPlane.intake({
+        title: name,
+        summary: `Synthetic ${name} work.`,
+        actor: "human:test",
+        idempotencyKey: `budget:intake:${name}`,
+      });
+      controlPlane.triage({
+        id: item.id,
+        ownerRole: "operator",
+        executionTarget: "local",
+        actor: "human:test",
+        idempotencyKey: `budget:triage:${name}`,
+      });
+      return item;
+    });
+    controlPlane.claim({
+      id: items[0]!.id,
+      actor: "runner:test",
+      idempotencyKey: "budget:claim:first",
+    });
+    assert.throws(
+      () =>
+        controlPlane.claim({
+          id: items[1]!.id,
+          actor: "runner:test",
+          idempotencyKey: "budget:claim:second",
+        }),
+      /BUDGET_CONCURRENT_RUNS_EXCEEDED/u,
+    );
+  } finally {
+    database.close();
+  }
+});

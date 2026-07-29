@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -125,4 +125,74 @@ test("engine reconfiguration is also bound to an exact plan hash", () => {
   );
   assert.equal(runtime.modelEngines[0].adapter, "openai-compatible");
   assert.equal(runtime.modelEngines[0].model, "local-model");
+});
+
+test("proposal and workflow commands expose versioned JSON for coding agents", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-json-"));
+  writeFileSync(join(target, "package.json"), '{"scripts":{"test":"node --test"}}');
+  writeFileSync(join(target, "service.ts"), "export const service = true;\n");
+  writeFileSync(join(target, "service.test.ts"), "export {};\n");
+
+  const proposed = cli([
+    "propose",
+    "--target",
+    target,
+    "--profile",
+    "controlled",
+    "--json",
+  ]);
+  assert.equal(proposed.status, 0, proposed.stderr);
+  const proposal = JSON.parse(proposed.stdout);
+  assert.equal(proposal.apiVersion, "chartermesh.dev/cli/v1alpha1");
+  assert.equal(proposal.data.profile, "controlled");
+  assert.ok(proposal.data.assessment.detectedLanguages.includes("TypeScript"));
+  assert.equal(proposal.data.assessment.hasTests, true);
+
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "fake",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  assert.equal(preview.data.approvalRequired, true);
+  const applied = cli([
+    ...bootstrapArgs,
+    "--approve",
+    preview.data.planHash,
+  ]);
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(JSON.parse(applied.stdout).data.applied, true);
+
+  const requested = cli([
+    "request",
+    "JSON contract",
+    "--summary",
+    "Exercise the machine-readable command contract.",
+    "--target",
+    target,
+    "--json",
+  ]);
+  const requestEnvelope = JSON.parse(requested.stdout);
+  assert.equal(requestEnvelope.command, "request");
+  assert.match(requestEnvelope.data.id, /^work-\d{6}$/u);
+
+  const listed = JSON.parse(
+    cli(["list", "--target", target, "--json"]).stdout,
+  );
+  assert.equal(listed.data.items.length, 1);
+
+  const evaluated = cli([
+    "evaluate-model",
+    "--target",
+    target,
+    "--live",
+    "--json",
+  ]);
+  assert.equal(evaluated.status, 0, evaluated.stdout + evaluated.stderr);
+  const evaluationEnvelope = JSON.parse(evaluated.stdout);
+  assert.equal(evaluationEnvelope.command, "evaluate-model");
+  assert.equal(evaluationEnvelope.data.passedCases, 3);
 });

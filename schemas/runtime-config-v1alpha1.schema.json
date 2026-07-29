@@ -33,6 +33,13 @@
               "endpoint": { "type": "string", "format": "uri" },
               "model": { "type": "string", "minLength": 1 },
               "apiKeyEnv": { "type": "string", "minLength": 1 },
+              "structuredOutputMode": {
+                "enum": ["prompt", "json-schema"]
+              },
+              "toolCalling": { "type": "boolean" },
+              "reasoningMode": {
+                "enum": ["default", "disabled"]
+              },
               "timeoutMs": {
                 "type": "integer",
                 "minimum": 1000,

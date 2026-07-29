@@ -8,10 +8,16 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
   database.exec(`
     PRAGMA foreign_keys = ON;
     PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
 
     CREATE TABLE IF NOT EXISTS metadata (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS work_items (
@@ -66,6 +72,8 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
       status TEXT NOT NULL,
       started_at TEXT NOT NULL,
       finished_at TEXT,
+      error_code TEXT,
+      error_message TEXT,
       FOREIGN KEY(run_id) REFERENCES runs(id)
     );
 
@@ -76,6 +84,7 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
       owner TEXT NOT NULL,
       generation INTEGER NOT NULL,
       acquired_at TEXT NOT NULL,
+      heartbeat_at TEXT,
       expires_at TEXT NOT NULL,
       released_at TEXT,
       FOREIGN KEY(run_id) REFERENCES runs(id),
@@ -91,7 +100,7 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
       media_type TEXT NOT NULL,
       byte_size INTEGER NOT NULL,
       created_at TEXT NOT NULL,
-      UNIQUE(work_item_id, sha256),
+      UNIQUE(run_id, sha256),
       FOREIGN KEY(work_item_id) REFERENCES work_items(id),
       FOREIGN KEY(run_id) REFERENCES runs(id)
     );
@@ -140,6 +149,16 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id INTEGER NOT NULL UNIQUE,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      dispatched_at TEXT,
+      FOREIGN KEY(event_id) REFERENCES events(id)
+    );
+
     CREATE INDEX IF NOT EXISTS work_items_status_idx
       ON work_items(status, availability, priority, updated_at);
     CREATE INDEX IF NOT EXISTS dependencies_predecessor_idx
@@ -153,6 +172,65 @@ export function openControlPlaneDatabase(path: string): DatabaseSync {
     .all() as Array<{ name: string }>;
   if (!workItemColumns.some(({ name }) => name === "wait_created_by")) {
     database.exec("ALTER TABLE work_items ADD COLUMN wait_created_by TEXT");
+  }
+  const attemptColumns = database
+    .prepare("PRAGMA table_info(attempts)")
+    .all() as Array<{ name: string }>;
+  if (!attemptColumns.some(({ name }) => name === "error_code")) {
+    database.exec("ALTER TABLE attempts ADD COLUMN error_code TEXT");
+  }
+  if (!attemptColumns.some(({ name }) => name === "error_message")) {
+    database.exec("ALTER TABLE attempts ADD COLUMN error_message TEXT");
+  }
+  const leaseColumns = database
+    .prepare("PRAGMA table_info(leases)")
+    .all() as Array<{ name: string }>;
+  if (!leaseColumns.some(({ name }) => name === "heartbeat_at")) {
+    database.exec("ALTER TABLE leases ADD COLUMN heartbeat_at TEXT");
+  }
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (2, ?)
+    `)
+    .run(new Date().toISOString());
+  const artifactMigration = database
+    .prepare("SELECT version FROM schema_migrations WHERE version = 3")
+    .get();
+  if (!artifactMigration) {
+    database.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE artifacts_v3 (
+        id TEXT PRIMARY KEY,
+        work_item_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        storage_name TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, sha256),
+        FOREIGN KEY(work_item_id) REFERENCES work_items(id),
+        FOREIGN KEY(run_id) REFERENCES runs(id)
+      );
+      INSERT INTO artifacts_v3(
+        id, work_item_id, run_id, sha256, storage_name,
+        media_type, byte_size, created_at
+      )
+      SELECT
+        id, work_item_id, run_id, sha256, storage_name,
+        media_type, byte_size, created_at
+      FROM artifacts;
+      DROP TABLE artifacts;
+      ALTER TABLE artifacts_v3 RENAME TO artifacts;
+      COMMIT;
+    `);
+    database
+      .prepare(`
+        INSERT INTO schema_migrations(version, applied_at)
+        VALUES (3, ?)
+      `)
+      .run(new Date().toISOString());
   }
   return database;
 }

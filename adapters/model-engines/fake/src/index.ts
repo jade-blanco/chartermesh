@@ -31,13 +31,16 @@ export class FakeModelEngine implements ModelEngine {
       .find(({ role }) => role === "user")?.content;
     return {
       invocationId: request.invocationId,
-      text: [
-        "Simulated CharterMesh result",
-        "",
-        userMessage?.slice(0, 500) ?? "No task input was provided.",
-        "",
-        "This offline result performs no external side effect.",
-      ].join("\n"),
+      text: JSON.stringify({
+        apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+        summary: "Simulated CharterMesh result",
+        deliverable:
+          userMessage?.slice(0, 500) ?? "No task input was provided.",
+        checks: ["The offline execution path completed."],
+        risks: ["This is synthetic output and performs no external side effect."],
+        nextActions: ["Review the immutable artifact hash."],
+        confidence: "high",
+      }),
       toolCalls: [],
       finishReason: "stop",
       usage: {

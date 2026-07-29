@@ -2,12 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  ArtifactEvidence,
   DashboardProjection,
+  RuntimeBudgets,
   UserAction,
   WaitCondition,
   WorkItem,
@@ -75,14 +78,49 @@ function transaction<T>(database: DatabaseSync, operation: () => T): T {
 export class ControlPlane {
   private readonly database: DatabaseSync;
   private readonly artifactDirectory: string;
+  private readonly budgets?: RuntimeBudgets;
 
   constructor(
     database: DatabaseSync,
     artifactDirectory: string,
+    options: { budgets?: RuntimeBudgets } = {},
   ) {
     this.database = database;
     this.artifactDirectory = artifactDirectory;
+    this.budgets = options.budgets;
     mkdirSync(artifactDirectory, { recursive: true });
+  }
+
+  private assertRunBudgets(): void {
+    if (!this.budgets) return;
+    const active = this.database
+      .prepare(
+        "SELECT COUNT(*) AS count FROM runs WHERE status IN ('running', 'waiting')",
+      )
+      .get() as Row;
+    if (Number(active.count) >= this.budgets.maxConcurrentRuns) {
+      throw new Error("BUDGET_CONCURRENT_RUNS_EXCEEDED");
+    }
+    const dayStart = new Date();
+    dayStart.setUTCHours(0, 0, 0, 0);
+    const daily = this.database
+      .prepare("SELECT COUNT(*) AS count FROM runs WHERE started_at >= ?")
+      .get(dayStart.toISOString()) as Row;
+    if (Number(daily.count) >= this.budgets.maxDailyModelStarts) {
+      throw new Error("BUDGET_DAILY_MODEL_STARTS_EXCEEDED");
+    }
+    const monthStart = new Date();
+    monthStart.setUTCDate(1);
+    monthStart.setUTCHours(0, 0, 0, 0);
+    const spend = this.database
+      .prepare(
+        `SELECT COALESCE(SUM(cost), 0) AS cost
+         FROM model_invocations WHERE started_at >= ?`,
+      )
+      .get(monthStart.toISOString()) as Row;
+    if (Number(spend.cost) >= this.budgets.monthlyCostLimitUsd) {
+      throw new Error("BUDGET_MONTHLY_COST_EXCEEDED");
+    }
   }
 
   private nextId(prefix: string): string {
@@ -106,12 +144,19 @@ export class ControlPlane {
     actor: string,
     payload: Record<string, unknown> = {},
   ): void {
-    this.database
+    const stamp = now();
+    const result = this.database
       .prepare(`
         INSERT INTO events(event_type, work_item_id, actor, payload_json, created_at)
         VALUES (?, ?, ?, ?, ?)
       `)
-      .run(type, workItemId, actor, JSON.stringify(payload), now());
+      .run(type, workItemId, actor, JSON.stringify(payload), stamp);
+    this.database
+      .prepare(`
+        INSERT INTO outbox(event_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?)
+      `)
+      .run(result.lastInsertRowid, type, JSON.stringify(payload), stamp);
   }
 
   private command<T>(
@@ -120,21 +165,22 @@ export class ControlPlane {
     operation: () => T,
   ): T {
     assertText(idempotencyKey, "idempotencyKey");
-    const replay = this.database
-      .prepare(`
-        SELECT command, response_json
-        FROM command_results
-        WHERE idempotency_key = ?
-      `)
-      .get(idempotencyKey) as Row | undefined;
-    if (replay) {
-      if (replay.command !== command) {
-        throw new Error("Idempotency key was already used for another command.");
-      }
-      return JSON.parse(String(replay.response_json)) as T;
-    }
-
     return transaction(this.database, () => {
+      const replay = this.database
+        .prepare(`
+          SELECT command, response_json
+          FROM command_results
+          WHERE idempotency_key = ?
+        `)
+        .get(idempotencyKey) as Row | undefined;
+      if (replay) {
+        if (replay.command !== command) {
+          throw new Error(
+            "Idempotency key was already used for another command.",
+          );
+        }
+        return JSON.parse(String(replay.response_json)) as T;
+      }
       const result = operation();
       this.database
         .prepare(`
@@ -294,6 +340,7 @@ export class ControlPlane {
       ) {
         throw new Error("Work is not currently claimable.");
       }
+      this.assertRunBudgets();
       const generationRow = this.database
         .prepare(`
           SELECT COALESCE(MAX(generation), 0) AS generation
@@ -330,8 +377,9 @@ export class ControlPlane {
       this.database
         .prepare(`
           INSERT INTO leases(
-            id, run_id, attempt_id, owner, generation, acquired_at, expires_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, run_id, attempt_id, owner, generation, acquired_at,
+            heartbeat_at, expires_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           leaseId,
@@ -339,6 +387,7 @@ export class ControlPlane {
           attemptId,
           input.actor,
           generation,
+          stamp,
           stamp,
           expiresAt,
         );
@@ -363,6 +412,201 @@ export class ControlPlane {
         leaseId,
         generation,
       };
+    });
+  }
+
+  heartbeat(input: {
+    leaseId: string;
+    generation: number;
+    actor: string;
+    idempotencyKey: string;
+    leaseMinutes?: number;
+  }): { leaseId: string; expiresAt: string } {
+    return this.command(input.idempotencyKey, "lease.heartbeat", () => {
+      const lease = this.database
+        .prepare(`
+          SELECT id, generation, expires_at, released_at
+          FROM leases WHERE id = ?
+        `)
+        .get(input.leaseId) as Row | undefined;
+      if (!lease || lease.released_at) {
+        throw new Error("Lease is not active.");
+      }
+      if (Number(lease.generation) !== input.generation) {
+        throw new Error("Lease generation does not match.");
+      }
+      if (Date.parse(String(lease.expires_at)) <= Date.now()) {
+        throw new Error("Lease has expired.");
+      }
+      const stamp = now();
+      const expiresAt = new Date(
+        Date.now() + (input.leaseMinutes ?? 15) * 60_000,
+      ).toISOString();
+      this.database
+        .prepare(`
+          UPDATE leases SET heartbeat_at = ?, expires_at = ?
+          WHERE id = ? AND released_at IS NULL
+        `)
+        .run(stamp, expiresAt, input.leaseId);
+      this.event("lease.heartbeat", null, input.actor, {
+        leaseId: input.leaseId,
+        generation: input.generation,
+        expiresAt,
+      });
+      return { leaseId: input.leaseId, expiresAt };
+    });
+  }
+
+  failRun(input: {
+    id: string;
+    generation: number;
+    attemptId: string;
+    errorCode: string;
+    errorMessage: string;
+    actor: string;
+    idempotencyKey: string;
+  }): WorkItem {
+    return this.command(input.idempotencyKey, "run.fail", () => {
+      const current = this.get(input.id);
+      if (current.status !== "in_progress") {
+        throw new Error("Only in-progress work can fail an active run.");
+      }
+      this.assertActiveGeneration(input.id, input.generation);
+      const message = assertText(input.errorMessage, "errorMessage").slice(
+        0,
+        1_000,
+      );
+      const code = assertText(input.errorCode, "errorCode").slice(0, 100);
+      const stamp = now();
+      const run = this.database
+        .prepare(`
+          SELECT id FROM runs
+          WHERE work_item_id = ? AND generation = ? AND status = 'running'
+        `)
+        .get(input.id, input.generation) as Row | undefined;
+      if (!run) throw new Error("Active run was not found.");
+      this.database
+        .prepare(`
+          UPDATE attempts
+          SET status = 'failed', finished_at = ?,
+              error_code = ?, error_message = ?
+          WHERE id = ? AND run_id = ? AND status = 'running'
+        `)
+        .run(stamp, code, message, input.attemptId, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE runs SET status = 'failed', finished_at = ?
+          WHERE id = ?
+        `)
+        .run(stamp, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE leases SET released_at = ?
+          WHERE run_id = ? AND released_at IS NULL
+        `)
+        .run(stamp, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE work_items
+          SET status = 'failed', availability = 'ready',
+              next_action = 'Inspect the failure and retry.',
+              version = version + 1, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(stamp, input.id);
+      this.event("run.failed", input.id, input.actor, {
+        runId: String(run.id),
+        attemptId: input.attemptId,
+        generation: input.generation,
+        errorCode: code,
+      });
+      return this.get(input.id);
+    });
+  }
+
+  retry(input: {
+    id: string;
+    actor: string;
+    idempotencyKey: string;
+  }): WorkItem {
+    return this.command(input.idempotencyKey, "run.retry", () => {
+      const current = this.get(input.id);
+      if (current.status !== "failed") {
+        throw new Error("Only failed work can be retried.");
+      }
+      const stamp = now();
+      this.database
+        .prepare(`
+          UPDATE work_items
+          SET status = 'ready', availability = 'ready',
+              wait_type = NULL, wait_reason = NULL, wait_reference = NULL,
+              resume_at = NULL, wait_created_by = NULL,
+              next_action = 'Claim and retry work.',
+              version = version + 1, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(stamp, input.id);
+      this.event("run.retry.requested", input.id, input.actor);
+      return this.get(input.id);
+    });
+  }
+
+  recoverExpiredLeases(actor = "system:recovery"): string[] {
+    return transaction(this.database, () => {
+      const expired = this.database
+        .prepare(`
+          SELECT l.id AS lease_id, l.run_id, l.attempt_id, l.generation,
+                 r.work_item_id
+          FROM leases l
+          JOIN runs r ON r.id = l.run_id
+          WHERE l.released_at IS NULL
+            AND l.expires_at <= ?
+            AND r.status = 'running'
+          ORDER BY l.id
+        `)
+        .all(now()) as Row[];
+      const recovered: string[] = [];
+      for (const row of expired) {
+        const stamp = now();
+        const workItemId = String(row.work_item_id);
+        this.database
+          .prepare(`
+            UPDATE attempts
+            SET status = 'failed', finished_at = ?,
+                error_code = 'LEASE_EXPIRED',
+                error_message = 'The worker lease expired before completion.'
+            WHERE id = ? AND status = 'running'
+          `)
+          .run(stamp, String(row.attempt_id));
+        this.database
+          .prepare(`
+            UPDATE runs SET status = 'failed', finished_at = ?
+            WHERE id = ? AND status = 'running'
+          `)
+          .run(stamp, String(row.run_id));
+        this.database
+          .prepare(`
+            UPDATE leases SET released_at = ?
+            WHERE id = ? AND released_at IS NULL
+          `)
+          .run(stamp, String(row.lease_id));
+        this.database
+          .prepare(`
+            UPDATE work_items
+            SET status = 'failed', availability = 'ready',
+                next_action = 'The previous lease expired. Inspect and retry.',
+                version = version + 1, updated_at = ?
+            WHERE id = ? AND status = 'in_progress'
+          `)
+          .run(stamp, workItemId);
+        this.event("lease.expired", workItemId, actor, {
+          leaseId: String(row.lease_id),
+          runId: String(row.run_id),
+          generation: Number(row.generation),
+        });
+        recovered.push(workItemId);
+      }
+      return recovered;
     });
   }
 
@@ -751,6 +995,35 @@ export class ControlPlane {
         );
       return id;
     });
+  }
+
+  latestArtifact(id: string): ArtifactEvidence | null {
+    this.get(id);
+    const row = this.database
+      .prepare(`
+        SELECT id, work_item_id, run_id, sha256, storage_name,
+               media_type, byte_size, created_at
+        FROM artifacts
+        WHERE work_item_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(id) as Row | undefined;
+    if (!row) return null;
+    const storageName = String(row.storage_name);
+    if (!/^[a-f0-9]{64}\.txt$/u.test(storageName)) {
+      throw new Error("Artifact storage name is invalid.");
+    }
+    return {
+      id: String(row.id),
+      workItemId: String(row.work_item_id),
+      runId: String(row.run_id),
+      sha256: String(row.sha256),
+      mediaType: String(row.media_type),
+      byteSize: Number(row.byte_size),
+      content: readFileSync(join(this.artifactDirectory, storageName), "utf8"),
+      createdAt: String(row.created_at),
+    };
   }
 
   get(id: string): WorkItem {
