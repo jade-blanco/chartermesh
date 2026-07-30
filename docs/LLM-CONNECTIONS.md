@@ -128,10 +128,43 @@ enforces:
 - exact-call human approval for writes;
 - `maxIterations` from 1 through 12.
 
-The first built-ins list a directory, read bounded UTF-8 text, and create or
-replace bounded UTF-8 text. There is no shell or network tool. Tool execution
-evidence stores hashes and bounded relative paths; raw inputs and results are
-not copied into the audit ledger.
+The always-available built-ins list a directory, read bounded UTF-8 text, and
+create or replace bounded UTF-8 text. There is no shell, package-manager, or
+deployment tool. Tool execution evidence stores hashes and bounded relative
+paths; raw inputs and results are not copied into the audit ledger.
+
+### Optional provider-neutral web search
+
+CharterMesh can add one bounded `web.search` tool through a reviewed SearXNG
+Search API endpoint. This does not require a commercial search API and does
+not install or operate SearXNG:
+
+```powershell
+node bin/chartermesh.mjs configure-engine `
+  --target TARGET `
+  --engine openai-compatible `
+  --endpoint http://127.0.0.1:8080/v1 `
+  --model LOCAL_MODEL_ID `
+  --tool-calling `
+  --web-search-searxng http://127.0.0.1:8888/search `
+  --web-search-max-results 8
+```
+
+Review the complete runtime and OrgSpec file plan, then repeat it with its
+exact approval hash. `configure-engine` updates both files atomically and
+defaults the search assignment to the `operator` role; repeat
+`--web-search-role ROLE_ID` to select another existing role. The endpoint must
+use HTTPS or loopback HTTP and cannot
+contain credentials or a fragment. Requests use no redirects and bound the
+query, timeout, result count, and response body. Returned result URLs are
+normalized HTTP(S) metadata; CharterMesh does not fetch them.
+
+Search queries leave the machine. Therefore `web.search` is an external-side-
+effect tool, must be allowed by the assigned role, and requires approval of
+the exact WorkItem/tool/arguments hash before the HTTP request. Public SearXNG
+instances may disable JSON output or impose their own retention and rate
+policies. To remove the endpoint and its OrgSpec grants atomically, create and
+approve a new engine plan with `--disable-web-search`.
 
 ## Remote provider
 
@@ -225,8 +258,9 @@ ModelEngine adapters should honor the supplied `AbortSignal`.
 
 - Text-only, non-streaming Chat Completions.
 - Structured artifact generation with at most one repair turn.
-- Built-in tools cover bounded workspace list/read/write only; command,
-  network, package-manager, and deployment tools are not implemented.
+- Built-in tools cover bounded workspace list/read/write plus optional
+  approval-gated SearXNG result search; generic URL fetch, shell, package
+  manager, and deployment tools are not implemented.
 - An approval-required call ends the current attempt; approval is followed by
   an explicit retry with a new fenced generation.
 - No automatic account creation or provider discovery.

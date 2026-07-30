@@ -67,3 +67,32 @@ test("checked-in runtime schema remains readable by the parser", () => {
     "urn:chartermesh:schema:runtime-config:v1alpha1",
   );
 });
+
+test("runtime parser validates optional web search security bounds", () => {
+  const parsed = parseRuntimeConfig(
+    JSON.stringify({
+      ...valid,
+      webSearch: {
+        adapter: "searxng",
+        endpoint: "http://127.0.0.1:8888/search",
+        timeoutMs: 20_000,
+        maxResults: 8,
+        maxResponseBytes: 1_048_576,
+      },
+    }),
+  );
+  assert.equal(parsed.webSearch?.adapter, "searxng");
+  assert.throws(
+    () =>
+      parseRuntimeConfig(
+        JSON.stringify({
+          ...valid,
+          webSearch: {
+            adapter: "searxng",
+            endpoint: "http://public.example/search",
+          },
+        }),
+      ),
+    /HTTPS or loopback HTTP/u,
+  );
+});

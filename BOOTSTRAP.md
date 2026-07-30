@@ -22,6 +22,8 @@ The target has reviewable:
 - `.chartermesh/organization.json`
 - `.chartermesh/runtime.json`
 - `.chartermesh/installation.json`
+- `.chartermesh/AGENT-ENTRYPOINT.md`
+- `.chartermesh/skills/*/SKILL.md`
 
 It also has an ignored local SQLite Control Plane, a passing `doctor` result,
 and a report of every changed file. No model call is required to bootstrap.
@@ -66,6 +68,9 @@ signals. This command performs no target writes.
 - If authentication is required, add `--api-key-env ENV_NAME`. Never place the
   credential value in a command, config, plan, chat summary, or commit.
 - Do not infer or create a remote provider account.
+- Add `--web-search-searxng URL` only when the user supplied or approved a
+  reviewed SearXNG endpoint and the selected engine supports tool calls. For
+  OpenAI-compatible engines, also add `--tool-calling`.
 
 ### 4. Generate the no-write plan
 
@@ -158,6 +163,10 @@ Never report credential values or unrelated absolute paths.
   is never silently converted to zero.
 - Artifact byte limits come from OrgSpec.
 - External side effects require their own human approval.
+- External search is disabled without runtime configuration. An exact
+  `web.search` query requires Control Plane approval before network egress.
+- Portable Agent Skills are guidance only; they cannot expand OrgSpec tools or
+  satisfy a human approval.
 - Provider features enter through adapters and capability manifests.
 - Default bootstrap and tests are offline and free.
 - Default proposals contain no active schedules. A controller schedule checks

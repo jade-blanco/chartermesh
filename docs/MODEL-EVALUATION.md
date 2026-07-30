@@ -19,6 +19,9 @@ the final artifact is invalid or misses its deterministic sentinel terms.
 
 This is a workflow compatibility test, not a general intelligence benchmark.
 It does not prove code correctness, safety, or production readiness.
+Schema success also does not prove that an artifact's claimed checks were
+performed. Run at least one real WorkItem and compare every `checks` entry with
+current-invocation task or tool evidence.
 
 ## Privacy boundary
 
@@ -75,3 +78,6 @@ validator and repair turn are intentionally active in both modes.
 
 The first recorded run is
 [`evaluations/2026-07-29-gemma-4-26b-a4b-q4km.md`](evaluations/2026-07-29-gemma-4-26b-a4b-q4km.md).
+The clean GitHub install, real-workflow evidence failure, prompt correction,
+and successful rerun are recorded in
+[`evaluations/2026-07-30-gemma-4-26b-a4b-q4km-evidence.md`](evaluations/2026-07-30-gemma-4-26b-a4b-q4km-evidence.md).

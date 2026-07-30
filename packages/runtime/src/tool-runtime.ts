@@ -589,10 +589,16 @@ export class ToolRuntime {
 }
 
 export function createWorkspaceToolRuntime(
-  options: Omit<ToolRuntimeOptions, "tools">,
+  options: Omit<ToolRuntimeOptions, "tools"> & {
+    additionalTools?: RuntimeTool[];
+  },
 ): ToolRuntime {
+  const { additionalTools = [], ...runtimeOptions } = options;
   return new ToolRuntime({
-    ...options,
-    tools: createWorkspaceTools(options.workspaceRoot, options.policy),
+    ...runtimeOptions,
+    tools: [
+      ...createWorkspaceTools(options.workspaceRoot, options.policy),
+      ...additionalTools,
+    ],
   });
 }

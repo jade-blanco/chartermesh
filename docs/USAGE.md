@@ -55,8 +55,9 @@ invocation are closed with visible cancellation evidence.
 
 ## Safe tool execution
 
-The built-in tools are `workspace.list_files`, `workspace.read_file`, and
-`workspace.write_file`. The runtime:
+The always-available tools are `workspace.list_files`,
+`workspace.read_file`, and `workspace.write_file`. An approved installation
+may also configure `web.search` through SearXNG. The runtime:
 
 - offers only the assigned role's OrgSpec `tools.allow` entries;
 - resolves paths beneath the declared relative `workspaceRoots`;
@@ -65,6 +66,12 @@ The built-in tools are `workspace.list_files`, `workspace.read_file`, and
 - records call/input/output hashes, status, paths, and duration as Control
   Plane evidence;
 - stops after OrgSpec `maxIterations`.
+
+`web.search` is absent by default. When configured, it is treated as an
+external side effect: the exact query hash must be approved before it leaves
+the machine. The adapter refuses redirects, credentials in the endpoint, and
+unbounded responses, and it returns search-result metadata without fetching
+the linked pages.
 
 An unapproved write fails visibly without touching the file and prints its
 canonical call hash. A human can approve that exact call, then start a fenced

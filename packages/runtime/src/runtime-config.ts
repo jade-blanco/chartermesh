@@ -3,6 +3,10 @@ import {
   validateJsonSchemaDocument,
   type JsonSchemaIssue,
 } from "../../orgspec/src/index.ts";
+import {
+  validateWebSearchConfig,
+  type SearxngWebSearchConfig,
+} from "./web-search.ts";
 
 export interface ModelPricing {
   inputPerMillionTokensUsd: number;
@@ -47,6 +51,7 @@ export interface RuntimeConfig {
     adapter: "builtin-managed-runner";
     modelEngineRef: string;
   }>;
+  webSearch?: SearxngWebSearchConfig;
 }
 
 let cachedRuntimeSchema: Record<string, unknown> | undefined;
@@ -121,6 +126,12 @@ export function parseRuntimeConfig(text: string): RuntimeConfig {
         `Managed runner '${runner.id}' references unknown model engine ` +
           `'${runner.modelEngineRef}'.`,
       );
+    }
+  }
+  if (config.webSearch) {
+    const webSearchIssues = validateWebSearchConfig(config.webSearch);
+    if (webSearchIssues.length > 0) {
+      throw new RuntimeConfigParseError(webSearchIssues.join("; "));
     }
   }
   return config;

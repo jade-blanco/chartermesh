@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.7-alpha.1 — 2026-07-30
+
+- Bundled four Apache-2.0, provider-neutral Agent Skills and installed them
+  through the same exact-hash bootstrap plan as the organization and runtime.
+- Added agent-readable capability and skill catalog commands. External MCP
+  servers and services are documented with source, license, prerequisites,
+  permissions, and risks but remain disabled and uninstalled.
+- Added optional SearXNG `web.search` with HTTPS/loopback endpoint policy,
+  no redirects or embedded credentials, bounded queries/results/time/bytes,
+  normalized output, OrgSpec allowlisting, and exact external-call approval.
+- Strengthened ManagedRunner evidence instructions so constrained models keep
+  unperformed checks in `nextActions` instead of claiming inspections.
+- Made synthetic scheduler timestamps deterministic so explicit `--now`
+  evaluation is independent of wall-clock process time.
+- Revalidated the GitHub install path and local Gemma 4 structured workflow.
+
 ## 0.0.6-alpha.1 — 2026-07-30
 
 - Validated the complete runtime configuration against its dependency-free

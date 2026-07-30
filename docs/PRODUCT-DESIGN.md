@@ -1717,3 +1717,36 @@ or automatic background service. Broader recurrence/missed-tick semantics,
 service installation, provider-native schedule reconciliation, external
 AgentHost adapters, OS sandboxing, signed releases/SBOM, and registry
 publication remain separate work.
+
+# 0.0.7 authoritative implementation amendment — 2026-07-30
+
+This amendment supersedes the 0.0.6 implementation-status paragraph above:
+
+- Exact bootstrap plans now install four provider-neutral Apache-2.0 Agent
+  Skills under `.chartermesh/skills/` and one common agent entrypoint. They
+  follow the portable `SKILL.md` format and grant no execution permission.
+- A versioned, agent-readable catalog distinguishes built-ins, opt-in
+  integrations, host-native preferences, and items that are unsafe as global
+  defaults. It records canonical source, license, prerequisites, network and
+  credential needs, and risk notes.
+- External MCP packages are not downloaded, executed, or connected by
+  default. The Filesystem and Git reference servers overlap existing host or
+  Tool Runtime capabilities; Fetch and browser automation require their own
+  egress/session threat models.
+- The optional provider-neutral `web.search` executor uses an
+  operator-supplied SearXNG JSON endpoint. It requires HTTPS or loopback HTTP,
+  rejects credentials and redirects, bounds time/results/response bytes, does
+  not fetch result pages, and starts disabled.
+- A role must allow `web.search`, the selected engine must support tool calls,
+  and the exact query call must receive human Control Plane approval before
+  network egress.
+- ManagedRunner instructions now define artifact checks as actions actually
+  performed with current-invocation evidence. Proposed verification belongs
+  in next actions. This rule is provider-neutral and specifically improves
+  constrained local-model reliability.
+
+These additions require no paid API, provider account, runtime npm dependency,
+or background daemon. CharterMesh does not bundle SearXNG itself and does not
+yet act as a generic MCP client. External package installation, browser
+profiles, credentials, and public search-instance policy remain user-owned,
+explicitly approved integrations.

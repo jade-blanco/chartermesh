@@ -1,6 +1,6 @@
 {
   "name": "@chartermesh/control-plane",
-  "version": "0.0.6-alpha.1",
+  "version": "0.0.7-alpha.1",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",

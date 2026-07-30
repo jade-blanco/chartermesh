@@ -44,9 +44,15 @@ import {
 } from "../../../packages/compiler/src/index.ts";
 import {
   BuiltInManagedRunner,
+  capabilityCatalog,
   createWorkspaceToolRuntime,
+  createWebSearchTools,
   evaluateIntervalSchedule,
   parseRuntimeConfig,
+  portableAgentEntrypoint,
+  portableSkillDocuments,
+  recommendedCapabilities,
+  validateWebSearchConfig,
   type RuntimeConfig,
 } from "../../../packages/runtime/src/index.ts";
 import {
@@ -57,7 +63,7 @@ import {
 import { evaluateModelEngine } from "./evaluate-model.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
-const CHARTERMESH_VERSION = "0.0.6-alpha.1";
+const CHARTERMESH_VERSION = "0.0.7-alpha.1";
 
 interface BootstrapFile {
   path: string;
@@ -302,13 +308,66 @@ function pricingFrom(args: string[]) {
 }
 
 function proposalFor(args: string[]): OrganizationProposal {
-  return createProposal(targetOf(args), profileOf(args));
+  return createProposal(targetOf(args), profileOf(args), {
+    webSearch: option(args, "--web-search-searxng") !== undefined,
+  });
+}
+
+function webSearchFrom(
+  args: string[],
+): RuntimeConfig["webSearch"] | undefined {
+  const endpoint = option(args, "--web-search-searxng");
+  if (endpoint && has(args, "--disable-web-search")) {
+    throw new Error(
+      "--web-search-searxng and --disable-web-search cannot be used together.",
+    );
+  }
+  if (!endpoint) return undefined;
+  return {
+    adapter: "searxng",
+    endpoint,
+    timeoutMs: Number(option(args, "--web-search-timeout-ms") ?? 20_000),
+    maxResults: Number(option(args, "--web-search-max-results") ?? 8),
+    maxResponseBytes: Number(
+      option(args, "--web-search-max-response-bytes") ?? 1_048_576,
+    ),
+  };
+}
+
+function withWebSearch(
+  config: Omit<RuntimeConfig, "webSearch">,
+  args: string[],
+): RuntimeConfig {
+  const webSearch = webSearchFrom(args);
+  if (webSearch) {
+    const issues = validateWebSearchConfig(webSearch);
+    if (issues.length > 0) throw new Error(issues.join("\n"));
+  }
+  return {
+    ...config,
+    ...(webSearch ? { webSearch } : {}),
+  };
 }
 
 function runtimeTemplate(args: string[]): RuntimeConfig {
   const adapter = option(args, "--engine") ?? "fake";
+  if (option(args, "--web-search-searxng")) {
+    if (adapter === "fake") {
+      throw new Error(
+        "--web-search-searxng requires a tool-calling model engine; the fake engine never calls tools.",
+      );
+    }
+    if (
+      adapter === "openai-compatible" &&
+      !has(args, "--tool-calling")
+    ) {
+      throw new Error(
+        "--web-search-searxng with openai-compatible requires --tool-calling.",
+      );
+    }
+  }
   if (adapter === "fake") {
-    return {
+    return withWebSearch({
       apiVersion: "chartermesh.dev/runtime/v1alpha1",
       modelEngines: [{ id: "primary-model", adapter: "fake" }],
       managedRunners: [
@@ -318,7 +377,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
           modelEngineRef: "primary-model",
         },
       ],
-    };
+    }, args);
   }
   if (adapter === "command-process") {
     const command = option(args, "--command");
@@ -337,7 +396,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
     };
     const issues = validateCommandProcessConfig(config);
     if (issues.length > 0) throw new Error(issues.join("\n"));
-    return {
+    return withWebSearch({
       apiVersion: "chartermesh.dev/runtime/v1alpha1",
       modelEngines: [{ adapter: "command-process", ...config }],
       managedRunners: [
@@ -347,7 +406,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
           modelEngineRef: "primary-model",
         },
       ],
-    };
+    }, args);
   }
   if (adapter !== "openai-compatible") {
     throw new Error(
@@ -370,7 +429,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
   if (!["default", "disabled"].includes(reasoningMode)) {
     throw new Error("--reasoning must be default or disabled.");
   }
-  return {
+  return withWebSearch({
     apiVersion: "chartermesh.dev/runtime/v1alpha1",
     modelEngines: [
       {
@@ -400,7 +459,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
         modelEngineRef: "primary-model",
       },
     ],
-  };
+  }, args);
 }
 
 function bootstrapPlan(args: string[]): BootstrapPlan {
@@ -461,10 +520,20 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
         "- `state.db` is the local mutable ledger and is ignored by Git.",
         "- `backups/` and `exports/` can contain private operational metadata and are ignored by Git.",
         "- Credentials are read only from the environment variable named in `runtime.json`.",
+        "- `AGENT-ENTRYPOINT.md` and `skills/` contain provider-neutral, Apache-2.0 guidance.",
+        "- External search is disabled unless `runtime.json` names a reviewed endpoint and OrgSpec allows `web.search`.",
         "- Run `chartermesh doctor --target .` before live model use.",
         "",
       ].join("\n"),
     },
+    {
+      path: join(paths.root, "AGENT-ENTRYPOINT.md"),
+      content: portableAgentEntrypoint(),
+    },
+    ...portableSkillDocuments().map(({ id, content }) => ({
+      path: join(paths.root, "skills", id, "SKILL.md"),
+      content,
+    })),
   ];
   const files = desired.map(({ path, content }) => ({
     path,
@@ -489,22 +558,101 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
 function runtimePlan(args: string[]): BootstrapPlan {
   const target = targetOf(args);
   recoverFileTransactions(target);
-  if (!existsSync(statePaths(target).organization)) {
+  const paths = statePaths(target);
+  if (!existsSync(paths.organization)) {
     throw new Error("CharterMesh is not initialized. Run bootstrap first.");
   }
-  const runtime = runtimeTemplate(args);
-  const path = statePaths(target).runtime;
+  let runtime = runtimeTemplate(args);
+  if (
+    !option(args, "--web-search-searxng") &&
+    !has(args, "--disable-web-search") &&
+    existsSync(paths.runtime)
+  ) {
+    const current = readRuntime(target);
+    if (current.webSearch) {
+      runtime = { ...runtime, webSearch: current.webSearch };
+    }
+  }
+  if (runtime.webSearch) {
+    const runnerEngineIds = new Set(
+      runtime.managedRunners.map(({ modelEngineRef }) => modelEngineRef),
+    );
+    for (const engine of runtime.modelEngines) {
+      if (!runnerEngineIds.has(engine.id)) continue;
+      if (
+        engine.adapter === "fake" ||
+        (engine.adapter === "openai-compatible" && !engine.toolCalling)
+      ) {
+        throw new Error(
+          `Configured web search requires tool calling for engine '${engine.id}'.`,
+        );
+      }
+    }
+  }
+  const path = paths.runtime;
   const content = `${JSON.stringify(runtime, null, 2)}\n`;
-  const files = [
+  const desired = [
     {
       path,
       content,
-      beforeHash: existsSync(path)
-        ? createHash("sha256").update(readFileSync(path)).digest("hex")
-        : null,
-      afterHash: createHash("sha256").update(content).digest("hex"),
     },
   ];
+  if (
+    option(args, "--web-search-searxng") ||
+    has(args, "--disable-web-search")
+  ) {
+    const organization = readOrganization(target);
+    if (has(args, "--disable-web-search")) {
+      for (const role of organization.spec.roles) {
+        role.capabilities = role.capabilities.filter(
+          (capability) => capability !== "web_research",
+        );
+        role.tools.allow = role.tools.allow.filter(
+          (tool) => tool !== "web.search",
+        );
+        role.tools.approvalRequired = role.tools.approvalRequired?.filter(
+          (tool) => tool !== "web.search",
+        );
+      }
+    } else {
+      const selectedRoles = options(args, "--web-search-role");
+      const roleIds = selectedRoles.length > 0 ? selectedRoles : ["operator"];
+      for (const roleId of roleIds) {
+        const role = organization.spec.roles.find(({ id }) => id === roleId);
+        if (!role) {
+          throw new Error(`Unknown --web-search-role '${roleId}'.`);
+        }
+        role.capabilities = [
+          ...new Set([...role.capabilities, "web_research"]),
+        ];
+        role.tools.allow = [
+          ...new Set([...role.tools.allow, "web.search"]),
+        ];
+        role.tools.approvalRequired = [
+          ...new Set([
+            ...(role.tools.approvalRequired ?? []),
+            "web.search",
+          ]),
+        ];
+      }
+    }
+    organization.metadata.revision += 1;
+    const organizationContent =
+      `${JSON.stringify(organization, null, 2)}\n`;
+    parseOrgSpec(organizationContent);
+    desired.push({
+      path: paths.organization,
+      content: organizationContent,
+    });
+  }
+  const files = desired.map(({ path: desiredPath, content: desiredContent }) => ({
+    path: desiredPath,
+    content: desiredContent,
+    beforeHash: existsSync(desiredPath)
+      ? createHash("sha256").update(readFileSync(desiredPath)).digest("hex")
+      : null,
+    afterHash: createHash("sha256").update(desiredContent).digest("hex"),
+  }));
   const body = {
     apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1" as const,
     operation: "configure-engine" as const,
@@ -649,6 +797,7 @@ function doctor(target: string, args: string[]): number {
   const issues: string[] = [];
   const paths = statePaths(target);
   let organization: ReturnType<typeof readOrganization> | undefined;
+  let webSearchConfiguration: "disabled" | "configured" = "disabled";
   if (existsSync(paths.installation)) {
     try {
       const installed = JSON.parse(
@@ -681,6 +830,39 @@ function doctor(target: string, args: string[]): number {
   } else {
     try {
       const runtime = readRuntime(target);
+      if (runtime.webSearch) {
+        webSearchConfiguration = "configured";
+        const searchAllowed = organization?.spec.roles.some(({ tools }) =>
+          tools.allow.includes("web.search"),
+        );
+        if (!searchAllowed) {
+          issues.push(
+            "runtime.json configures web search but no OrgSpec role allows web.search",
+          );
+        }
+        const runnerEngineIds = new Set(
+          runtime.managedRunners.map(({ modelEngineRef }) => modelEngineRef),
+        );
+        for (const engine of runtime.modelEngines) {
+          if (!runnerEngineIds.has(engine.id)) continue;
+          if (
+            engine.adapter === "fake" ||
+            (engine.adapter === "openai-compatible" && !engine.toolCalling)
+          ) {
+            issues.push(
+              `Engine '${engine.id}' cannot use configured web.search because tool calling is disabled`,
+            );
+          }
+        }
+      } else if (
+        organization?.spec.roles.some(({ tools }) =>
+          tools.allow.includes("web.search"),
+        )
+      ) {
+        issues.push(
+          "OrgSpec allows web.search but runtime.json has no webSearch endpoint",
+        );
+      }
       for (const engine of runtime.modelEngines) {
         if (engine.adapter === "openai-compatible") {
           issues.push(...validateOpenAICompatibleConfig(engine));
@@ -729,6 +911,7 @@ function doctor(target: string, args: string[]): number {
     node: process.version,
     target,
     controlPlane: existsSync(paths.database) ? "ready" : "not_initialized",
+    webSearch: webSearchConfiguration,
     runtimeConfiguration: issues.length === 0 ? "ready" : "attention_required",
     issues,
     recovery: recovered,
@@ -1246,6 +1429,7 @@ export async function runWork(
         workspaceRoot: target,
         workItemId: candidate.id,
         policy: role.tools,
+        additionalTools: createWebSearchTools(runtime.webSearch),
         isApproved: (callHash, toolName) =>
           controlPlane.isToolCallApproved(
             candidate.id,
@@ -1274,6 +1458,11 @@ export async function runWork(
         "config" in engine && engine.config?.model
           ? String(engine.config.model)
           : "deterministic-fixture";
+      const skillGuidance = role.capabilities.includes("web_research")
+        ? portableSkillDocuments().find(({ id: skillId }) =>
+            skillId === "web-research"
+          )?.content
+        : undefined;
       invocationId = controlPlane.startInvocation({
         attemptId: claim.attemptId,
         engineId: engine.manifest.profileId,
@@ -1283,7 +1472,12 @@ export async function runWork(
         {
           taskPacket: {
             objective: candidate.title,
-            context: candidate.summary,
+            context: [
+              candidate.summary,
+              skillGuidance
+                ? `Assigned portable skill guidance:\n${skillGuidance}`
+                : "",
+            ].filter(Boolean).join("\n\n"),
             acceptanceCriteria: [
               "Return a structured artifact suitable for exact-hash review.",
               "Do not claim external side effects.",
@@ -1473,6 +1667,7 @@ export async function runSchedulerTick(
           tickKey: evaluation.tickKey,
           workItemId: null,
           status: "skipped_overlap",
+          startedAt: evaluatedAt.toISOString(),
         });
         summary.skippedOverlap += 1;
         summary.results.push({
@@ -1489,6 +1684,7 @@ export async function runSchedulerTick(
           tickKey: evaluation.tickKey,
           workItemId: null,
           status: "skipped_no_work",
+          startedAt: evaluatedAt.toISOString(),
         });
         summary.skippedNoWork += 1;
         summary.results.push({
@@ -1502,6 +1698,7 @@ export async function runSchedulerTick(
         scheduleId: schedule.id,
         tickKey: evaluation.tickKey,
         workItemId: candidate.id,
+        startedAt: evaluatedAt.toISOString(),
       });
       summary.started += 1;
       database.close();
@@ -2023,6 +2220,59 @@ async function evaluateModel(target: string, args: string[]): Promise<number> {
   return report.passed ? 0 : 2;
 }
 
+function capabilitiesCommand(args: string[]): void {
+  const subcommand = args[1] ?? "list";
+  if (!["list", "recommend"].includes(subcommand)) {
+    throw new Error("capabilities requires list or recommend.");
+  }
+  const kind = option(args, "--kind");
+  const source =
+    subcommand === "recommend"
+      ? recommendedCapabilities()
+      : capabilityCatalog;
+  const items = source.filter((entry) => !kind || entry.kind === kind);
+  if (has(args, "--json")) {
+    writeJsonEnvelope(`capabilities ${subcommand}`, { items });
+    return;
+  }
+  for (const item of items) {
+    console.log(
+      `${item.id} | ${item.kind} | ${item.disposition} | ` +
+        `${item.defaultEnabled ? "enabled" : "disabled"}`,
+    );
+    console.log(`  ${item.rationale}`);
+    console.log(`  source: ${item.source} (${item.license})`);
+  }
+}
+
+function skillsCommand(args: string[]): void {
+  const subcommand = args[1] ?? "list";
+  const documents = portableSkillDocuments();
+  if (subcommand === "list") {
+    const items = documents.map(({ id, relativePath }) => ({
+      id,
+      relativePath,
+      bundled: true,
+      license: "Apache-2.0",
+    }));
+    if (has(args, "--json")) writeJsonEnvelope("skills list", { items });
+    else {
+      for (const item of items) {
+        console.log(`${item.id} | ${item.relativePath} | Apache-2.0`);
+      }
+    }
+    return;
+  }
+  if (subcommand !== "show") {
+    throw new Error("skills requires list or show.");
+  }
+  const id = option(args, "--id");
+  const document = documents.find((item) => item.id === id);
+  if (!document) throw new Error(`Unknown bundled skill '${id ?? ""}'.`);
+  if (has(args, "--json")) writeJsonEnvelope("skills show", document);
+  else console.log(document.content);
+}
+
 function help(): void {
   console.log(`CharterMesh CLI
 
@@ -2083,7 +2333,17 @@ Commands:
   chartermesh scheduler list --target PATH [--schedule ID] [--json]
   chartermesh scheduler watch --target PATH [--poll-ms 30000] [--json]
   chartermesh evaluate-model --target PATH --live [--engine-id ID] [--json]
+  chartermesh capabilities list|recommend [--kind KIND] [--json]
+  chartermesh skills list [--json]
+  chartermesh skills show --id SKILL [--json]
   chartermesh dashboard --target PATH [--port 4173]
+
+Bootstrap and configure-engine accept an optional reviewed search endpoint:
+  --web-search-searxng URL [--web-search-role operator]
+  [--web-search-max-results 8]
+Use --disable-web-search in a configure-engine plan to remove it.
+Search remains disabled without this option, is OrgSpec allowlisted, and each
+exact external query requires Control Plane approval.
 
 Live model calls are opt-in. Credentials are read from the configured
 environment-variable name and are never written to CharterMesh files.`);
@@ -2101,6 +2361,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (command === "version") return version(args);
+  if (command === "capabilities") {
+    capabilitiesCommand(args);
+    return 0;
+  }
+  if (command === "skills") {
+    skillsCommand(args);
+    return 0;
+  }
   if (command === "bootstrap") {
     applyBootstrap(args, bootstrapPlan(args));
     return 0;

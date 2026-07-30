@@ -29,7 +29,7 @@ executable that implements CharterMesh's neutral stdin/stdout JSON contract.
 Provider-specific features enter through adapter capability manifests, never
 through the core OrgSpec schema.
 
-## 0.0.6-alpha.1 runnable slice
+## 0.0.7-alpha.1 runnable slice
 
 - Project-aware `lean`, `balanced`, and `controlled` proposals
 - Exact plan-hash approval and crash-recoverable journaled apply
@@ -60,6 +60,11 @@ through the core OrgSpec schema.
 - Dashboard request, triage, run, artifact review, retry, approval, and complete
 - Synthetic local-model evaluation for comparing small models
 - Buildable dependency-free npm package and clean-install verification
+- Four bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan
+- Agent-readable capability catalog with every external integration disabled
+  by default
+- Optional approval-gated SearXNG `web.search` with bounded network behavior
+- Evidence-grounding instructions validated with a local Gemma 4 workflow
 
 This is pre-alpha software, not a production authorization system.
 
@@ -69,6 +74,54 @@ This is pre-alpha software, not a production authorization system.
 - pnpm 11 for source verification
 
 There are no runtime npm dependencies in this slice.
+
+## Portable skills and free integrations
+
+Every approved bootstrap installs these provider-neutral Agent Skills under
+`.chartermesh/skills/`:
+
+- `web-research`
+- `repository-diagnostics`
+- `small-model-evidence`
+- `integration-review`
+
+They follow the open `SKILL.md` package format and are Apache-2.0. Skill text
+guides a model but never grants tools or replaces OrgSpec.
+
+Inspect the bundled and optional capabilities without installing anything:
+
+```powershell
+node bin/chartermesh.mjs skills list --json
+node bin/chartermesh.mjs capabilities recommend --json
+node bin/chartermesh.mjs capabilities list --json
+```
+
+The catalog includes the official MCP reference Fetch, Filesystem, and Git
+servers plus Microsoft Playwright MCP. They are not automatically downloaded
+or executed. Filesystem and Git usually duplicate narrower native capabilities;
+Fetch and browser automation expand network/session access and therefore need
+a separate reviewed installation plan.
+
+For provider-neutral search without a commercial API, supply a reviewed
+SearXNG Search API endpoint while configuring a tool-calling engine:
+
+```powershell
+node bin/chartermesh.mjs configure-engine `
+  --target C:\path\to\project `
+  --engine openai-compatible `
+  --endpoint http://127.0.0.1:8080/v1 `
+  --model YOUR_MODEL_ID `
+  --tool-calling `
+  --web-search-searxng http://127.0.0.1:8888/search
+```
+
+Search is absent by default. HTTPS or loopback HTTP is required; credentials
+and redirects are rejected; responses are bounded; result pages are not
+fetched. Each exact query requires human Control Plane approval before it
+leaves the machine. The approved configuration plan updates `runtime.json` and
+the selected OrgSpec role together; use `--web-search-role ROLE_ID` when the
+role is not `operator`. Use `--disable-web-search` in a later approved engine
+plan to remove the endpoint and its role grants.
 
 ## One-command entry from the GitHub URL
 

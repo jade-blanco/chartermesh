@@ -1,7 +1,7 @@
 # Implementation roadmap
 
-Current milestone: `0.0.6-alpha.1`, durable invocation control and bounded
-local automation.
+Current milestone: `0.0.7-alpha.1`, portable skills, evidence-grounded local
+models, and approval-gated optional search.
 
 ## Completed foundation
 
@@ -42,6 +42,11 @@ local automation.
 - Claim/retry/backoff/dead-letter outbox dispatcher with human replay
 - Optional local interval scheduler, disabled by default, with overlap control
   and zero model starts on empty queues
+- Four bundled Apache-2.0 Agent Skills installed by the approved bootstrap
+  plan, plus agent-readable skill and integration catalog commands
+- Optional bounded SearXNG search with exact-query approval and no commercial
+  search API requirement
+- Explicit small-model evidence discipline validated with local Gemma 4
 
 ## Next: execution hardening
 
@@ -54,6 +59,8 @@ local automation.
 ## Next: integration surfaces
 
 - MCP server over the same Control Plane application service
+- Provider-neutral MCP client lifecycle with capability projection,
+  supply-chain pinning, cancellation, approval, and evidence
 - Optional external AgentHost adapters
 - Runtime capability discovery and drift reporting
 - Registry release automation and clean-machine install/uninstall matrix

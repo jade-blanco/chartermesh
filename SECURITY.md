@@ -38,13 +38,24 @@ private paths, or user data.
   executables, bounded output, timeouts, dedicated working directories, and
   explicit environment allowlists
 - Redirect-disabled, size-bounded OpenAI-compatible HTTP responses
+- External skills and MCP catalog entries disabled and uninstalled by default
+- Optional SearXNG search restricted to HTTPS/loopback, without endpoint
+  credentials or redirects, with bounded time/results/bytes and exact-query
+  approval before egress
 
 The OpenAI-compatible adapter transports model messages and tool calls but
 does not execute them. The common Tool Runtime is the authorization boundary.
-Its initial executors are bounded workspace list/read/write operations; there
-is no shell, network, package-manager, deployment, or external-side-effect
-tool. The threat model must be expanded before adding any such executor,
-daemon, or unattended AgentHost mutation.
+Its always-available executors are bounded workspace list/read/write
+operations. The only optional network executor is SearXNG result search; it is
+absent unless configured and every exact query requires human approval. There
+is no generic URL fetch, shell, package-manager, deployment, or unattended
+external-side-effect tool. The threat model must be expanded before adding any
+such executor, daemon, or unattended AgentHost mutation.
+
+Bundled Agent Skills are instruction text, not trusted executables or
+permissions. External MCP packages in the catalog are metadata only. Review
+their source, license, version/integrity, paths, credentials, network reach,
+and removal path before a separately approved installation.
 
 Executable hash pinning and a dedicated cwd detect replacement and reduce
 accidental project access; they are not an operating-system sandbox. Only

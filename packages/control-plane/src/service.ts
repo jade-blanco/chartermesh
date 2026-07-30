@@ -729,6 +729,7 @@ export class ControlPlane {
     tickKey: string;
     workItemId: string | null;
     status?: "started" | "skipped_no_work" | "skipped_overlap";
+    startedAt?: string;
   }): ScheduleTickRecord {
     return this.transact(() => {
       const scheduleId = assertText(input.scheduleId, "scheduleId");
@@ -739,7 +740,13 @@ export class ControlPlane {
         .update(`${scheduleId}\0${tickKey}`)
         .digest("hex")
         .slice(0, 24)}`;
-      const stamp = now();
+      const requestedStamp = input.startedAt
+        ? new Date(input.startedAt)
+        : null;
+      if (requestedStamp && !Number.isFinite(requestedStamp.getTime())) {
+        throw new Error("startedAt must be an ISO-8601 timestamp.");
+      }
+      const stamp = requestedStamp?.toISOString() ?? now();
       const insert = this.database
         .prepare(`
           INSERT OR IGNORE INTO schedule_ticks(

@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -13,9 +18,9 @@ import { compareVersions } from "../src/main.ts";
 const executable = resolve("bin", "chartermesh.mjs");
 
 test("version comparison does not treat an older release as an update", () => {
-  assert.ok(compareVersions("0.0.6-alpha.1", "0.0.5-alpha.1") > 0);
-  assert.ok(compareVersions("0.0.6", "0.0.6-alpha.1") > 0);
-  assert.equal(compareVersions("v0.0.6-alpha.1", "0.0.6-alpha.1"), 0);
+  assert.ok(compareVersions("0.0.7-alpha.1", "0.0.6-alpha.1") > 0);
+  assert.ok(compareVersions("0.0.7", "0.0.7-alpha.1") > 0);
+  assert.equal(compareVersions("v0.0.7-alpha.1", "0.0.7-alpha.1"), 0);
 });
 
 function cli(
@@ -51,6 +56,19 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   const applied = cli([...bootstrapArgs, "--approve", hash]);
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, /Applied CharterMesh bootstrap plan/u);
+  assert.equal(
+    existsSync(
+      join(target, ".chartermesh", "skills", "web-research", "SKILL.md"),
+    ),
+    true,
+  );
+  assert.match(
+    readFileSync(
+      join(target, ".chartermesh", "AGENT-ENTRYPOINT.md"),
+      "utf8",
+    ),
+    /performed, evidenced checks/u,
+  );
 
   const doctor = cli(["doctor", "--target", target]);
   assert.equal(doctor.status, 0, doctor.stdout + doctor.stderr);
@@ -126,6 +144,56 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   assert.match(listed.stdout, /\| done \| completed \|/u);
 });
 
+test("capability catalog is agent-readable and external integrations stay disabled", () => {
+  const listed = cli(["capabilities", "list", "--json"]);
+  assert.equal(listed.status, 0, listed.stdout + listed.stderr);
+  const catalog = JSON.parse(listed.stdout).data.items;
+  assert.ok(
+    catalog.some(
+      ({ id, defaultEnabled }: { id: string; defaultEnabled: boolean }) =>
+        id === "searxng-web-search" && defaultEnabled === false,
+    ),
+  );
+  const skills = cli(["skills", "list", "--json"]);
+  assert.equal(skills.status, 0, skills.stdout + skills.stderr);
+  assert.equal(JSON.parse(skills.stdout).data.items.length, 4);
+});
+
+test("bootstrap can opt into approval-gated loopback SearXNG search", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-search-"));
+  const args = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "openai-compatible",
+    "--endpoint",
+    "http://127.0.0.1:18080/v1",
+    "--model",
+    "local-model",
+    "--tool-calling",
+    "--web-search-searxng",
+    "http://127.0.0.1:8888/search",
+    "--json",
+  ];
+  const preview = cli(args);
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  const hash = JSON.parse(preview.stdout).data.planHash;
+  const applied = cli([...args, "--approve", hash]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  const runtime = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+  );
+  const organization = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "organization.json"), "utf8"),
+  );
+  assert.equal(runtime.webSearch.adapter, "searxng");
+  assert.ok(organization.spec.roles[0].tools.allow.includes("web.search"));
+  assert.ok(
+    organization.spec.roles[0].tools.approvalRequired.includes("web.search"),
+  );
+});
+
 test("engine reconfiguration is also bound to an exact plan hash", () => {
   const target = mkdtempSync(join(tmpdir(), "chartermesh-reconfigure-"));
   const initial = cli(["bootstrap", "--target", target, "--engine", "fake"]);
@@ -168,6 +236,98 @@ test("engine reconfiguration is also bound to an exact plan hash", () => {
   );
   assert.equal(runtime.modelEngines[0].adapter, "openai-compatible");
   assert.equal(runtime.modelEngines[0].model, "local-model");
+});
+
+test("engine reconfiguration adds web search to runtime and selected OrgSpec role atomically", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-search-configure-"));
+  const initialArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "fake",
+    "--json",
+  ];
+  const initial = JSON.parse(cli(initialArgs).stdout);
+  assert.equal(
+    cli([...initialArgs, "--approve", initial.data.planHash]).status,
+    0,
+  );
+  const configureArgs = [
+    "configure-engine",
+    "--target",
+    target,
+    "--engine",
+    "openai-compatible",
+    "--endpoint",
+    "http://127.0.0.1:18080/v1",
+    "--model",
+    "local-model",
+    "--tool-calling",
+    "--web-search-searxng",
+    "http://127.0.0.1:8888/search",
+    "--web-search-role",
+    "operator",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(configureArgs).stdout);
+  assert.equal(preview.data.files.length, 2);
+  const applied = cli([
+    ...configureArgs,
+    "--approve",
+    preview.data.planHash,
+  ]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  const runtime = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+  );
+  const organization = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "organization.json"), "utf8"),
+  );
+  assert.equal(runtime.webSearch.endpoint, "http://127.0.0.1:8888/search");
+  assert.ok(organization.spec.roles[0].capabilities.includes("web_research"));
+  assert.ok(organization.spec.roles[0].tools.allow.includes("web.search"));
+  assert.ok(
+    organization.spec.roles[0].tools.approvalRequired.includes("web.search"),
+  );
+  const doctor = cli(["doctor", "--target", target, "--json"]);
+  assert.equal(doctor.status, 0, doctor.stdout + doctor.stderr);
+  assert.equal(JSON.parse(doctor.stdout).data.webSearch, "configured");
+
+  const disableArgs = [
+    "configure-engine",
+    "--target",
+    target,
+    "--engine",
+    "openai-compatible",
+    "--endpoint",
+    "http://127.0.0.1:18080/v1",
+    "--model",
+    "local-model",
+    "--tool-calling",
+    "--disable-web-search",
+    "--json",
+  ];
+  const disablePreview = JSON.parse(cli(disableArgs).stdout);
+  assert.equal(
+    cli([
+      ...disableArgs,
+      "--approve",
+      disablePreview.data.planHash,
+    ]).status,
+    0,
+  );
+  const disabledRuntime = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+  );
+  const disabledOrganization = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "organization.json"), "utf8"),
+  );
+  assert.equal(disabledRuntime.webSearch, undefined);
+  assert.equal(
+    disabledOrganization.spec.roles[0].tools.allow.includes("web.search"),
+    false,
+  );
 });
 
 test("an arbitrary local executable can serve as the ModelEngine", () => {
@@ -619,7 +779,11 @@ test("local scheduler is disabled by default and skips empty queues without a mo
     "--json",
   ]);
   assert.equal(executed.status, 0, executed.stdout + executed.stderr);
-  assert.equal(JSON.parse(executed.stdout).data.succeeded, 1);
+  assert.equal(
+    JSON.parse(executed.stdout).data.succeeded,
+    1,
+    executed.stdout + executed.stderr,
+  );
   const listed = JSON.parse(
     cli(["list", "--target", target, "--json"]).stdout,
   );

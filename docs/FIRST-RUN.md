@@ -32,6 +32,14 @@ With a coding agent, provide the repository URL and say:
 
 The agent must follow `BOOTSTRAP.md` and use the repository CLI.
 
+The approved bootstrap also installs four Apache-2.0 portable skills and
+`.chartermesh/AGENT-ENTRYPOINT.md`. Inspect them without model or network use:
+
+```powershell
+node bin/chartermesh.mjs skills list --json
+node bin/chartermesh.mjs capabilities recommend --json
+```
+
 ## 2. Inspect the proposed organization
 
 ```powershell
@@ -117,6 +125,23 @@ calls. The common Tool Runtime still exposes only tools allowed by the
 assigned OrgSpec role. It confines paths to `workspaceRoots`, requires exact
 human approval for writes, records hash-only evidence, and stops at
 `maxIterations`.
+
+To add free provider-neutral search, run the same engine plan with a reviewed
+SearXNG `/search` endpoint:
+
+```powershell
+node bin/chartermesh.mjs configure-engine `
+  --target C:\path\to\target `
+  --engine openai-compatible `
+  --endpoint http://127.0.0.1:8080/v1 `
+  --model YOUR_MODEL_ID `
+  --tool-calling `
+  --web-search-searxng http://127.0.0.1:8888/search
+```
+
+SearXNG itself is not installed by CharterMesh. Search stays disabled without
+this option, and every exact query requires a separate Control Plane tool-call
+approval before network egress.
 
 For a local runtime wrapper with no compatible HTTP endpoint:
 

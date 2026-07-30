@@ -18,6 +18,10 @@ before start and share durable CLI/dashboard/signal cancellation. Work lists
 support cursors and archive, audit export streams, outbox delivery retries and
 dead-letters, and optional local schedules are disabled by default and start
 zero models on an empty queue.
+Approved bootstrap plans also install four provider-neutral Apache-2.0 Agent
+Skills. External MCP servers remain uninstalled and disabled. Optional
+SearXNG web.search requires a reviewed HTTPS/loopback endpoint, a tool-calling
+engine, an OrgSpec allowlist entry, and exact per-query human approval.
 
 Project architecture: docs/PRODUCT-DESIGN.md
 CLI and first run: docs/FIRST-RUN.md

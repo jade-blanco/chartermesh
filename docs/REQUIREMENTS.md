@@ -64,6 +64,11 @@ Status values: `done`, `partial`, `planned`, `decision`.
 | AUDIT-002 | Audit export is memory-bounded as event history grows | 2/5 | paged projection and incremental JSONL writer | done |
 | OUTBOX-001 | Outbox delivery claims, retries, dead-letters, and permits explicit human replay | 2/4 | dispatcher and Control Plane tests | done |
 | SCHED-003 | Local controller scheduling is opt-in, overlap-aware, and records durable ticks | 2/4 | scheduler runtime, Control Plane ticks, CLI E2E | done |
+| SKILL-001 | Provider-neutral evidence and research skills install through the approved bootstrap plan | 0/4 | four Apache-2.0 SKILL.md packages, package and CLI E2E | done |
+| CATALOG-001 | External agent integrations expose source, license, prerequisites, permissions, risks, and disabled state | 0/4 | capability catalog and CLI JSON tests | done |
+| WEB-001 | Optional search is provider-neutral, bounded, allowlisted, and exact-query approved before egress | 4 | SearXNG adapter, config schema, approval and loopback HTTP tests | done |
+| MCP-001 | Generic MCP client projects capabilities through the Control Plane rather than bypassing it | 4 | ADR 0015 | planned |
+| EVAL-002 | ManagedRunner separates performed checks from unperformed verification for constrained models | 4 | prompt regression and local Gemma workflow | done |
 
 ## Engine/host separation acceptance tests
 

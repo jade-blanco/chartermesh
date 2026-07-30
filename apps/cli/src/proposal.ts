@@ -186,6 +186,7 @@ export function analyzeTarget(target: string): TargetAssessment {
 export function organizationFor(
   profile: ProposalProfile,
   assessment: TargetAssessment,
+  options: { webSearch?: boolean } = {},
 ): OrganizationSpec {
   const languageSummary =
     assessment.detectedLanguages.length > 0
@@ -196,7 +197,10 @@ export function organizationFor(
     name: "Operator",
     class: "worker" as const,
     executionMode: "on_demand_ephemeral" as const,
-    capabilities: ["artifact_generation"],
+    capabilities: [
+      "artifact_generation",
+      ...(options.webSearch ? ["web_research"] : []),
+    ],
     requiredModelCapabilities: ["model.text.generate"],
     execution: { preferred: "local" },
     concurrency: 1,
@@ -205,8 +209,12 @@ export function organizationFor(
         "workspace.list_files",
         "workspace.read_file",
         "workspace.write_file",
+        ...(options.webSearch ? ["web.search"] : []),
       ],
-      approvalRequired: ["workspace.write_file"],
+      approvalRequired: [
+        "workspace.write_file",
+        ...(options.webSearch ? ["web.search"] : []),
+      ],
       workspaceRoots: ["."],
       maxIterations: profile === "lean" ? 3 : 5,
     },
@@ -220,12 +228,22 @@ export function organizationFor(
             name: "Verifier",
             class: "reviewer",
             executionMode: "on_demand_ephemeral",
-            capabilities: ["artifact_verification"],
+            capabilities: [
+              "artifact_verification",
+              ...(options.webSearch ? ["web_research"] : []),
+            ],
             requiredModelCapabilities: ["model.text.generate"],
             execution: { preferred: "local" },
             concurrency: 1,
             tools: {
-              allow: ["workspace.list_files", "workspace.read_file"],
+              allow: [
+                "workspace.list_files",
+                "workspace.read_file",
+                ...(options.webSearch ? ["web.search"] : []),
+              ],
+              ...(options.webSearch
+                ? { approvalRequired: ["web.search"] }
+                : {}),
               workspaceRoots: ["."],
               maxIterations: 4,
             },
@@ -330,11 +348,15 @@ export function organizationFor(
 export function createProposal(
   target: string,
   profile: ProposalProfile,
+  options: { webSearch?: boolean } = {},
 ): OrganizationProposal {
   const assessment = analyzeTarget(target);
-  const organization = organizationFor(profile, assessment);
+  const organization = organizationFor(profile, assessment, options);
   const rationale = [
     `Selected the ${profile} operating profile.`,
+    options.webSearch
+      ? "Enabled approval-gated web.search for the reviewed SearXNG endpoint."
+      : "Kept external web search disabled by default.",
     `Detected ${assessment.fileCount} reviewable files without reading file contents.`,
     assessment.detectedLanguages.length > 0
       ? `Detected languages: ${assessment.detectedLanguages.join(", ")}.`

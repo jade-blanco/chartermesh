@@ -169,6 +169,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
             "workspace.read_file",
             "workspace.write_file",
           ],
+          optionalBuiltIns: ["web.search"],
         },
       },
       {
@@ -218,7 +219,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
             apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
             summary: "non-empty string",
             deliverable: "non-empty string",
-            checks: ["string"],
+            checks: [],
             risks: ["string"],
             nextActions: ["string"],
             confidence: "low | medium | high",
@@ -226,7 +227,15 @@ export class BuiltInManagedRunner implements ManagedRunner {
           null,
           2,
         ),
-        "Use empty arrays when there are no checks, risks, or next actions. Do not add keys or Markdown fences.",
+        [
+          "Evidence boundary:",
+          "- Put a check in `checks` only when it was performed in this invocation and is directly supported by the task packet or a successful tool result.",
+          "- If no check was performed, return `checks: []`.",
+          "- Put proposed or unperformed verification in `nextActions`, using future tense.",
+          "- Never transform requested work into a claim that files, tests, dependencies, endpoints, builds, deployments, or external systems were inspected.",
+          "- Lower confidence and name missing evidence in `risks`.",
+          "Use empty arrays when there are no checks, risks, or next actions. Do not add keys or Markdown fences.",
+        ].join("\n"),
       ].join("\n"),
     ]
       .filter(Boolean)
@@ -242,7 +251,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
       {
         role: "system" as const,
         content:
-          "You are a bounded CharterMesh worker. Follow the task packet, do not claim external actions were performed, and return only the requested JSON object.",
+          "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran.",
       },
       { role: "user" as const, content: prompt },
     ];
@@ -284,7 +293,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
             {
               role: "user",
               content:
-                "The previous response did not match the required JSON schema. Return one corrected JSON object only. Do not use Markdown fences.",
+                "The previous response did not match the required JSON schema. Return one corrected JSON object only. Preserve the evidence boundary: checks are only actions actually performed with direct current-invocation evidence; otherwise use an empty checks array and move proposals to nextActions. Do not use Markdown fences.",
             },
           ],
           responseSchema: structuredArtifactSchema,

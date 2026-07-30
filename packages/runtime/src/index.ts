@@ -30,3 +30,22 @@ export {
   evaluateIntervalSchedule,
   type IntervalScheduleEvaluation,
 } from "./scheduler.ts";
+export {
+  capabilityCatalog,
+  recommendedCapabilities,
+  type CapabilityDisposition,
+  type CapabilityCatalogEntry,
+  type CapabilityCatalogKind,
+} from "./capability-catalog.ts";
+export {
+  portableAgentEntrypoint,
+  portableSkillDocuments,
+  portableSkillIds,
+  type PortableSkillDocument,
+  type PortableSkillId,
+} from "./portable-skills.ts";
+export {
+  createWebSearchTools,
+  validateWebSearchConfig,
+  type SearxngWebSearchConfig,
+} from "./web-search.ts";

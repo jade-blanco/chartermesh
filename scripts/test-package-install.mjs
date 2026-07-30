@@ -77,6 +77,12 @@ const executable = join(installed, "bin", "chartermesh.mjs");
 assert.equal(existsSync(executable), true);
 assert.equal(
   existsSync(
+    join(installed, "dist", "skills", "web-research", "SKILL.md"),
+  ),
+  true,
+);
+assert.equal(
+  existsSync(
     join(
       consumer,
       "node_modules",
@@ -91,7 +97,7 @@ const version = JSON.parse(
     cwd: target,
   }),
 );
-assert.equal(version.data.currentVersion, "0.0.6-alpha.1");
+assert.equal(version.data.currentVersion, "0.0.7-alpha.1");
 
 const proposal = JSON.parse(
   run(
@@ -138,12 +144,24 @@ const doctor = JSON.parse(
 );
 assert.equal(doctor.ok, true);
 assert.equal(
+  existsSync(
+    join(
+      target,
+      ".chartermesh",
+      "skills",
+      "small-model-evidence",
+      "SKILL.md",
+    ),
+  ),
+  true,
+);
+assert.equal(
   JSON.parse(
     readFileSync(
       join(target, ".chartermesh", "installation.json"),
       "utf8",
     ),
   ).charterMeshVersion,
-  "0.0.6-alpha.1",
+  "0.0.7-alpha.1",
 );
 console.log(`Package install check passed: ${packed[0].filename}`);

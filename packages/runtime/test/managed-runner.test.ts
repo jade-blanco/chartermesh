@@ -49,6 +49,50 @@ test("built-in managed runner executes an arbitrary model engine", async () => {
   assert.equal(result.inference.usage.cost, 0);
 });
 
+test("small-model prompt separates performed checks from proposed checks", async () => {
+  let system = "";
+  let user = "";
+  const engine: ModelEngine = {
+    manifest,
+    async generate(request) {
+      system = request.messages.find(({ role }) => role === "system")?.content ??
+        "";
+      user = request.messages.find(({ role }) => role === "user")?.content ?? "";
+      return {
+        invocationId: request.invocationId,
+        text: JSON.stringify({
+          apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+          summary: "Evidence boundary retained.",
+          deliverable: "No project inspection was claimed.",
+          checks: [],
+          risks: ["No filesystem evidence was supplied."],
+          nextActions: ["Inspect the requested files in a future run."],
+          confidence: "low",
+        }),
+        toolCalls: [],
+        finishReason: "stop",
+        usage,
+      };
+    },
+  };
+  const runner = new BuiltInManagedRunner();
+  const handle = await runner.start(
+    {
+      taskPacket: { objective: "Describe a verification plan." },
+      organizationRevision: 1,
+      workItemId: "work-evidence",
+      runId: "run-evidence",
+      attemptId: "attempt-evidence",
+      generation: 1,
+    },
+    { engine },
+  );
+  await runner.result(handle.hostRunId);
+  assert.match(system, /Never claim an action, inspection, test/u);
+  assert.match(user, /If no check was performed, return `checks: \[\]`/u);
+  assert.match(user, /using future tense/u);
+});
+
 test("runner repairs one invalid response and accounts for both turns", async () => {
   let calls = 0;
   let schemaShapeWasPrompted = false;

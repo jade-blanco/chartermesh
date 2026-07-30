@@ -62,4 +62,7 @@ cpSync(
 cpSync(join(project, "schemas"), join(output, "schemas"), {
   recursive: true,
 });
+cpSync(join(project, "skills"), join(output, "skills"), {
+  recursive: true,
+});
 console.log("Built dependency-free JavaScript package in dist/.");
