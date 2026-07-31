@@ -241,6 +241,27 @@ reported screening subset. A reviewer engine affects only verifier and
 synthesizer in the delegated condition. See
 [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md).
 
+Repository contributors can also run the opt-in executable-work harness
+directly against a loopback OpenAI-compatible server:
+
+```powershell
+pnpm evaluate:execution -- `
+  --endpoint http://127.0.0.1:8080/v1 `
+  --model LOCAL_MODEL_ID `
+  --engine-id local-small `
+  --tier-id small `
+  --task-count 100 `
+  --probe-count 200 `
+  --reasoning-mode disabled `
+  --output .chartermesh/artifacts/execution-small.json
+```
+
+Use `--resume PREVIOUS_REPORT` with a new `--tier-id`, endpoint, and model to
+run only pending tasks at a stronger tier. The harness uses synthetic
+configuration data in temporary Git repositories and hidden deterministic
+tests. It does not execute model-generated source code or grant the model
+tools. See [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md).
+
 ## Operate from the CLI
 
 ```powershell

@@ -1773,3 +1773,32 @@ or background daemon. CharterMesh does not bundle SearXNG itself and does not
 yet act as a generic MCP client. External package installation, browser
 profiles, credentials, and public search-instance policy remain user-owned,
 explicitly approved integrations.
+
+# Runtime artifact compiler and execution-evaluation amendment — 2026-07-31
+
+This amendment adds a provider-neutral reliability boundary without changing
+the default artifact mode:
+
+- The built-in ManagedRunner supports an experimental `runtime_compiled`
+  artifact mode. The model supplies bounded human-readable content; the
+  runtime deterministically owns the versioned envelope, required fields,
+  canonical JSON, and size limits. The existing `model_json` mode remains the
+  default.
+- Empty model content compiles to an explicit low-confidence artifact and
+  risk. It is structurally valid but must not be counted as successful work.
+- The opt-in execution evaluator creates isolated temporary Git repositories,
+  stages one synthetic configuration file, applies only a parsed complete JSON
+  object, and runs schema, exact-result, and Git-diff tests hidden from the
+  model.
+- Model-generated source code is never executed. The evaluation model receives
+  no tools or external side-effect capability. The reported zero-side-effect
+  result is therefore an isolation property, not proof of model restraint.
+- Evaluation reports resume across ordered model tiers and invoke only pending
+  tasks at later tiers. Artifact structure, sentinel retention, executable
+  correctness, latency, usage, and side effects remain separate metrics.
+- The harness stores hashes and bounded evidence rather than raw model output.
+
+This evaluator demonstrates only the checked bounded task family. It does not
+establish production autonomy, general coding ability, ambiguous planning,
+long-horizon recovery, or safe execution of generated programs. ADR 0017
+records the boundary and the conditions for a future code-execution sandbox.

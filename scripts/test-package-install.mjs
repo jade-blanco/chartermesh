@@ -77,6 +77,12 @@ const executable = join(installed, "bin", "chartermesh.mjs");
 assert.equal(existsSync(executable), true);
 assert.equal(
   existsSync(
+    join(installed, "scripts", "run-execution-evaluation.mjs"),
+  ),
+  true,
+);
+assert.equal(
+  existsSync(
     join(installed, "dist", "skills", "web-research", "SKILL.md"),
   ),
   true,

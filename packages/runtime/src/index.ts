@@ -1,9 +1,16 @@
 export {
   BuiltInManagedRunner,
+  parseStructuredArtifact,
   structuredArtifactSchema,
   type ManagedRunResult,
   type StructuredArtifact,
 } from "./managed-runner.ts";
+export {
+  compileStructuredArtifact,
+  extractFirstJsonObject,
+  type ArtifactCompilerInput,
+  type ArtifactCompilerResult,
+} from "./artifact-compiler.ts";
 export {
   DelegationController,
   type DelegatedRole,

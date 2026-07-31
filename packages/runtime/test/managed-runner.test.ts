@@ -8,6 +8,7 @@ import type {
 import {
   BuiltInManagedRunner,
   DelegationController,
+  parseStructuredArtifact,
 } from "../src/index.ts";
 
 const usage: InferenceResult["usage"] = {
@@ -150,6 +151,47 @@ test("runner repairs one invalid response and accounts for both turns", async ()
   assert.equal(schemaShapeWasPrompted, true);
   assert.equal(result.inference.usage.inputTokens, 4);
   assert.equal(result.inference.usage.outputTokens, 6);
+});
+
+test("runtime artifact compiler owns the final envelope", async () => {
+  let calls = 0;
+  let schemaRequested = true;
+  const engine: ModelEngine = {
+    manifest,
+    async generate(request) {
+      calls += 1;
+      schemaRequested = request.responseSchema !== undefined;
+      return {
+        invocationId: request.invocationId,
+        text: "A human-readable bounded deliverable.",
+        toolCalls: [],
+        finishReason: "stop",
+        usage,
+      };
+    },
+  };
+  const runner = new BuiltInManagedRunner({
+    artifactMode: "runtime_compiled",
+  });
+  const handle = await runner.start(
+    {
+      taskPacket: { objective: "Compile this result." },
+      organizationRevision: 1,
+      workItemId: "work-compiled",
+      runId: "run-compiled",
+      attemptId: "attempt-compiled",
+      generation: 1,
+    },
+    { engine },
+  );
+  const result = await runner.result(handle.hostRunId);
+  const artifact = parseStructuredArtifact(result.inference.text);
+  assert.equal(calls, 1);
+  assert.equal(schemaRequested, false);
+  assert.equal(
+    artifact?.deliverable,
+    "A human-readable bounded deliverable.",
+  );
 });
 
 test("runner cancellation aborts the active model request", async () => {

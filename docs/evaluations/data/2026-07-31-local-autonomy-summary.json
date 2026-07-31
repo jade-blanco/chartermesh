@@ -1,0 +1,81 @@
+{
+  "apiVersion": "chartermesh.dev/evaluation-summary/v1alpha1",
+  "date": "2026-07-31",
+  "suiteId": "bounded-config-repository-v1",
+  "seed": 20260731,
+  "rawReportSha256": "ED42895518C2F0640AACCC0407CFE942BF1EBCBF5EDB571E2CF004E43AF2CB57",
+  "executionBoundary": {
+    "mode": "harness-owned-temporary-git-repositories",
+    "modelGeneratedCodeExecuted": false,
+    "unapprovedExternalSideEffects": 0
+  },
+  "tiers": [
+    {
+      "tierId": "e4b",
+      "engineId": "local-gemma-e4b",
+      "model": "Gemma 4 E4B Q4_K_M",
+      "contextTokens": 131072,
+      "taskAttempts": 100,
+      "tasksPassed": 100,
+      "probeAttempts": 200
+    },
+    {
+      "tierId": "26b",
+      "engineId": "local-gemma-26b",
+      "model": "Gemma 4 26B A4B UD-Q4_K_M",
+      "contextTokens": 32768,
+      "taskAttempts": 0,
+      "tasksPassed": 0,
+      "probeAttempts": 1
+    },
+    {
+      "tierId": "qwen-122b",
+      "engineId": "local-qwen-122b-a10b",
+      "model": "Qwen 3.5 122B A10B UD-Q4_K_XL",
+      "contextTokens": 16384,
+      "taskAttempts": 0,
+      "tasksPassed": 0,
+      "probeAttempts": 1
+    }
+  ],
+  "aggregate": {
+    "passedTasks": 100,
+    "taskCount": 100,
+    "executionPassRate": 1,
+    "modelOutputs": 302,
+    "structuredValidOutputs": 302,
+    "structuredOutputRate": 1,
+    "sentinelRetainedOutputs": 202,
+    "sentinelOutputCount": 202,
+    "sentinelRetentionRate": 1,
+    "unapprovedExternalSideEffects": 0
+  },
+  "e4bTaskLatencyMs": {
+    "mean": 4475,
+    "p50": 3770,
+    "p95": 5607,
+    "p99": 5681,
+    "maximum": 5759
+  },
+  "e4bProbeLatencyMs": {
+    "mean": 452,
+    "p50": 446,
+    "p95": 492,
+    "p99": 566,
+    "maximum": 628
+  },
+  "reportedUsage": {
+    "e4bTaskInputTokens": 35085,
+    "e4bTaskOutputTokens": 19541,
+    "e4bProbeInputTokens": 7800,
+    "e4bProbeOutputTokens": 3633,
+    "costMeasurementStatus": "unknown",
+    "paidProviderUsed": false
+  },
+  "interpretation": {
+    "claim": "bounded configuration-operation reliability",
+    "generalCompanyAutonomyProven": false,
+    "upperTierTaskAccuracyMeasured": false,
+    "note": "E4B resolved every task, so 26B and Qwen executed transition probes only."
+  }
+}

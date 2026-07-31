@@ -125,3 +125,62 @@ recorded in
 The expanded E4B, DeepSeek 8B NPU, Gemma 26B, and Qwen 122B tier matrix is
 recorded in
 [`evaluations/2026-07-31-local-model-tier-matrix.md`](evaluations/2026-07-31-local-model-tier-matrix.md).
+
+## Bounded executable-work evaluation
+
+The contributor harness in `scripts/run-execution-evaluation.mjs` measures a
+narrower but stronger property than the three-case compatibility smoke:
+
+- create one real temporary Git repository per task;
+- stage a complete synthetic `service-config.json`;
+- ask the model for the complete replacement JSON;
+- compile the raw response into a runtime-owned structured artifact;
+- apply only the parsed JSON object to the known file;
+- run schema, exact expected-value, and non-empty Git-diff checks that were not
+  included in the model prompt;
+- delete the temporary repository;
+- preserve hashes, usage, latency, and error codes in a resumable report.
+
+The model has no tools in this harness. It cannot select a path, run a process,
+reach a network service, or make an external change. Generated source code is
+not executed. This makes zero unapproved external effects an isolation
+property. It does not prove that an unrestricted model would choose safely.
+
+Example first tier:
+
+```powershell
+pnpm evaluate:execution -- `
+  --endpoint http://127.0.0.1:18081/v1 `
+  --model LOCAL_MODEL_ID `
+  --engine-id local-small `
+  --tier-id small `
+  --task-count 100 `
+  --probe-count 200 `
+  --reasoning-mode disabled `
+  --output .chartermesh/artifacts/execution-small.json
+```
+
+Example escalation:
+
+```powershell
+pnpm evaluate:execution -- `
+  --endpoint http://127.0.0.1:18082/v1 `
+  --model STRONGER_LOCAL_MODEL_ID `
+  --engine-id local-reviewer `
+  --tier-id reviewer `
+  --resume .chartermesh/artifacts/execution-small.json `
+  --output .chartermesh/artifacts/execution-small-reviewer.json
+```
+
+Later tiers execute only tasks that remain pending. Optional artifact probes
+still run when `--probe-count` is nonzero, which permits a real liveness and
+compiler-contract check even when an earlier tier resolved every task.
+
+This is not a general coding benchmark. A 95% pass rate here applies only to
+bounded complete-file configuration edits. Production autonomy additionally
+needs isolated generated-code execution, adversarial and ambiguous tasks,
+fault injection, long-horizon recovery, repeated seeds, and tests spanning
+real project types.
+
+The first 100-task/302-output local run is recorded in
+[`evaluations/2026-07-31-local-autonomy-reliability.md`](evaluations/2026-07-31-local-autonomy-reliability.md).

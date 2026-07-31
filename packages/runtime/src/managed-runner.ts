@@ -11,6 +11,7 @@ import type {
   ToolExecutionEvidence,
   ToolRuntime,
 } from "./tool-runtime.ts";
+import { compileStructuredArtifact } from "./artifact-compiler.ts";
 
 export interface ManagedRunResult {
   hostRunId: string;
@@ -80,7 +81,9 @@ function strings(value: unknown): value is string[] {
   );
 }
 
-function parseStructuredArtifact(text: string): StructuredArtifact | null {
+export function parseStructuredArtifact(
+  text: string,
+): StructuredArtifact | null {
   const trimmed = text.trim();
   const candidate = trimmed.startsWith("```")
     ? trimmed
@@ -161,6 +164,15 @@ export class BuiltInManagedRunner implements ManagedRunner {
         stability: "stable",
       },
       {
+        name: "runner.artifact_compiler",
+        support: "native",
+        stability: "experimental",
+        constraints: {
+          modes: ["model_json", "runtime_compiled"],
+          default: "model_json",
+        },
+      },
+      {
         name: "runner.tool_loop",
         support: "native",
         stability: "stable",
@@ -204,9 +216,17 @@ export class BuiltInManagedRunner implements ManagedRunner {
       cleanup: () => void;
     }
   >();
-  private readonly options: { maxOutputTokens?: number };
+  private readonly options: {
+    maxOutputTokens?: number;
+    artifactMode?: "model_json" | "runtime_compiled";
+  };
 
-  constructor(options: { maxOutputTokens?: number } = {}) {
+  constructor(
+    options: {
+      maxOutputTokens?: number;
+      artifactMode?: "model_json" | "runtime_compiled";
+    } = {},
+  ) {
     this.options = options;
     const value =
       options.maxOutputTokens ?? DEFAULT_MAX_MODEL_OUTPUT_TOKENS;
@@ -231,6 +251,41 @@ export class BuiltInManagedRunner implements ManagedRunner {
       context?: string;
       acceptanceCriteria?: string[];
     };
+    const runtimeCompiled =
+      this.options.artifactMode === "runtime_compiled";
+    const artifactInstructions = runtimeCompiled
+      ? [
+          "Return a concise, human-readable deliverable.",
+          "Do not wrap the answer in a JSON envelope; the runtime will compile the final artifact.",
+          "State only checks actually performed with direct current-invocation evidence.",
+          "Describe proposed verification as a next action, not a completed check.",
+        ].join("\n")
+      : [
+          "Return JSON only with exactly this shape:",
+          JSON.stringify(
+            {
+              apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+              summary: "non-empty string",
+              deliverable: "non-empty string",
+              checks: [],
+              risks: ["string"],
+              nextActions: ["string"],
+              confidence: "low | medium | high",
+            },
+            null,
+            2,
+          ),
+          [
+            "Evidence boundary:",
+            "- Put a check in `checks` only when it was performed in this invocation and is directly supported by the task packet or a successful tool result.",
+            "- If no check was performed, return `checks: []`.",
+            "- Put proposed or unperformed verification in `nextActions`, using future tense.",
+            "- Never transform requested work into a claim that files, tests, dependencies, endpoints, builds, deployments, or external systems were inspected.",
+            "- Lower confidence and name missing evidence in `risks`.",
+            "- Write human-facing fields (`summary`, `deliverable`, `checks`, `risks`, and `nextActions`) in the task packet's primary language. Keep exact paths, commands, identifiers, and quoted source text unchanged.",
+            "Use empty arrays when there are no checks, risks, or next actions. Do not add keys or Markdown fences.",
+          ].join("\n"),
+        ].join("\n");
     const prompt = [
       packet.objective ?? "Complete the assigned work.",
       packet.context ? `Context:\n${packet.context}` : "",
@@ -238,37 +293,14 @@ export class BuiltInManagedRunner implements ManagedRunner {
         ? `Acceptance criteria:\n- ${packet.acceptanceCriteria.join("\n- ")}`
         : "",
       [
-        "Return JSON only with exactly this shape:",
-        JSON.stringify(
-          {
-            apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
-            summary: "non-empty string",
-            deliverable: "non-empty string",
-            checks: [],
-            risks: ["string"],
-            nextActions: ["string"],
-            confidence: "low | medium | high",
-          },
-          null,
-          2,
-        ),
-        [
-          "Evidence boundary:",
-          "- Put a check in `checks` only when it was performed in this invocation and is directly supported by the task packet or a successful tool result.",
-          "- If no check was performed, return `checks: []`.",
-          "- Put proposed or unperformed verification in `nextActions`, using future tense.",
-          "- Never transform requested work into a claim that files, tests, dependencies, endpoints, builds, deployments, or external systems were inspected.",
-          "- Lower confidence and name missing evidence in `risks`.",
-          "- Write human-facing fields (`summary`, `deliverable`, `checks`, `risks`, and `nextActions`) in the task packet's primary language. Keep exact paths, commands, identifiers, and quoted source text unchanged.",
-          "Use empty arrays when there are no checks, risks, or next actions. Do not add keys or Markdown fences.",
-          "",
-          "Tool argument boundary:",
-          "- For `workspace.write_file`, put the exact raw UTF-8 file text in `content`.",
-          "- For a small change to an existing file, prefer replacement mode: use the complete-file SHA-256 returned by `workspace.read_file` as `expectedSha256`, provide bounded `replacements`, and omit `content`.",
-          "- Each replacement must copy `oldText` exactly from the read result and state its `expectedOccurrences` (normally 1).",
-          "- JSON-escape that string exactly once for transport. Do not JSON-encode the file text a second time.",
-          "- After the tool arguments are parsed, source quotes must be ordinary quote characters and source line breaks must be actual line breaks, not pervasive literal backslash escapes.",
-        ].join("\n"),
+        artifactInstructions,
+        "",
+        "Tool argument boundary:",
+        "- For `workspace.write_file`, put the exact raw UTF-8 file text in `content`.",
+        "- For a small change to an existing file, prefer replacement mode: use the complete-file SHA-256 returned by `workspace.read_file` as `expectedSha256`, provide bounded `replacements`, and omit `content`.",
+        "- Each replacement must copy `oldText` exactly from the read result and state its `expectedOccurrences` (normally 1).",
+        "- JSON-escape that string exactly once for transport. Do not JSON-encode the file text a second time.",
+        "- After the tool arguments are parsed, source quotes must be ordinary quote characters and source line breaks must be actual line breaks, not pervasive literal backslash escapes.",
       ].join("\n"),
     ]
       .filter(Boolean)
@@ -283,8 +315,9 @@ export class BuiltInManagedRunner implements ManagedRunner {
     const messages = [
       {
         role: "system" as const,
-        content:
-          "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran. Tool arguments are parsed JSON values: prefer SHA-bound workspace.write_file replacements for small edits; full content must be raw file text after one JSON transport encoding, never a second JSON-encoded string.",
+        content: runtimeCompiled
+          ? "You are a bounded CharterMesh worker. Follow the task packet and return a concise human-readable deliverable. The runtime owns the final artifact envelope. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened."
+          : "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran. Tool arguments are parsed JSON values: prefer SHA-bound workspace.write_file replacements for small edits; full content must be raw file text after one JSON transport encoding, never a second JSON-encoded string.",
       },
       { role: "user" as const, content: prompt },
     ];
@@ -292,7 +325,9 @@ export class BuiltInManagedRunner implements ManagedRunner {
       const inferenceRequest = {
         invocationId: `${request.attemptId}:1`,
         messages,
-        responseSchema: structuredArtifactSchema,
+        responseSchema: runtimeCompiled
+          ? undefined
+          : structuredArtifactSchema,
         maxOutputTokens:
           this.options.maxOutputTokens ?? DEFAULT_MAX_MODEL_OUTPUT_TOKENS,
       };
@@ -308,6 +343,25 @@ export class BuiltInManagedRunner implements ManagedRunner {
         (await options.engine.generate(inferenceRequest, {
           signal: controller.signal,
         }));
+      if (runtimeCompiled) {
+        const compiled = compileStructuredArtifact({
+          text: first.text,
+          checks: toolLoop?.evidence
+            .filter((item) => item.status === "succeeded")
+            .map(
+              (item) =>
+                `${item.toolName} succeeded (output ${item.outputHash ?? "none"}).`,
+            ),
+          confidence: first.text.trim().length === 0 ? "low" : "medium",
+        });
+        return {
+          inference: {
+            ...first,
+            text: compiled.canonicalText,
+          },
+          toolEvidence: toolLoop?.evidence ?? [],
+        };
+      }
       let artifact = parseStructuredArtifact(first.text);
       if (artifact) {
         return {
