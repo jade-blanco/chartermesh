@@ -50,6 +50,10 @@ test("collaboration evaluation compares paired bounded conditions", async () => 
   };
   const report = await evaluateCollaboration(engine);
   assert.equal(report.trials.length, 3);
+  assert.deepEqual(report.conditionEngines, {
+    single: ["scripted-evaluation"],
+    delegated: ["scripted-evaluation"],
+  });
   assert.equal(report.aggregate.singlePassRate, 1);
   assert.equal(report.aggregate.delegatedPassRate, 1);
   assert.deepEqual(report.aggregate.observedTokens, {
@@ -72,4 +76,93 @@ test("collaboration evaluation compares paired bounded conditions", async () => 
     ),
     true,
   );
+});
+
+test("collaboration evaluation reports hybrid role engines", async () => {
+  const generated = (profileId: string): ModelEngine => ({
+    manifest: {
+      kind: "model_engine",
+      profileId,
+      adapter: "scripted",
+      contractVersion: "v1alpha1",
+      capabilities: [],
+    },
+    async generate(request) {
+      return {
+        invocationId: request.invocationId,
+        text: JSON.stringify({
+          apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+          summary: "Hybrid result.",
+          deliverable: allConcepts,
+          checks: [],
+          risks: [],
+          nextActions: [],
+          confidence: "medium",
+        }),
+        toolCalls: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          cost: 0,
+          measurementStatus: "measured",
+        },
+      };
+    },
+  });
+  const worker = generated("small-worker");
+  const reviewer = generated("large-reviewer");
+  const report = await evaluateCollaboration(worker, {
+    delegatedEngineForRole: (role) =>
+      ["verifier", "synthesizer"].includes(role)
+        ? reviewer
+        : worker,
+  });
+  assert.deepEqual(report.conditionEngines, {
+    single: ["small-worker"],
+    delegated: ["small-worker", "large-reviewer"],
+  });
+});
+
+test("collaboration evaluation records a condition failure and continues", async () => {
+  let calls = 0;
+  const engine: ModelEngine = {
+    manifest: {
+      kind: "model_engine",
+      profileId: "failing-engine",
+      adapter: "scripted",
+      contractVersion: "v1alpha1",
+      capabilities: [],
+    },
+    async generate(request) {
+      calls += 1;
+      return {
+        invocationId: request.invocationId,
+        text: "not-json",
+        toolCalls: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          cost: 0,
+          measurementStatus: "measured",
+        },
+      };
+    },
+  };
+  const report = await evaluateCollaboration(engine);
+  assert.equal(report.trials.length, 3);
+  assert.equal(
+    report.trials.every(
+      ({ single, delegated }) =>
+        single.errorCode === "STRUCTURED_ARTIFACT_INVALID" &&
+        delegated.errorCode === "STRUCTURED_ARTIFACT_INVALID",
+    ),
+    true,
+  );
+  assert.equal(calls, 12);
 });

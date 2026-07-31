@@ -112,3 +112,6 @@ and successful rerun are recorded in
 The bounded local-delegation and Gemma 4 E4B context/quality experiment is
 recorded in
 [`evaluations/2026-07-31-gemma-4-e4b-delegation.md`](evaluations/2026-07-31-gemma-4-e4b-delegation.md).
+The E4B-versus-26B, hybrid role-routing, and unified-memory investigation is
+recorded in
+[`evaluations/2026-07-31-gemma-4-model-size-and-hybrid.md`](evaluations/2026-07-31-gemma-4-model-size-and-hybrid.md).

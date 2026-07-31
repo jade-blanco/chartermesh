@@ -277,3 +277,54 @@ test("delegation controller runs four isolated bounded roles with typed lineage"
   assert.match(requests[3]!.user, /VERIFIER HANDOFF/u);
   assert.match(result.inference.text, /synthesizer bounded deliverable/u);
 });
+
+test("delegation controller can route reviewer roles to another engine", async () => {
+  const calls: string[] = [];
+  const engine = (profileId: string): ModelEngine => ({
+    manifest: { ...manifest, profileId },
+    async generate(request) {
+      calls.push(profileId);
+      return {
+        invocationId: request.invocationId,
+        text: JSON.stringify({
+          apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+          summary: `${profileId} result`,
+          deliverable: `${profileId} deliverable`,
+          checks: [],
+          risks: [],
+          nextActions: [],
+          confidence: "medium",
+        }),
+        toolCalls: [],
+        finishReason: "stop",
+        usage,
+      };
+    },
+  });
+  const worker = engine("small-worker");
+  const reviewer = engine("large-reviewer");
+  const result = await new DelegationController(256).run(
+    {
+      taskPacket: { objective: "Exercise hybrid routing." },
+      organizationRevision: 1,
+      workItemId: "work-hybrid",
+      runId: "run-hybrid",
+      attemptId: "attempt-hybrid",
+      generation: 1,
+    },
+    {
+      engine: worker,
+      engineForRole: (role) =>
+        ["verifier", "synthesizer"].includes(role)
+          ? reviewer
+          : worker,
+    },
+  );
+  assert.deepEqual(calls, [
+    "small-worker",
+    "small-worker",
+    "large-reviewer",
+    "large-reviewer",
+  ]);
+  assert.match(result.inference.text, /large-reviewer deliverable/u);
+});

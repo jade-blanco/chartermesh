@@ -1556,7 +1556,7 @@ export async function runWork(
           toolRuntime,
           signal: runController.signal,
           lifecycle: {
-            startStage({ role: delegatedRole }) {
+            startStage({ role: delegatedRole, engineId }) {
               const child = controlPlane.startChildAttempt({
                 parentAttemptId: claim!.attemptId,
                 roleId: delegatedRole,
@@ -1567,7 +1567,7 @@ export async function runWork(
               try {
                 const invocation = controlPlane.startInvocation({
                   attemptId: child.id,
-                  engineId: engine.manifest.profileId,
+                  engineId,
                   modelId,
                 });
                 stageInvocations.set(child.id, invocation.id);

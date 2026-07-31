@@ -29,6 +29,7 @@ export interface CollaborationConditionResult {
   usage: ModelUsage;
   usageComplete: boolean;
   output: string;
+  errorCode?: string;
 }
 
 export interface CollaborationTrial {
@@ -45,6 +46,10 @@ export interface CollaborationEvaluationReport {
   apiVersion: "chartermesh.dev/collaboration-evaluation/v1alpha1";
   evaluationId: string;
   engineId: string;
+  conditionEngines: {
+    single: string[];
+    delegated: string[];
+  };
   suiteId: "small-model-company-work-v1";
   suiteHash: string;
   startedAt: string;
@@ -231,60 +236,118 @@ function score(
   };
 }
 
+function evaluationErrorCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("STRUCTURED_ARTIFACT_INVALID")) {
+    return "STRUCTURED_ARTIFACT_INVALID";
+  }
+  if (message.toLowerCase().includes("abort")) return "RUN_CANCELED";
+  return "MODEL_INVOCATION_FAILED";
+}
+
+function failedCondition(
+  condition: CollaborationConditionResult["condition"],
+  fixture: CollaborationFixture,
+  latencyMs: number,
+  error: unknown,
+): CollaborationConditionResult {
+  return {
+    condition,
+    score: 0,
+    passed: false,
+    missingConcepts: [...fixture.requiredConcepts],
+    forbiddenClaims: [],
+    latencyMs,
+    stages: 0,
+    usage: {
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      cost: null,
+      measurementStatus: "unknown",
+    },
+    usageComplete: false,
+    output: "",
+    errorCode: evaluationErrorCode(error),
+  };
+}
+
 async function runSingle(
   engine: ModelEngine,
   fixture: CollaborationFixture,
   trialId: string,
 ): Promise<CollaborationConditionResult> {
   const startedAt = performance.now();
-  const runner = new BuiltInManagedRunner({ maxOutputTokens: 4_096 });
-  const handle = await runner.start(
-    {
-      taskPacket: fixture,
-      organizationRevision: 1,
-      workItemId: `evaluation-${fixture.id}`,
-      runId: trialId,
-      attemptId: `${trialId}:single`,
-      generation: 1,
-    },
-    { engine },
-  );
-  const result = await runner.result(handle.hostRunId);
-  return score(
-    "single",
-    fixture,
-    result.inference.text,
-    Math.round(performance.now() - startedAt),
-    1,
-    result.inference.usage,
-  );
+  try {
+    const runner = new BuiltInManagedRunner({ maxOutputTokens: 4_096 });
+    const handle = await runner.start(
+      {
+        taskPacket: fixture,
+        organizationRevision: 1,
+        workItemId: `evaluation-${fixture.id}`,
+        runId: trialId,
+        attemptId: `${trialId}:single`,
+        generation: 1,
+      },
+      { engine },
+    );
+    const result = await runner.result(handle.hostRunId);
+    return score(
+      "single",
+      fixture,
+      result.inference.text,
+      Math.round(performance.now() - startedAt),
+      1,
+      result.inference.usage,
+    );
+  } catch (error) {
+    return failedCondition(
+      "single",
+      fixture,
+      Math.round(performance.now() - startedAt),
+      error,
+    );
+  }
 }
 
 async function runDelegated(
   engine: ModelEngine,
   fixture: CollaborationFixture,
   trialId: string,
+  engineForRole?: Parameters<
+    DelegationController["run"]
+  >[1]["engineForRole"],
 ): Promise<CollaborationConditionResult> {
   const startedAt = performance.now();
-  const result = await new DelegationController(1_024).run(
-    {
-      taskPacket: fixture,
-      organizationRevision: 1,
-      workItemId: `evaluation-${fixture.id}`,
-      runId: trialId,
-      attemptId: `${trialId}:delegated`,
-      generation: 1,
-    },
-    { engine },
-  );
-  return score(
-    "delegated",
-    fixture,
-    result.inference.text,
-    Math.round(performance.now() - startedAt),
-    result.stages.length,
-    aggregateUsage(result.stages.map(({ inference }) => inference)),
-  );
+  try {
+    const result = await new DelegationController(1_024).run(
+      {
+        taskPacket: fixture,
+        organizationRevision: 1,
+        workItemId: `evaluation-${fixture.id}`,
+        runId: trialId,
+        attemptId: `${trialId}:delegated`,
+        generation: 1,
+      },
+      { engine, ...(engineForRole ? { engineForRole } : {}) },
+    );
+    return score(
+      "delegated",
+      fixture,
+      result.inference.text,
+      Math.round(performance.now() - startedAt),
+      result.stages.length,
+      aggregateUsage(result.stages.map(({ inference }) => inference)),
+    );
+  } catch (error) {
+    return failedCondition(
+      "delegated",
+      fixture,
+      Math.round(performance.now() - startedAt),
+      error,
+    );
+  }
 }
 
 function mean(values: number[]): number {
@@ -293,7 +356,12 @@ function mean(values: number[]): number {
 
 export async function evaluateCollaboration(
   engine: ModelEngine,
-  options: { repetitions?: number } = {},
+  options: {
+    repetitions?: number;
+    delegatedEngineForRole?: Parameters<
+      DelegationController["run"]
+    >[1]["engineForRole"];
+  } = {},
 ): Promise<CollaborationEvaluationReport> {
   const repetitions = options.repetitions ?? 1;
   if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 10) {
@@ -309,11 +377,21 @@ export async function evaluateCollaboration(
       let single: CollaborationConditionResult;
       let delegated: CollaborationConditionResult;
       if (delegatedFirst) {
-        delegated = await runDelegated(engine, fixture, trialId);
+        delegated = await runDelegated(
+          engine,
+          fixture,
+          trialId,
+          options.delegatedEngineForRole,
+        );
         single = await runSingle(engine, fixture, trialId);
       } else {
         single = await runSingle(engine, fixture, trialId);
-        delegated = await runDelegated(engine, fixture, trialId);
+        delegated = await runDelegated(
+          engine,
+          fixture,
+          trialId,
+          options.delegatedEngineForRole,
+        );
       }
       trials.push({
         id: trialId,
@@ -351,6 +429,27 @@ export async function evaluateCollaboration(
     apiVersion: "chartermesh.dev/collaboration-evaluation/v1alpha1",
     evaluationId,
     engineId: engine.manifest.profileId,
+    conditionEngines: {
+      single: [engine.manifest.profileId],
+      delegated: [
+        ...new Set(
+          options.delegatedEngineForRole
+            ? (
+                [
+                  "planner",
+                  "implementer",
+                  "verifier",
+                  "synthesizer",
+                ] as const
+              ).map(
+                (role) =>
+                  options.delegatedEngineForRole!(role).manifest
+                    .profileId,
+              )
+            : [engine.manifest.profileId],
+        ),
+      ],
+    },
     suiteId: "small-model-company-work-v1",
     suiteHash: createHash("sha256")
       .update(JSON.stringify(fixtures))

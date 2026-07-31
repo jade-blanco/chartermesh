@@ -27,6 +27,7 @@ export interface DelegationLifecycle {
   startStage(input: {
     role: DelegatedRole;
     index: number;
+    engineId: string;
   }): Promise<{ attemptId: string }> | { attemptId: string };
   finishStage(input: {
     role: DelegatedRole;
@@ -158,6 +159,7 @@ export class DelegationController {
     request: HostRunRequest,
     options: {
       engine: ModelEngine;
+      engineForRole?: (role: DelegatedRole) => ModelEngine;
       signal?: AbortSignal;
       toolRuntime?: ToolRuntime;
       lifecycle?: DelegationLifecycle;
@@ -174,7 +176,13 @@ export class DelegationController {
       if (options.signal?.aborted) {
         throw options.signal.reason ?? new Error("RUN_CANCELED");
       }
-      const started = await options.lifecycle?.startStage({ role, index });
+      const stageEngine =
+        options.engineForRole?.(role) ?? options.engine;
+      const started = await options.lifecycle?.startStage({
+        role,
+        index,
+        engineId: stageEngine.manifest.profileId,
+      });
       const attemptId =
         started?.attemptId ??
         `${request.attemptId}:${role}:${randomUUID()}`;
@@ -190,7 +198,7 @@ export class DelegationController {
             taskPacket: taskPacketFor(role, original, stages),
           },
           {
-            engine: options.engine,
+            engine: stageEngine,
             signal: options.signal,
             ...(role === "implementer" && options.toolRuntime
               ? { toolRuntime: options.toolRuntime }
