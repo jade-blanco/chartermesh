@@ -28,6 +28,8 @@ export interface StructuredArtifact {
   confidence: "low" | "medium" | "high";
 }
 
+const MAX_MODEL_OUTPUT_TOKENS = 4_096;
+
 export const structuredArtifactSchema = {
   type: "object",
   additionalProperties: false,
@@ -234,7 +236,15 @@ export class BuiltInManagedRunner implements ManagedRunner {
           "- Put proposed or unperformed verification in `nextActions`, using future tense.",
           "- Never transform requested work into a claim that files, tests, dependencies, endpoints, builds, deployments, or external systems were inspected.",
           "- Lower confidence and name missing evidence in `risks`.",
+          "- Write human-facing fields (`summary`, `deliverable`, `checks`, `risks`, and `nextActions`) in the task packet's primary language. Keep exact paths, commands, identifiers, and quoted source text unchanged.",
           "Use empty arrays when there are no checks, risks, or next actions. Do not add keys or Markdown fences.",
+          "",
+          "Tool argument boundary:",
+          "- For `workspace.write_file`, put the exact raw UTF-8 file text in `content`.",
+          "- For a small change to an existing file, prefer replacement mode: use the complete-file SHA-256 returned by `workspace.read_file` as `expectedSha256`, provide bounded `replacements`, and omit `content`.",
+          "- Each replacement must copy `oldText` exactly from the read result and state its `expectedOccurrences` (normally 1).",
+          "- JSON-escape that string exactly once for transport. Do not JSON-encode the file text a second time.",
+          "- After the tool arguments are parsed, source quotes must be ordinary quote characters and source line breaks must be actual line breaks, not pervasive literal backslash escapes.",
         ].join("\n"),
       ].join("\n"),
     ]
@@ -251,7 +261,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
       {
         role: "system" as const,
         content:
-          "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran.",
+          "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran. Tool arguments are parsed JSON values: prefer SHA-bound workspace.write_file replacements for small edits; full content must be raw file text after one JSON transport encoding, never a second JSON-encoded string.",
       },
       { role: "user" as const, content: prompt },
     ];
@@ -260,7 +270,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
         invocationId: `${request.attemptId}:1`,
         messages,
         responseSchema: structuredArtifactSchema,
-        maxOutputTokens: 1_500,
+        maxOutputTokens: MAX_MODEL_OUTPUT_TOKENS,
       };
       const toolLoop = options.toolRuntime
         ? await options.toolRuntime.run(
@@ -297,7 +307,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
             },
           ],
           responseSchema: structuredArtifactSchema,
-          maxOutputTokens: 1_500,
+          maxOutputTokens: MAX_MODEL_OUTPUT_TOKENS,
         },
         { signal: controller.signal },
       );

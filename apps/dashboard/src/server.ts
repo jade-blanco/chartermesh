@@ -295,6 +295,40 @@ export async function startDashboard(
         json(response, 200, controlPlane.get(decodeURIComponent(workMatch[1])));
         return;
       }
+      const toolEvidenceMatch = url.pathname.match(
+        /^\/api\/work-items\/([^/]+)\/tool-evidence$/u,
+      );
+      if (method === "GET" && toolEvidenceMatch) {
+        const id = decodeURIComponent(toolEvidenceMatch[1]);
+        const pendingToolCalls = controlPlane
+          .listPendingToolCalls(id)
+          .map((pending) => ({
+            ...pending,
+            approved: controlPlane.isToolCallApproved(
+              id,
+              pending.callHash,
+              pending.toolName,
+            ),
+          }));
+        json(response, 200, {
+          items: controlPlane.listToolEvidence(id),
+          pendingToolCalls,
+        });
+        return;
+      }
+      const reviewDecisionMatch = url.pathname.match(
+        /^\/api\/work-items\/([^/]+)\/review-decision$/u,
+      );
+      if (method === "GET" && reviewDecisionMatch) {
+        json(
+          response,
+          200,
+          controlPlane.latestArtifactDecision(
+            decodeURIComponent(reviewDecisionMatch[1]),
+          ),
+        );
+        return;
+      }
       if (method === "POST" && url.pathname === "/api/work-items") {
         const body = await readJson(request);
         const title = typeof body.title === "string" ? body.title : "";
@@ -313,7 +347,7 @@ export async function startDashboard(
         return;
       }
       const actionMatch = url.pathname.match(
-        /^\/api\/work-items\/([^/]+)\/(triage|run|cancel|retry|decision|complete|archive)$/u,
+        /^\/api\/work-items\/([^/]+)\/(triage|run|cancel|retry|decision|complete|archive|approve-tool)$/u,
       );
       if (method === "POST" && actionMatch) {
         const id = decodeURIComponent(actionMatch[1]);
@@ -364,6 +398,29 @@ export async function startDashboard(
             200,
             controlPlane.retry({
               id,
+              actor: "human:dashboard",
+              idempotencyKey,
+            }),
+          );
+          return;
+        }
+        if (action === "approve-tool") {
+          const callHash =
+            typeof body.callHash === "string" ? body.callHash : "";
+          const toolName =
+            typeof body.toolName === "string" ? body.toolName : "";
+          const note =
+            typeof body.note === "string"
+              ? body.note
+              : "Reviewed exact tool arguments in the local dashboard.";
+          json(
+            response,
+            200,
+            controlPlane.approveToolCall({
+              id,
+              callHash,
+              toolName,
+              note,
               actor: "human:dashboard",
               idempotencyKey,
             }),

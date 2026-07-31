@@ -11,6 +11,7 @@ export {
   createWorkspaceToolRuntime,
   createWorkspaceTools,
   toolCallHash,
+  type ApprovedToolCallResult,
   type RuntimeTool,
   type ToolExecutionContext,
   type ToolExecutionEvidence,

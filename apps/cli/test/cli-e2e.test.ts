@@ -77,8 +77,11 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   const requested = cli([
     "request",
     "Prepare the clean-target artifact",
-    "--summary",
-    "Prove the provider-neutral CLI path.",
+    "--summary-base64",
+    Buffer.from(
+      "Prove the provider-neutral CLI path with quotes, regex /^safe$/, and 한국어.",
+      "utf8",
+    ).toString("base64"),
     "--target",
     target,
   ]);
@@ -142,6 +145,44 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   const listed = cli(["list", "--target", target]);
   assert.equal(listed.status, 0, listed.stderr);
   assert.match(listed.stdout, /\| done \| completed \|/u);
+
+  const evidenceRequest = cli([
+    "request",
+    "Require a real workspace read",
+    "--summary",
+    "The fake engine cannot satisfy this required tool evidence.",
+    "--require-tool",
+    "workspace.read_file",
+    "--target",
+    target,
+  ]);
+  const evidenceWorkId =
+    evidenceRequest.stdout.match(/(work-\d{6}) created/u)?.[1];
+  assert.ok(evidenceWorkId, evidenceRequest.stdout);
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      evidenceWorkId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+  const evidenceRun = cli([
+    "run",
+    "--id",
+    evidenceWorkId,
+    "--target",
+    target,
+  ]);
+  assert.equal(evidenceRun.status, 1);
+  assert.match(
+    evidenceRun.stderr,
+    /REQUIRED_TOOL_EVIDENCE_MISSING: workspace\.read_file/u,
+  );
 });
 
 test("capability catalog is agent-readable and external integrations stay disabled", () => {
@@ -156,7 +197,7 @@ test("capability catalog is agent-readable and external integrations stay disabl
   );
   const skills = cli(["skills", "list", "--json"]);
   assert.equal(skills.status, 0, skills.stdout + skills.stderr);
-  assert.equal(JSON.parse(skills.stdout).data.items.length, 4);
+  assert.equal(JSON.parse(skills.stdout).data.items.length, 5);
 });
 
 test("bootstrap can opt into approval-gated loopback SearXNG search", () => {
@@ -408,6 +449,150 @@ test("an arbitrary local executable can serve as the ModelEngine", () => {
         "primary-model",
       )}`,
     ),
+  );
+});
+
+test("an approval-gated tool call waits without failing and resumes on a new run", () => {
+  const target = mkdtempSync(
+    join(tmpdir(), "chartermesh-command-approval-cli-"),
+  );
+  const fixture = resolve(
+    "adapters",
+    "model-engines",
+    "command-process",
+    "test",
+    "fixtures",
+    "approval-engine.mjs",
+  );
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "command-process",
+    "--command",
+    process.execPath,
+    "--command-arg",
+    fixture,
+    "--model",
+    "approval-fixture",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  assert.equal(
+    cli([
+      ...bootstrapArgs,
+      "--approve",
+      preview.data.planHash,
+    ]).status,
+    0,
+  );
+
+  const requested = JSON.parse(
+    cli([
+      "request",
+      "Exercise a durable tool approval wait",
+      "--target",
+      target,
+      "--json",
+    ]).stdout,
+  );
+  const workId = requested.data.id;
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      workId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+
+  const firstRun = cli([
+    "run",
+    "--id",
+    workId,
+    "--target",
+    target,
+    "--json",
+  ]);
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const pending = JSON.parse(firstRun.stdout).data;
+  assert.equal(pending.status, "approval_required");
+  assert.equal(pending.toolName, "workspace.write_file");
+  assert.match(pending.callHash, /^[a-f0-9]{64}$/u);
+
+  let database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  let controlPlane = new ControlPlane(
+    database,
+    join(target, ".chartermesh", "artifacts"),
+  );
+  assert.deepEqual(
+    {
+      status: controlPlane.get(workId).status,
+      availability: controlPlane.get(workId).availability,
+      failures: controlPlane.dashboard().summary.failed,
+      approvals: controlPlane.dashboard().summary.approvals,
+    },
+    {
+      status: "in_progress",
+      availability: "approval_waiting",
+      failures: 0,
+      approvals: 1,
+    },
+  );
+  database.close();
+
+  const approved = cli([
+    "approve-tool",
+    "--id",
+    workId,
+    "--call-hash",
+    pending.callHash,
+    "--tool",
+    pending.toolName,
+    "--target",
+    target,
+  ]);
+  assert.equal(approved.status, 0, approved.stderr);
+
+  database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  controlPlane = new ControlPlane(
+    database,
+    join(target, ".chartermesh", "artifacts"),
+  );
+  assert.deepEqual(
+    {
+      status: controlPlane.get(workId).status,
+      availability: controlPlane.get(workId).availability,
+    },
+    { status: "ready", availability: "ready" },
+  );
+  database.close();
+
+  const resumed = cli([
+    "run",
+    "--id",
+    workId,
+    "--target",
+    target,
+    "--json",
+  ]);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(
+    JSON.parse(resumed.stdout).data.status,
+    "submitted_for_review",
+  );
+  assert.equal(
+    readFileSync(join(target, "approval-fixture.txt"), "utf8"),
+    "approved\n",
   );
 });
 

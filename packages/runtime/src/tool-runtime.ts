@@ -72,18 +72,29 @@ export interface ToolLoopResult {
   iterations: number;
 }
 
+export interface ApprovedToolCallResult {
+  output: string;
+  evidence: ToolExecutionEvidence;
+}
+
 export class ToolApprovalRequiredError extends Error {
   readonly code = "TOOL_APPROVAL_REQUIRED";
   readonly callHash: string;
   readonly toolName: string;
+  readonly call: ModelToolCall;
 
-  constructor(callHash: string, toolName: string) {
+  constructor(callHash: string, toolName: string, call: ModelToolCall) {
     super(
       `TOOL_APPROVAL_REQUIRED: approve exact call hash ${callHash} for '${toolName}'.`,
     );
     this.name = "ToolApprovalRequiredError";
     this.callHash = callHash;
     this.toolName = toolName;
+    this.call = {
+      id: call.id,
+      name: call.name,
+      arguments: call.arguments,
+    };
   }
 }
 
@@ -114,6 +125,87 @@ function digest(value: unknown): string {
       ? value
       : JSON.stringify(stableValue(value));
   return createHash("sha256").update(content).digest("hex");
+}
+
+function declaredPaths(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const record = value as Record<string, unknown>;
+  const paths = [
+    ...(typeof record.path === "string" ? [record.path] : []),
+    ...(Array.isArray(record.paths)
+      ? record.paths.filter((entry): entry is string =>
+          typeof entry === "string"
+        )
+      : []),
+  ];
+  return [...new Set(paths)].slice(0, 32);
+}
+
+function malformedToolArguments(
+  value: unknown,
+  toolName?: string,
+): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "Tool arguments must be a JSON object.";
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.unparsed === "string") {
+    return "The model returned tool arguments that were not valid complete JSON.";
+  }
+  if (toolName === "workspace.write_file") {
+    if (typeof record.path !== "string" || !record.path.trim()) {
+      return "workspace.write_file requires a non-empty path.";
+    }
+    const hasContent = typeof record.content === "string";
+    const hasReplacements = Array.isArray(record.replacements);
+    if (hasContent === hasReplacements) {
+      return "workspace.write_file requires exactly one mode: content or replacements.";
+    }
+    if (
+      hasContent &&
+      Buffer.byteLength(record.content as string, "utf8") > 262_144
+    ) {
+      return "workspace.write_file content exceeds 262144 UTF-8 bytes.";
+    }
+    if (hasReplacements) {
+      if (
+        typeof record.expectedSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(record.expectedSha256)
+      ) {
+        return "Replacement mode requires a lowercase 64-character expectedSha256.";
+      }
+      const replacements = record.replacements as unknown[];
+      if (replacements.length < 1 || replacements.length > 20) {
+        return "Replacement mode requires from 1 through 20 replacements.";
+      }
+      for (const replacement of replacements) {
+        if (
+          !replacement ||
+          typeof replacement !== "object" ||
+          Array.isArray(replacement)
+        ) {
+          return "Each replacement must be a JSON object.";
+        }
+        const edit = replacement as Record<string, unknown>;
+        if (
+          typeof edit.oldText !== "string" ||
+          edit.oldText.length === 0 ||
+          typeof edit.newText !== "string"
+        ) {
+          return "Each replacement requires non-empty oldText and string newText.";
+        }
+        const expectedOccurrences = edit.expectedOccurrences ?? 1;
+        if (
+          !Number.isInteger(expectedOccurrences) ||
+          Number(expectedOccurrences) < 1 ||
+          Number(expectedOccurrences) > 100
+        ) {
+          return "Replacement expectedOccurrences must be an integer from 1 through 100.";
+        }
+      }
+    }
+  }
+  return null;
 }
 
 export function toolCallHash(
@@ -238,6 +330,44 @@ function objectArguments(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function writeUtf8File(path: { absolute: string; display: string }, content: string) {
+  mkdirSync(dirname(path.absolute), { recursive: true });
+  if (
+    existsSync(path.absolute) &&
+    lstatSync(path.absolute).isSymbolicLink()
+  ) {
+    throw new Error(`Symbolic-link target '${path.display}' is not allowed.`);
+  }
+  const noFollow = "O_NOFOLLOW" in constants
+    ? Number(constants.O_NOFOLLOW)
+    : 0;
+  const descriptor = openSync(
+    path.absolute,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_TRUNC |
+      noFollow,
+    0o600,
+  );
+  try {
+    writeFileSync(descriptor, content, { encoding: "utf8" });
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function occurrenceCount(content: string, search: string): number {
+  let count = 0;
+  let cursor = 0;
+  while (cursor <= content.length - search.length) {
+    const next = content.indexOf(search, cursor);
+    if (next === -1) break;
+    count += 1;
+    cursor = next + search.length;
+  }
+  return count;
+}
+
 export function createWorkspaceTools(
   workspaceRoot: string,
   policy: ToolPolicy,
@@ -291,7 +421,7 @@ export function createWorkspaceTools(
       modelTool: {
         name: "workspace.read_file",
         description:
-          "Read a bounded UTF-8 text file inside the approved workspace roots.",
+          "Read a bounded UTF-8 text file inside the approved workspace roots. The result includes the SHA-256 of the complete file for exact replacement writes.",
         inputSchema: {
           type: "object",
           additionalProperties: false,
@@ -330,6 +460,7 @@ export function createWorkspaceTools(
           output: JSON.stringify({
             path: path.display,
             truncated: content.byteLength > maximum,
+            sha256: createHash("sha256").update(content).digest("hex"),
             content: content.subarray(0, maximum).toString("utf8"),
           }),
           paths: [path.display],
@@ -340,65 +471,130 @@ export function createWorkspaceTools(
       modelTool: {
         name: "workspace.write_file",
         description:
-          "Create or replace one UTF-8 text file inside the approved workspace roots. Exact-call human approval is required.",
+          "Create or replace one UTF-8 text file inside the approved workspace roots. Prefer replacements with the complete-file expectedSha256 for small, exact edits; every oldText must occur exactly expectedOccurrences times. Otherwise pass exact raw file text in content after one JSON transport encoding. Never JSON-encode file text a second time. Exact-call human approval is required.",
         inputSchema: {
           type: "object",
           additionalProperties: false,
-          required: ["path", "content"],
+          required: ["path"],
           properties: {
             path: { type: "string", minLength: 1 },
             content: {
               type: "string",
               maxLength: 262_144,
+              description:
+                "Exact raw UTF-8 file text after JSON parsing. Source quotes and line breaks must not remain pervasively backslash-escaped.",
+            },
+            expectedSha256: {
+              type: "string",
+              pattern: "^[a-f0-9]{64}$",
+              description:
+                "Required in replacement mode; must match the complete current file.",
+            },
+            replacements: {
+              type: "array",
+              minItems: 1,
+              maxItems: 20,
+              description:
+                "Exact bounded edits applied in order. Omit content when using this mode.",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["oldText", "newText"],
+                properties: {
+                  oldText: { type: "string", minLength: 1 },
+                  newText: { type: "string" },
+                  expectedOccurrences: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 100,
+                    default: 1,
+                  },
+                },
+              },
             },
           },
+          oneOf: [
+            {
+              required: ["content"],
+              not: { required: ["replacements"] },
+            },
+            {
+              required: ["expectedSha256", "replacements"],
+              not: { required: ["content"] },
+            },
+          ],
         },
       },
       permission: "workspace_write",
       async execute(value) {
         const args = objectArguments(value);
-        if (
-          typeof args.content !== "string" ||
-          Buffer.byteLength(args.content, "utf8") > 262_144
-        ) {
-          throw new Error(
-            "Tool argument 'content' must be a UTF-8 string of at most 262144 bytes.",
-          );
-        }
         const path = canonicalPath(
           workspaceRoot,
           policy,
           args.path,
           "write",
         );
-        mkdirSync(dirname(path.absolute), { recursive: true });
-        if (
-          existsSync(path.absolute) &&
-          lstatSync(path.absolute).isSymbolicLink()
-        ) {
-          throw new Error(`Symbolic-link target '${path.display}' is not allowed.`);
+        let content: string;
+        let beforeSha256: string | null = null;
+        const replacements = Array.isArray(args.replacements)
+          ? (args.replacements as Array<Record<string, unknown>>)
+          : null;
+        if (replacements) {
+          if (!existsSync(path.absolute) || !lstatSync(path.absolute).isFile()) {
+            throw new Error(
+              `Replacement target '${path.display}' must be an existing regular file.`,
+            );
+          }
+          const current = readFileSync(path.absolute);
+          if (current.includes(0)) {
+            throw new Error(
+              `Replacement target '${path.display}' is not UTF-8 text.`,
+            );
+          }
+          beforeSha256 = createHash("sha256").update(current).digest("hex");
+          if (beforeSha256 !== args.expectedSha256) {
+            throw new Error(
+              `Replacement target '${path.display}' changed: expected ${String(
+                args.expectedSha256,
+              )}, found ${beforeSha256}.`,
+            );
+          }
+          content = current.toString("utf8");
+          for (const replacement of replacements) {
+            const oldText = String(replacement.oldText);
+            const newText = String(replacement.newText);
+            const expectedOccurrences = Number(
+              replacement.expectedOccurrences ?? 1,
+            );
+            const found = occurrenceCount(content, oldText);
+            if (found !== expectedOccurrences) {
+              throw new Error(
+                `Replacement in '${path.display}' expected ${expectedOccurrences} occurrence(s), found ${found}.`,
+              );
+            }
+            content = content.split(oldText).join(newText);
+          }
+        } else if (typeof args.content === "string") {
+          content = args.content;
+        } else {
+          throw new Error(
+            "workspace.write_file requires content or exact replacements.",
+          );
         }
-        const noFollow = "O_NOFOLLOW" in constants
-          ? Number(constants.O_NOFOLLOW)
-          : 0;
-        const descriptor = openSync(
-          path.absolute,
-          constants.O_WRONLY |
-            constants.O_CREAT |
-            constants.O_TRUNC |
-            noFollow,
-          0o600,
-        );
-        try {
-          writeFileSync(descriptor, args.content, { encoding: "utf8" });
-        } finally {
-          closeSync(descriptor);
+        if (Buffer.byteLength(content, "utf8") > 262_144) {
+          throw new Error(
+            "Resulting UTF-8 file exceeds the 262144-byte limit.",
+          );
         }
+        writeUtf8File(path, content);
         return {
           output: JSON.stringify({
             path: path.display,
-            byteSize: Buffer.byteLength(args.content, "utf8"),
-            sha256: digest(args.content),
+            mode: replacements ? "replacements" : "content",
+            replacements: replacements?.length ?? 0,
+            beforeSha256,
+            byteSize: Buffer.byteLength(content, "utf8"),
+            sha256: digest(content),
           }),
           paths: [path.display],
         };
@@ -473,6 +669,105 @@ export class ToolRuntime {
     };
   }
 
+  async executeApprovedCall(
+    call: ModelToolCall,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ApprovedToolCallResult> {
+    const evidence: ToolExecutionEvidence[] = [];
+    const started = Date.now();
+    const callHash = toolCallHash(this.workItemId, call);
+    const tool = this.tools.get(call.name);
+    if (!tool || !this.policy.allow.includes(call.name)) {
+      const output = JSON.stringify({
+        ok: false,
+        code: "TOOL_DENIED",
+        message: `Tool '${call.name}' is not allowed by OrgSpec.`,
+      });
+      await this.record(
+        this.evidence(
+          call,
+          "denied",
+          started,
+          output,
+          declaredPaths(call.arguments),
+        ),
+        evidence,
+      );
+      throw new Error(`TOOL_DENIED: '${call.name}' is not allowed by OrgSpec.`);
+    }
+    const malformed = malformedToolArguments(call.arguments, call.name);
+    if (malformed) {
+      const output = JSON.stringify({
+        ok: false,
+        code: "TOOL_ARGUMENTS_INVALID",
+        message: malformed,
+      });
+      await this.record(
+        this.evidence(
+          call,
+          "failed",
+          started,
+          output,
+          declaredPaths(call.arguments),
+        ),
+        evidence,
+      );
+      throw new Error(`TOOL_ARGUMENTS_INVALID: ${malformed}`);
+    }
+    const approvalRequired =
+      tool.permission !== "read_only" ||
+      (this.policy.approvalRequired ?? []).includes(call.name);
+    if (approvalRequired && !this.isApproved(callHash, call.name)) {
+      await this.record(
+        this.evidence(
+          call,
+          "approval_required",
+          started,
+          null,
+          declaredPaths(call.arguments),
+        ),
+        evidence,
+      );
+      throw new ToolApprovalRequiredError(callHash, call.name, call);
+    }
+    try {
+      options.signal?.throwIfAborted();
+      const result = await tool.execute(call.arguments, {
+        workspaceRoot: this.workspaceRoot,
+        signal: options.signal,
+      });
+      const output = result.output.slice(0, 65_536);
+      const record = this.evidence(
+        call,
+        "succeeded",
+        started,
+        output,
+        result.paths ?? declaredPaths(call.arguments),
+      );
+      await this.record(record, evidence);
+      return { output, evidence: record };
+    } catch (error) {
+      const output = JSON.stringify({
+        ok: false,
+        code: "TOOL_EXECUTION_FAILED",
+        message: error instanceof Error ? error.message : String(error),
+      }).slice(0, 8_000);
+      const record = this.evidence(
+        call,
+        "failed",
+        started,
+        output,
+        declaredPaths(call.arguments),
+      );
+      await this.record(record, evidence);
+      throw new Error(
+        `TOOL_EXECUTION_FAILED: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   async run(
     engine: ModelEngine,
     request: InferenceRequest,
@@ -531,6 +826,30 @@ export class ToolRuntime {
           });
           continue;
         }
+        const malformed = malformedToolArguments(call.arguments, call.name);
+        if (malformed) {
+          const output = JSON.stringify({
+            ok: false,
+            code: "TOOL_ARGUMENTS_INVALID",
+            message: malformed,
+          });
+          await this.record(
+            this.evidence(
+              call,
+              "failed",
+              started,
+              output,
+              declaredPaths(call.arguments),
+            ),
+            evidence,
+          );
+          messages.push({
+            role: "tool",
+            toolCallId: call.id,
+            content: output,
+          });
+          continue;
+        }
         const approvalRequired =
           tool.permission !== "read_only" ||
           (this.policy.approvalRequired ?? []).includes(call.name);
@@ -539,10 +858,16 @@ export class ToolRuntime {
           !this.isApproved(callHash, call.name)
         ) {
           await this.record(
-            this.evidence(call, "approval_required", started, null),
+            this.evidence(
+              call,
+              "approval_required",
+              started,
+              null,
+              declaredPaths(call.arguments),
+            ),
             evidence,
           );
-          throw new ToolApprovalRequiredError(callHash, call.name);
+          throw new ToolApprovalRequiredError(callHash, call.name, call);
         }
         try {
           options.signal?.throwIfAborted();

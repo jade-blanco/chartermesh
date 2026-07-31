@@ -4,6 +4,7 @@ export const portableSkillIds = [
   "web-research",
   "repository-diagnostics",
   "small-model-evidence",
+  "tool-grounded-implementation",
   "integration-review",
 ] as const;
 

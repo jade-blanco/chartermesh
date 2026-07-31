@@ -44,6 +44,7 @@ import {
 } from "../../../packages/compiler/src/index.ts";
 import {
   BuiltInManagedRunner,
+  ToolApprovalRequiredError,
   capabilityCatalog,
   createWorkspaceToolRuntime,
   createWebSearchTools,
@@ -54,6 +55,7 @@ import {
   recommendedCapabilities,
   validateWebSearchConfig,
   type RuntimeConfig,
+  type ToolExecutionEvidence,
 } from "../../../packages/runtime/src/index.ts";
 import {
   createProposal,
@@ -1274,12 +1276,21 @@ function restoreControlPlane(target: string, args: string[]): void {
   }
 }
 
-export interface RunWorkResult {
-  workItemId: string;
-  artifactId: string;
-  sha256: string;
-  generation: number;
-}
+export type RunWorkResult =
+  | {
+      status: "submitted_for_review";
+      workItemId: string;
+      artifactId: string;
+      sha256: string;
+      generation: number;
+    }
+  | {
+      status: "approval_required";
+      workItemId: string;
+      callHash: string;
+      toolName: string;
+      generation: number;
+    };
 
 export interface SchedulerTickSummary {
   evaluatedAt: string;
@@ -1454,15 +1465,43 @@ export async function runWork(
           });
         },
       });
+      const replayedEvidence: ToolExecutionEvidence[] = [];
+      const approvedPending =
+        controlPlane.approvedPendingToolCall(candidate.id);
+      if (approvedPending) {
+        const replay = await toolRuntime.executeApprovedCall(
+          {
+            id: approvedPending.id,
+            name: approvedPending.toolName,
+            arguments: approvedPending.arguments,
+          },
+          { signal: runController.signal },
+        );
+        replayedEvidence.push(replay.evidence);
+        controlPlane.markPendingToolCallExecuted({
+          id: candidate.id,
+          callHash: approvedPending.callHash,
+          actor: "runner:local",
+          idempotencyKey:
+            `cli:pending-tool-executed:${candidate.id}:${approvedPending.callHash}`,
+        });
+      }
       const modelId =
         "config" in engine && engine.config?.model
           ? String(engine.config.model)
           : "deterministic-fixture";
-      const skillGuidance = role.capabilities.includes("web_research")
-        ? portableSkillDocuments().find(({ id: skillId }) =>
-            skillId === "web-research"
-          )?.content
-        : undefined;
+      const requiredTools = controlPlane.requiredTools(candidate.id);
+      const skillGuidance = portableSkillDocuments()
+        .filter(
+          ({ id: skillId }) =>
+            skillId === "small-model-evidence" ||
+            (requiredTools.length > 0 &&
+              skillId === "tool-grounded-implementation") ||
+            (role.capabilities.includes("web_research") &&
+              skillId === "web-research"),
+        )
+        .map(({ content }) => content)
+        .join("\n\n");
       invocationId = controlPlane.startInvocation({
         attemptId: claim.attemptId,
         engineId: engine.manifest.profileId,
@@ -1476,6 +1515,19 @@ export async function runWork(
               candidate.summary,
               skillGuidance
                 ? `Assigned portable skill guidance:\n${skillGuidance}`
+                : "",
+              requiredTools.length > 0
+                ? [
+                    "Required execution evidence:",
+                    ...requiredTools.map(
+                      (toolName) =>
+                        `- A successful ${toolName} result is required before final submission.`,
+                    ),
+                    "Do not return a completion artifact until every required tool succeeds.",
+                  ].join("\n")
+                : "",
+              replayedEvidence.length > 0
+                ? "An exact human-approved pending tool call was replayed successfully in this run. Inspect the resulting workspace state before final submission."
                 : "",
             ].filter(Boolean).join("\n\n"),
             acceptanceCriteria: [
@@ -1493,6 +1545,19 @@ export async function runWork(
         { engine, toolRuntime, signal: runController.signal },
       );
       const result = await runner.result(handle.hostRunId);
+      const successfulTools = new Set(
+        [...replayedEvidence, ...result.toolEvidence]
+          .filter(({ status }) => status === "succeeded")
+          .map(({ toolName }) => toolName),
+      );
+      const missingRequiredTools = requiredTools.filter(
+        (toolName) => !successfulTools.has(toolName),
+      );
+      if (missingRequiredTools.length > 0) {
+        throw new Error(
+          `REQUIRED_TOOL_EVIDENCE_MISSING: ${missingRequiredTools.join(", ")}`,
+        );
+      }
       controlPlane.finishInvocation({
         id: invocationId,
         status: "succeeded",
@@ -1509,6 +1574,7 @@ export async function runWork(
         idempotencyKey: `cli:submit:${candidate.id}:${claim.generation}`,
       });
       const runResult = {
+        status: "submitted_for_review" as const,
         workItemId: submission.workItem.id,
         artifactId: submission.artifactId,
         sha256: submission.sha256,
@@ -1524,10 +1590,39 @@ export async function runWork(
       return runResult;
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error);
+      if (error instanceof ToolApprovalRequiredError && claim) {
+        controlPlane.recordPendingToolCall({
+          id: candidate.id,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
+          callHash: error.callHash,
+          toolName: error.toolName,
+          arguments: error.call.arguments,
+          createdAt: new Date().toISOString(),
+          actor: "runner:local",
+        });
+        const pendingResult = {
+          status: "approval_required" as const,
+          workItemId: candidate.id,
+          callHash: error.callHash,
+          toolName: error.toolName,
+          generation: claim.generation,
+        };
+        if (options.json) {
+          writeJsonEnvelope("run", pendingResult);
+        } else if (!options.quiet) {
+          console.log(
+            `${candidate.id} is waiting for exact human tool approval (${error.callHash}).`,
+          );
+        }
+        return pendingResult;
+      }
       const errorCode = rawMessage.startsWith("STRUCTURED_ARTIFACT_INVALID")
         ? "STRUCTURED_ARTIFACT_INVALID"
         : rawMessage.startsWith("TOOL_APPROVAL_REQUIRED")
           ? "TOOL_APPROVAL_REQUIRED"
+          : rawMessage.startsWith("REQUIRED_TOOL_EVIDENCE_MISSING")
+            ? "REQUIRED_TOOL_EVIDENCE_MISSING"
           : rawMessage.startsWith("TOOL_ITERATION_LIMIT")
             ? "TOOL_ITERATION_LIMIT"
             : rawMessage.startsWith("RUN_CANCELED") ||
@@ -1556,6 +1651,8 @@ export async function runWork(
             ? "The model did not return a valid structured artifact."
             : errorCode === "TOOL_APPROVAL_REQUIRED"
               ? rawMessage
+              : errorCode === "REQUIRED_TOOL_EVIDENCE_MISSING"
+                ? rawMessage
               : errorCode === "TOOL_ITERATION_LIMIT"
                 ? "The model exceeded the OrgSpec tool iteration limit."
                 : errorCode === "RUN_CANCELED"
@@ -1866,9 +1963,44 @@ function printItems(target: string, args: string[]): void {
 
 function requestWork(target: string, args: string[]): void {
   const title = option(args, "--title") ?? args.filter((arg) => !arg.startsWith("--"))[1];
-  const summary = option(args, "--summary") ?? title;
+  const encodedSummary = option(args, "--summary-base64");
+  let decodedSummary: string | undefined;
+  if (encodedSummary !== undefined) {
+    if (
+      encodedSummary.length === 0 ||
+      encodedSummary.length > 87_384 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/u.test(encodedSummary) ||
+      encodedSummary.length % 4 !== 0
+    ) {
+      throw new Error(
+        "--summary-base64 must be canonical base64 for at most 65536 UTF-8 bytes.",
+      );
+    }
+    const bytes = Buffer.from(encodedSummary, "base64");
+    if (
+      bytes.byteLength > 65_536 ||
+      bytes.toString("base64") !== encodedSummary
+    ) {
+      throw new Error(
+        "--summary-base64 must be canonical base64 for at most 65536 UTF-8 bytes.",
+      );
+    }
+    decodedSummary = bytes.toString("utf8");
+    if (
+      Buffer.from(decodedSummary, "utf8").compare(bytes) !== 0 ||
+      decodedSummary.trim().length === 0
+    ) {
+      throw new Error("--summary-base64 must decode to non-empty UTF-8 text.");
+    }
+  }
+  if (option(args, "--summary") !== undefined && decodedSummary !== undefined) {
+    throw new Error("Use only one of --summary or --summary-base64.");
+  }
+  const summary = option(args, "--summary") ?? decodedSummary ?? title;
   if (!title || !summary) {
-    throw new Error("request requires a title or --title and --summary.");
+    throw new Error(
+      "request requires a title and optionally --summary or --summary-base64.",
+    );
   }
   const { database, controlPlane } = controlPlaneFor(target);
   try {
@@ -1877,6 +2009,7 @@ function requestWork(target: string, args: string[]): void {
       summary,
       actor: "human:cli",
       idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+      requiredTools: options(args, "--require-tool"),
     });
     if (has(args, "--json")) writeJsonEnvelope("request", item);
     else console.log(`${item.id} created. Next action: ${item.nextAction}`);
@@ -2175,13 +2308,22 @@ function printToolEvidence(target: string, args: string[]): void {
   const { database, controlPlane } = controlPlaneFor(target);
   try {
     const evidence = controlPlane.listToolEvidence(id);
+    const pending = controlPlane.listPendingToolCalls(id);
     if (has(args, "--json")) {
-      writeJsonEnvelope("tool-evidence", { items: evidence });
+      writeJsonEnvelope("tool-evidence", {
+        items: evidence,
+        pendingToolCalls: pending,
+      });
       return;
     }
     for (const item of evidence) {
       console.log(
         `${item.id} | ${item.status} | ${item.toolName} | ${item.callHash}`,
+      );
+    }
+    for (const item of pending) {
+      console.log(
+        `${item.id} | ${item.status} | ${item.toolName} | ${item.callHash} | ${JSON.stringify(item.arguments)}`,
       );
     }
   } finally {
@@ -2311,7 +2453,8 @@ Commands:
   chartermesh system pause --reason TEXT --target PATH
   chartermesh system resume --target PATH
   chartermesh seed-demo --target PATH
-  chartermesh request "work title" --target PATH [--json]
+  chartermesh request "work title" --target PATH
+    [--summary TEXT | --summary-base64 BASE64] [--require-tool TOOL] [--json]
   chartermesh triage --id WORK --role ROLE --target PATH [--json]
   chartermesh list --target PATH [--json] [--limit N --cursor CURSOR]
     [--active-only] [--include-archived]

@@ -14,6 +14,10 @@ writing, proposes a project-aware organization, generates an immutable plan
 hash, and waits for a human to approve that exact hash. A human or shell script
 can use the same versioned CLI contract.
 
+처음 설치하고 운영하는 사용자는
+[`한국어 사용자 설명서`](docs/USER-GUIDE.ko.md)를 따라 전체 흐름을
+확인할 수 있습니다.
+
 ## Why any LLM can be the engine
 
 - `ModelEngine` handles inference behind a small provider-neutral contract.
@@ -271,10 +275,12 @@ until a human approves the exact call hash:
 
 ```powershell
 node bin/chartermesh.mjs approve-tool --id work-000001 --call-hash CALL_SHA256 --tool workspace.write_file --target TARGET
-node bin/chartermesh.mjs retry --id work-000001 --target TARGET
 node bin/chartermesh.mjs run --id work-000001 --target TARGET
 node bin/chartermesh.mjs tool-evidence --id work-000001 --target TARGET --json
 ```
+
+The unapproved call waits without changing the WorkItem to failed. Exact human
+approval returns it to ready, and the next `run` uses a new fenced generation.
 
 ## Local files added to a target
 
@@ -307,6 +313,7 @@ All default tests are offline and free. Live model calls require `--live`.
 Key documents:
 
 - [`BOOTSTRAP.md`](BOOTSTRAP.md) — universal application protocol
+- [`docs/USER-GUIDE.ko.md`](docs/USER-GUIDE.ko.md) — 한국어 사용자 설명서
 - [`docs/FIRST-RUN.md`](docs/FIRST-RUN.md) — first configuration
 - [`docs/LLM-CONNECTIONS.md`](docs/LLM-CONNECTIONS.md) — model connection guide
 - [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md) — small-model experiment

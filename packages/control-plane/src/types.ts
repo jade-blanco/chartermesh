@@ -138,6 +138,29 @@ export interface ToolCallApproval {
   createdAt: string;
 }
 
+export interface ArtifactReviewDecision {
+  id: string;
+  workItemId: string;
+  artifactHash: string;
+  decision: "approve" | "changes_requested" | "reject";
+  note: string;
+  actor: string;
+  createdAt: string;
+}
+
+export interface PendingToolCall {
+  id: string;
+  workItemId: string;
+  runId: string;
+  attemptId: string;
+  callHash: string;
+  toolName: string;
+  arguments: unknown;
+  status: "approval_required" | "executed";
+  createdAt: string;
+  executedAt: string | null;
+}
+
 export interface ToolExecutionEvidenceRecord {
   id: string;
   workItemId: string;

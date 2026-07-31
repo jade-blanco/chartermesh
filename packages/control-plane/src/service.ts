@@ -9,12 +9,14 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
   AuditRecord,
+  ArtifactReviewDecision,
   ArtifactEvidence,
   DashboardProjection,
   ModelInvocationRecord,
   OperationalState,
   OutboxDelivery,
   OutboxRecord,
+  PendingToolCall,
   RuntimeBudgets,
   ScheduleTickRecord,
   ToolCallApproval,
@@ -311,7 +313,7 @@ export class ControlPlane {
     if (!this.budgets) return;
     const active = this.database
       .prepare(
-        "SELECT COUNT(*) AS count FROM runs WHERE status IN ('running', 'waiting')",
+        "SELECT COUNT(*) AS count FROM runs WHERE status = 'running'",
       )
       .get() as Row;
     if (Number(active.count) >= this.budgets.maxConcurrentRuns) {
@@ -888,6 +890,7 @@ export class ControlPlane {
     idempotencyKey: string;
     parentId?: string;
     rootId?: string;
+    requiredTools?: string[];
   }): WorkItem {
     return this.command(input.idempotencyKey, "intake", () => {
       const id = this.nextId("work");
@@ -914,9 +917,41 @@ export class ControlPlane {
           stamp,
           stamp,
         );
+      const requiredTools = [
+        ...new Set(
+          (input.requiredTools ?? []).map((toolName) =>
+            assertText(toolName, "required tool")
+          ),
+        ),
+      ];
+      if (requiredTools.length > 20) {
+        throw new Error("A work item can require at most 20 tools.");
+      }
+      for (const toolName of requiredTools) {
+        this.database
+          .prepare(`
+            INSERT INTO work_item_required_tools(
+              work_item_id, tool_name, created_at
+            ) VALUES (?, ?, ?)
+          `)
+          .run(id, toolName, stamp);
+      }
       this.event("work.intake.created", id, input.actor, { rootId });
       return this.get(id);
     });
+  }
+
+  requiredTools(id: string): string[] {
+    this.get(id);
+    const rows = this.database
+      .prepare(`
+        SELECT tool_name
+        FROM work_item_required_tools
+        WHERE work_item_id = ?
+        ORDER BY tool_name
+      `)
+      .all(id) as Row[];
+    return rows.map((row) => String(row.tool_name));
   }
 
   triage(input: {
@@ -1688,6 +1723,30 @@ export class ControlPlane {
     });
   }
 
+  latestArtifactDecision(id: string): ArtifactReviewDecision | null {
+    this.get(id);
+    const row = this.database
+      .prepare(`
+        SELECT id, work_item_id, artifact_hash, decision, note, actor,
+               created_at
+        FROM approvals
+        WHERE work_item_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(id) as Row | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      workItemId: String(row.work_item_id),
+      artifactHash: String(row.artifact_hash),
+      decision: String(row.decision) as ArtifactReviewDecision["decision"],
+      note: String(row.note),
+      actor: String(row.actor),
+      createdAt: String(row.created_at),
+    };
+  }
+
   complete(input: {
     id: string;
     actor: string;
@@ -1927,6 +1986,261 @@ export class ControlPlane {
     return rows.map(asInvocation);
   }
 
+  recordPendingToolCall(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    callHash: string;
+    toolName: string;
+    arguments: unknown;
+    createdAt: string;
+    actor: string;
+  }): PendingToolCall {
+    return this.command(
+      `pending-tool:${input.id}:${input.callHash}`,
+      "tool.pending.record",
+      () => {
+        const current = this.get(input.id);
+        if (current.status !== "in_progress") {
+          throw new Error(
+            "Only in-progress work can wait for tool approval.",
+          );
+        }
+        if (!/^[a-f0-9]{64}$/u.test(input.callHash)) {
+          throw new Error("callHash must be a SHA-256 digest.");
+        }
+        const argumentsJson = JSON.stringify(input.arguments);
+        if (
+          argumentsJson === undefined ||
+          Buffer.byteLength(argumentsJson, "utf8") > 300_000
+        ) {
+          throw new Error(
+            "Pending tool arguments must be JSON of at most 300000 bytes.",
+          );
+        }
+        const parsedArguments = JSON.parse(argumentsJson) as unknown;
+        if (
+          parsedArguments &&
+          typeof parsedArguments === "object" &&
+          !Array.isArray(parsedArguments) &&
+          typeof (parsedArguments as Record<string, unknown>).unparsed ===
+            "string"
+        ) {
+          throw new Error(
+            "Pending tool arguments must be fully parsed before approval.",
+          );
+        }
+        const pending: PendingToolCall = {
+          id: `pending-tool-${randomUUID()}`,
+          workItemId: input.id,
+          runId: input.runId,
+          attemptId: input.attemptId,
+          callHash: input.callHash,
+          toolName: assertText(input.toolName, "toolName"),
+          arguments: parsedArguments,
+          status: "approval_required",
+          createdAt: input.createdAt,
+          executedAt: null,
+        };
+        this.database
+          .prepare(`
+            INSERT INTO pending_tool_calls(
+              id, work_item_id, run_id, attempt_id, call_hash, tool_name,
+              arguments_json, status, created_at, executed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+          `)
+          .run(
+            pending.id,
+            pending.workItemId,
+            pending.runId,
+            pending.attemptId,
+            pending.callHash,
+            pending.toolName,
+            argumentsJson,
+            pending.status,
+            pending.createdAt,
+          );
+        const stamp = now();
+        const run = this.database
+          .prepare(`
+            SELECT id
+            FROM runs
+            WHERE id = ? AND work_item_id = ? AND status = 'running'
+          `)
+          .get(input.runId, input.id) as Row | undefined;
+        if (!run) {
+          throw new Error("Active run was not found for tool approval.");
+        }
+        const attempt = this.database
+          .prepare(`
+            SELECT id
+            FROM attempts
+            WHERE id = ? AND run_id = ? AND status = 'running'
+          `)
+          .get(input.attemptId, input.runId) as Row | undefined;
+        if (!attempt) {
+          throw new Error("Active attempt was not found for tool approval.");
+        }
+        const invocationRows = this.database
+          .prepare(`
+            SELECT id
+            FROM model_invocations
+            WHERE attempt_id = ? AND status = 'running'
+          `)
+          .all(input.attemptId) as Row[];
+        this.database
+          .prepare(`
+            UPDATE model_invocations
+            SET status = 'succeeded', measurement_status = 'unknown',
+                finished_at = ?
+            WHERE attempt_id = ? AND status = 'running'
+          `)
+          .run(stamp, input.attemptId);
+        for (const invocation of invocationRows) {
+          this.event(
+            "model.invocation.succeeded",
+            input.id,
+            "runner:local",
+            {
+              invocationId: String(invocation.id),
+              status: "succeeded",
+              measurementStatus: "unknown",
+            },
+          );
+        }
+        this.database
+          .prepare(`
+            UPDATE attempts
+            SET status = 'waiting'
+            WHERE id = ? AND run_id = ? AND status = 'running'
+          `)
+          .run(input.attemptId, input.runId);
+        this.database
+          .prepare(`
+            UPDATE runs
+            SET status = 'waiting'
+            WHERE id = ? AND work_item_id = ? AND status = 'running'
+          `)
+          .run(input.runId, input.id);
+        this.database
+          .prepare(`
+            UPDATE leases
+            SET released_at = ?
+            WHERE run_id = ? AND attempt_id = ? AND released_at IS NULL
+          `)
+          .run(stamp, input.runId, input.attemptId);
+        this.database
+          .prepare(`
+            UPDATE work_items
+            SET availability = 'approval_waiting',
+                wait_type = 'approval',
+                wait_reason = 'Review the proposed tool change.',
+                wait_reference = ?,
+                wait_created_by = ?,
+                next_action = 'Review the proposed tool change.',
+                version = version + 1,
+                updated_at = ?
+            WHERE id = ?
+          `)
+          .run(input.callHash, input.actor, stamp, input.id);
+        this.event("tool.approval.required", input.id, input.actor, {
+          callHash: pending.callHash,
+          toolName: pending.toolName,
+        });
+        return pending;
+      },
+    );
+  }
+
+  listPendingToolCalls(id: string): PendingToolCall[] {
+    this.get(id);
+    const rows = this.database
+      .prepare(`
+        SELECT *
+        FROM pending_tool_calls
+        WHERE work_item_id = ?
+        ORDER BY created_at, id
+      `)
+      .all(id) as Row[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      workItemId: String(row.work_item_id),
+      runId: String(row.run_id),
+      attemptId: String(row.attempt_id),
+      callHash: String(row.call_hash),
+      toolName: String(row.tool_name),
+      arguments: JSON.parse(String(row.arguments_json)) as unknown,
+      status: String(row.status) as PendingToolCall["status"],
+      createdAt: String(row.created_at),
+      executedAt: row.executed_at ? String(row.executed_at) : null,
+    }));
+  }
+
+  approvedPendingToolCall(id: string): PendingToolCall | null {
+    this.get(id);
+    const row = this.database
+      .prepare(`
+        SELECT p.*
+        FROM pending_tool_calls p
+        JOIN tool_approvals a
+          ON a.work_item_id = p.work_item_id
+         AND a.call_hash = p.call_hash
+         AND a.tool_name = p.tool_name
+        WHERE p.work_item_id = ?
+          AND p.status = 'approval_required'
+        ORDER BY p.created_at, p.id
+        LIMIT 1
+      `)
+      .get(id) as Row | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      workItemId: String(row.work_item_id),
+      runId: String(row.run_id),
+      attemptId: String(row.attempt_id),
+      callHash: String(row.call_hash),
+      toolName: String(row.tool_name),
+      arguments: JSON.parse(String(row.arguments_json)) as unknown,
+      status: String(row.status) as PendingToolCall["status"],
+      createdAt: String(row.created_at),
+      executedAt: row.executed_at ? String(row.executed_at) : null,
+    };
+  }
+
+  markPendingToolCallExecuted(input: {
+    id: string;
+    callHash: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolCall {
+    return this.command(input.idempotencyKey, "tool.pending.executed", () => {
+      const pending = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (!pending) throw new Error("Pending tool call does not exist.");
+      if (pending.status !== "approval_required") {
+        throw new Error("Pending tool call is not awaiting execution.");
+      }
+      const executedAt = now();
+      this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'executed', executed_at = ?
+          WHERE work_item_id = ? AND call_hash = ?
+        `)
+        .run(executedAt, input.id, input.callHash);
+      this.event("tool.pending.executed", input.id, input.actor, {
+        callHash: pending.callHash,
+        toolName: pending.toolName,
+      });
+      return {
+        ...pending,
+        status: "executed",
+        executedAt,
+      };
+    });
+  }
+
   approveToolCall(input: {
     id: string;
     callHash: string;
@@ -1936,7 +2250,7 @@ export class ControlPlane {
     idempotencyKey: string;
   }): ToolCallApproval {
     return this.command(input.idempotencyKey, "tool.approve", () => {
-      this.get(input.id);
+      const current = this.get(input.id);
       if (!input.actor.startsWith("human:")) {
         throw new Error("Tool approval authority must be a human actor.");
       }
@@ -1944,6 +2258,25 @@ export class ControlPlane {
         throw new Error("callHash must be a SHA-256 digest.");
       }
       const toolName = assertText(input.toolName, "toolName");
+      if (
+        current.status !== "in_progress" ||
+        current.availability !== "approval_waiting" ||
+        current.wait?.type !== "approval" ||
+        current.wait.reference !== input.callHash
+      ) {
+        throw new Error("Work is not actively waiting for this tool approval.");
+      }
+      const pending = this.database
+        .prepare(`
+          SELECT id
+          FROM pending_tool_calls
+          WHERE work_item_id = ? AND call_hash = ? AND tool_name = ?
+            AND status = 'approval_required'
+        `)
+        .get(input.id, input.callHash, toolName) as Row | undefined;
+      if (!pending) {
+        throw new Error("Pending tool call does not exist.");
+      }
       const approvalId = this.nextId("tool-approval");
       const createdAt = now();
       this.database
@@ -1961,6 +2294,39 @@ export class ControlPlane {
           assertText(input.note, "note"),
           createdAt,
         );
+      this.database
+        .prepare(`
+          UPDATE attempts
+          SET status = 'succeeded', finished_at = ?
+          WHERE id IN (
+            SELECT attempt_id
+            FROM pending_tool_calls
+            WHERE work_item_id = ? AND call_hash = ?
+          ) AND status = 'waiting'
+        `)
+        .run(createdAt, input.id, input.callHash);
+      this.database
+        .prepare(`
+          UPDATE runs
+          SET status = 'succeeded', finished_at = ?
+          WHERE id IN (
+            SELECT run_id
+            FROM pending_tool_calls
+            WHERE work_item_id = ? AND call_hash = ?
+          ) AND status = 'waiting'
+        `)
+        .run(createdAt, input.id, input.callHash);
+      this.database
+        .prepare(`
+          UPDATE work_items
+          SET status = 'ready', availability = 'ready',
+              wait_type = NULL, wait_reason = NULL, wait_reference = NULL,
+              resume_at = NULL, wait_created_by = NULL,
+              next_action = 'Run the exact approved tool call.',
+              version = version + 1, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(createdAt, input.id);
       this.event("tool.approved", input.id, input.actor, {
         approvalId,
         callHash: input.callHash,
@@ -2227,9 +2593,44 @@ export class ControlPlane {
       includeCompleted: true,
     });
     const workItems = page.items;
+    const pendingToolApprovalIds = new Set(
+      (
+        this.database
+          .prepare(`
+            SELECT pending.work_item_id, pending.arguments_json
+            FROM pending_tool_calls pending
+            LEFT JOIN tool_approvals approval
+              ON approval.work_item_id = pending.work_item_id
+             AND approval.call_hash = pending.call_hash
+             AND approval.tool_name = pending.tool_name
+            WHERE pending.status = 'approval_required'
+              AND approval.id IS NULL
+          `)
+          .all() as Row[]
+      ).flatMap((row) => {
+        try {
+          const argumentsValue = JSON.parse(String(row.arguments_json)) as
+            | Record<string, unknown>
+            | unknown;
+          if (
+            argumentsValue &&
+            typeof argumentsValue === "object" &&
+            !Array.isArray(argumentsValue) &&
+            typeof argumentsValue.unparsed === "string"
+          ) {
+            return [];
+          }
+          return [String(row.work_item_id)];
+        } catch {
+          return [];
+        }
+      }),
+    );
     const userActions = workItems
       .filter(({ status }) => !["done", "canceled"].includes(status))
-      .map((item) => this.projectAction(item))
+      .map((item) =>
+        this.projectAction(item, pendingToolApprovalIds.has(item.id)),
+      )
       .sort(
         (left, right) =>
           right.priority - left.priority ||
@@ -2265,7 +2666,23 @@ export class ControlPlane {
     };
   }
 
-  private projectAction(item: WorkItem): UserAction {
+  private projectAction(
+    item: WorkItem,
+    hasPendingToolApproval = false,
+  ): UserAction {
+    if (
+      hasPendingToolApproval &&
+      item.status === "in_progress" &&
+      item.availability === "approval_waiting"
+    ) {
+      return this.action(
+        item,
+        "human_review",
+        "Review exact pending tool arguments.",
+        true,
+        110,
+      );
+    }
     if (item.status === "review_pending") {
       return this.action(item, "human_review", "Review immutable artifact.", true, 100);
     }
@@ -2273,7 +2690,13 @@ export class ControlPlane {
       return this.action(item, "user_input", item.wait?.reason ?? "Input required.", true, 90);
     }
     if (item.status === "failed") {
-      return this.action(item, "retry", "Inspect failure and retry.", true, 80);
+      return this.action(
+        item,
+        "retry",
+        "Failure is retained for inspection.",
+        false,
+        5,
+      );
     }
     if (item.status === "requested") {
       return this.action(item, "triage", "Assign role and runtime.", true, 70);

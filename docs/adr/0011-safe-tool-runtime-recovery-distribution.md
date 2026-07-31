@@ -82,8 +82,11 @@ for the latest GitHub release.
 ## Consequences
 
 - Any compatible engine receives the same policy and evidence boundary.
-- Approval-required calls end the current attempt and resume through an
-  explicit fenced retry; in-memory model continuation is not promised.
+- Approval-required calls durably pause the current Run and Attempt, release
+  their lease, and keep the WorkItem in progress without marking it failed.
+  Exact approval closes that waiting execution and returns the WorkItem to
+  ready; the next `run` creates a new fenced generation. In-memory model
+  continuation is not promised.
 - Tool output needed by a model remains bounded and ephemeral.
 - Apply recovery is conservative and stops on evidence of external edits.
 - Node.js 24 or newer is required both for source execution and package build.

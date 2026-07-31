@@ -34,7 +34,7 @@ export function openControlPlaneDatabase(
         )
         .get() as { version: number };
       const priorVersion = Number(row.version);
-      if (priorVersion > 0 && priorVersion < 7) {
+      if (priorVersion > 0 && priorVersion < 8) {
         createControlPlaneBackup(
           database,
           join(dirname(path), "backups"),
@@ -356,6 +356,34 @@ export function openControlPlaneDatabase(
 
     CREATE INDEX IF NOT EXISTS tool_evidence_work_idx
       ON tool_evidence(work_item_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS pending_tool_calls (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      call_hash TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      arguments_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      executed_at TEXT,
+      UNIQUE(work_item_id, call_hash),
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id),
+      FOREIGN KEY(run_id) REFERENCES runs(id),
+      FOREIGN KEY(attempt_id) REFERENCES attempts(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS pending_tool_calls_work_idx
+      ON pending_tool_calls(work_item_id, status, created_at);
+
+    CREATE TABLE IF NOT EXISTS work_item_required_tools (
+      work_item_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(work_item_id, tool_name),
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
+    );
   `);
   database
     .prepare(`
@@ -379,6 +407,12 @@ export function openControlPlaneDatabase(
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (7, ?)
+    `)
+    .run(new Date().toISOString());
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (8, ?)
     `)
     .run(new Date().toISOString());
   return database;

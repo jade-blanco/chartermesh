@@ -46,9 +46,17 @@ Team Console의 첫 화면은 status 통계보다 `누가 지금 무엇을 해�
 
 `UserAction`은 최소한 category, reason, actor, CTA, actionable,
 blockedBy, priority와 선택적 expiresAt을 가진다. 우선순위는 사람 검토,
-사용자 입력, 실패 복구, 미배정 intake, 변경 요청 재개, 시작 가능 작업,
-가시적 대기 순이다. 일반 대기는 화면에는 남지만 actionable count에는
-들어가지 않는다.
+사용자 입력, 미배정 intake, 변경 요청 재개, 시작 가능 작업, 가시적 대기
+순이다. 실패한 WorkItem은 검사와 명시적 수동 재시도를 위한 이력으로
+보존하지만 actionable 또는 사람 검토 수에 포함하지 않는다. 일반 대기도
+화면에는 남지만 actionable count에는 들어가지 않는다. 첫 화면의 기본
+필터는 실제 actionable 작업이다.
+
+사람 검토에는 현재 진행을 막고 있는 최신 artifact 결정과 정확한 tool-call
+승인만 들어간다. `changes_requested`는 검토가 끝난 뒤 담당 role/runner가
+보완할 작업이며 사람 검토로 다시 세지 않는다. 대신 최신 검토 결정과
+사유를 WorkItem 옆에 보존해 무엇을 수정해야 하는지 바로 읽을 수 있어야
+한다.
 
 모든 대기는 `WaitCondition`으로 표현한다.
 

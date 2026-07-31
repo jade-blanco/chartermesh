@@ -9,7 +9,7 @@ import {
 
 test("portable skills are complete Apache-2.0 Agent Skills packages", () => {
   const documents = portableSkillDocuments();
-  assert.equal(documents.length, 4);
+  assert.equal(documents.length, 5);
   for (const document of documents) {
     assert.match(document.content, /^---\r?\n/u);
     assert.match(document.content, /\nname: [a-z0-9-]+\r?\n/u);

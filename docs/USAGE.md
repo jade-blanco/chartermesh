@@ -73,9 +73,9 @@ the machine. The adapter refuses redirects, credentials in the endpoint, and
 unbounded responses, and it returns search-result metadata without fetching
 the linked pages.
 
-An unapproved write fails visibly without touching the file and prints its
-canonical call hash. A human can approve that exact call, then start a fenced
-retry:
+An unapproved write pauses visibly without touching the file and prints its
+canonical call hash. A human can approve that exact call, which returns the
+WorkItem to ready, then start a new fenced run:
 
 ```powershell
 node bin/chartermesh.mjs approve-tool `
@@ -85,7 +85,6 @@ node bin/chartermesh.mjs approve-tool `
   --note "Exact path and content hash reviewed." `
   --target TARGET
 
-node bin/chartermesh.mjs retry --id work-000001 --target TARGET
 node bin/chartermesh.mjs run --id work-000001 --target TARGET
 node bin/chartermesh.mjs tool-evidence --id work-000001 --target TARGET --json
 ```
@@ -147,8 +146,12 @@ node bin/chartermesh.mjs resume --id work-000001 --target TARGET
 node bin/chartermesh.mjs dashboard --target TARGET --port 4173
 ```
 
-The inspector exposes the appropriate action for each state: triage, run,
-retry, review, or complete. Review shows artifact content and exact hash.
+The default view contains only current actionable work. Failed items remain
+available from the failure or all-work filter, but do not inflate action or
+human-review counts. The inspector exposes the appropriate action for each
+state: triage, run, explicit failed-work retry, review, or complete. Review
+shows artifact content and exact hash; requested changes show the latest human
+review note.
 Every action remains a Control Plane command with actor and idempotency.
 Loopback requests also have separate per-minute limits for all APIs, mutations,
 and model-run starts. A limited request returns `429` with `Retry-After`.

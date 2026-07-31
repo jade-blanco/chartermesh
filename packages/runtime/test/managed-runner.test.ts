@@ -91,6 +91,11 @@ test("small-model prompt separates performed checks from proposed checks", async
   assert.match(system, /Never claim an action, inspection, test/u);
   assert.match(user, /If no check was performed, return `checks: \[\]`/u);
   assert.match(user, /using future tense/u);
+  assert.match(user, /task packet's primary language/u);
+  assert.match(system, /raw file text after one JSON transport encoding/u);
+  assert.match(user, /Do not JSON-encode the file text a second time/u);
+  assert.match(user, /prefer replacement mode/u);
+  assert.match(user, /expectedOccurrences/u);
 });
 
 test("runner repairs one invalid response and accounts for both turns", async () => {

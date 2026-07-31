@@ -23,10 +23,18 @@ The first screen answers:
   response for the full model call.
 - Inspect immutable artifact content and exact SHA-256.
 - Approve, request changes, or reject.
-- Recover failed work to ready and run a new generation.
+- Inspect failed history and explicitly recover it to ready when a human chooses
+  to retry it. Failure does not count as current action or human review.
 - Complete approved work.
 - Archive completed or canceled work without deleting its evidence.
-- Filter all, actionable, waiting, and completed work.
+- Default to actionable work, with explicit filters for all, waiting, failed,
+  and completed work.
+
+An exact tool approval appears under human review only while its WorkItem is
+actively waiting for that hash. A failed WorkItem may retain the historical
+pending-call record for audit, but the dashboard must not present that record
+as an approval request. `changes_requested` displays the latest reviewer note
+and is categorized as role/runner rework, not human review.
 
 The inspector derives actions from server-projected state. The browser does not
 edit database rows or invent transitions.

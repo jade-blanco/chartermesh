@@ -186,8 +186,10 @@ Never report credential values or unrelated absolute paths.
   generation.
 - Active run no longer needed: use `cancel --id WORK`; dashboard cancel and
   foreground Ctrl+C write the same Control Plane cancellation request.
-- `TOOL_APPROVAL_REQUIRED`: show the exact call hash and tool name, obtain a
-  human `approve-tool` command, then use `retry` and start a new generation.
+- `TOOL_APPROVAL_REQUIRED`: keep the WorkItem in an explicit approval wait,
+  show the exact call hash and tool name, obtain a human `approve-tool`
+  command, then use `run` to start a new fenced generation. Do not classify
+  the approval wait as a failure.
 - Interrupted file apply: run `doctor` or `recover`; do not delete the journal
   or backup files manually.
 - Restore: generate the exact `restore --backup BACKUP_ID` plan, including the

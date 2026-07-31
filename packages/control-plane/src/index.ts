@@ -21,11 +21,13 @@ export {
 } from "./outbox.ts";
 export type {
   AuditRecord,
+  ArtifactReviewDecision,
   ArtifactEvidence,
   ModelInvocationRecord,
   OperationalState,
   OutboxDelivery,
   OutboxRecord,
+  PendingToolCall,
   RuntimeBudgets,
   Availability,
   DashboardProjection,

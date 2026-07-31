@@ -26,9 +26,16 @@ one transaction. Artifact submission is fenced by run generation. Human review
 binds the exact immutable artifact hash.
 
 The dashboard consumes a server-generated `DashboardProjection`. It derives
-`UserAction` objects that prioritize human review, user input, failure recovery,
-triage, resume, and start. Explicit waits remain visible and state why and when
-they can resume, but non-actionable waits do not inflate the actionable count.
+`UserAction` objects that prioritize human review, user input, triage, resume,
+and start. A failed WorkItem is retained as inspectable history and may expose
+an explicit manual retry, but is not counted as actionable or human review.
+Explicit waits remain visible and state why and when they can resume, but
+non-actionable waits do not inflate the actionable count.
+
+The default dashboard filter shows actionable work. Human review includes only
+an active artifact decision or exact tool-call approval that currently blocks
+progress. `changes_requested` is role/runner rework rather than another human
+review; the latest human review note remains visible beside that work.
 
 ## Consequences
 

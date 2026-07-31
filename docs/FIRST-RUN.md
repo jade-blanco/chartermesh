@@ -3,6 +3,10 @@
 This guide starts offline, applies an exact approved plan, exercises the whole
 review loop, and only then connects a live model.
 
+For an integrated Korean guide covering installation, dashboard state,
+approvals, model connection, operations, and troubleshooting, see
+[`USER-GUIDE.ko.md`](USER-GUIDE.ko.md).
+
 ## 1. Prepare CharterMesh
 
 GitHub package path, with no manual source checkout:

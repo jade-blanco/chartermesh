@@ -18,16 +18,16 @@
         </a>
         <nav>
           <a class="nav-item active" href="/" aria-current="page">
-            <span aria-hidden="true">⌂</span> 오늘
+            <span aria-hidden="true">◉</span> 오늘
           </a>
           <button class="nav-item" type="button" data-filter-nav="all">
-            <span aria-hidden="true">≡</span> 작업
+            <span aria-hidden="true">□</span> 작업
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
             <span aria-hidden="true">✓</span> 승인 <small>준비 중</small>
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
-            <span aria-hidden="true">◷</span> 실행·일정 <small>준비 중</small>
+            <span aria-hidden="true">↻</span> 실행·일정 <small>준비 중</small>
           </button>
           <button class="nav-item reserved" type="button" disabled title="준비 중">
             <span aria-hidden="true">◇</span> 조직 <small>준비 중</small>
@@ -38,7 +38,7 @@
         </nav>
         <div class="local-note">
           <span class="health-dot" aria-hidden="true"></span>
-          <div><strong>로컬 제어면</strong><small>단일 상태 저장소</small></div>
+          <div><strong>로컬 제어면</strong><small>파일 기반 상태 저장소</small></div>
         </div>
       </aside>
 
@@ -55,37 +55,37 @@
         </header>
 
         <section class="summary-grid" aria-label="운영 요약">
-          <article class="summary-card blue">
+          <button class="summary-card blue" type="button" data-summary-filter="actionable" aria-pressed="true" aria-controls="work-results">
             <div><span class="summary-icon" aria-hidden="true">→</span><span>지금 필요한 조치</span></div>
-            <strong id="summary-actionable">—</strong>
+            <strong id="summary-actionable">–</strong>
             <small>실행 또는 결정 가능</small>
-          </article>
-          <article class="summary-card violet">
+          </button>
+          <button class="summary-card violet" type="button" data-summary-filter="approvals" aria-pressed="false" aria-controls="work-results">
             <div><span class="summary-icon" aria-hidden="true">✓</span><span>사람 검토</span></div>
-            <strong id="summary-approvals">—</strong>
-            <small>불변 산출물 검토</small>
-          </article>
-          <article class="summary-card amber">
+            <strong id="summary-approvals">–</strong>
+            <small>불변 산출물·도구 변경 검토</small>
+          </button>
+          <button class="summary-card amber" type="button" data-summary-filter="user-input" aria-pressed="false" aria-controls="work-results">
             <div><span class="summary-icon" aria-hidden="true">?</span><span>사용자 입력</span></div>
-            <strong id="summary-input">—</strong>
-            <small>응답이 있어야 재개</small>
-          </article>
-          <article class="summary-card red">
-            <div><span class="summary-icon" aria-hidden="true">!</span><span>실패</span></div>
+            <strong id="summary-input">–</strong>
+            <small>응답을 기다리는 작업</small>
+          </button>
+          <button class="summary-card red" type="button" data-summary-filter="failed" aria-pressed="false" aria-controls="work-results">
+            <div><span class="summary-icon" aria-hidden="true">!</span><span>실패 이력</span></div>
             <strong id="summary-failed">—</strong>
-            <small>검사와 재시도 필요</small>
-          </article>
+            <small>자동 조치 없이 보존</small>
+          </button>
         </section>
 
-        <section class="workspace-card" aria-labelledby="work-heading">
+        <section class="workspace-card" id="work-results" aria-labelledby="work-heading">
           <div class="section-heading">
             <div>
               <h2 id="work-heading">작업 흐름</h2>
               <p>상태보다 다음 조치를 기준으로 정렬합니다.</p>
             </div>
             <div class="filters" role="group" aria-label="작업 필터">
-              <button class="filter active" data-filter="all" type="button" aria-pressed="true">전체</button>
-              <button class="filter" data-filter="actionable" type="button" aria-pressed="false">조치 필요</button>
+              <button class="filter" data-filter="all" type="button" aria-pressed="false">전체</button>
+              <button class="filter active" data-filter="actionable" type="button" aria-pressed="true">조치 필요</button>
               <button class="filter" data-filter="waiting" type="button" aria-pressed="false">대기 중</button>
               <button class="filter" data-filter="completed" type="button" aria-pressed="false">완료</button>
             </div>
@@ -117,7 +117,7 @@
 
         <section class="runtime-band" aria-labelledby="runtime-heading">
           <div>
-            <span class="runtime-symbol" aria-hidden="true">◎</span>
+            <span class="runtime-symbol" aria-hidden="true">⌁</span>
             <div><h2 id="runtime-heading">런타임 상태</h2><p>모델 엔진과 실행기의 연결 준비 상태</p></div>
           </div>
           <div class="runtime-items" id="runtime-items">
@@ -131,7 +131,7 @@
         <p class="eyebrow">WORK INSPECTOR</p>
         <h2 id="inspector-heading" tabindex="-1">작업을 선택하세요</h2>
         <p class="inspector-summary" id="inspector-summary">
-          표에서 작업을 선택하면 현재 상태, 다음 조치, 대기 이유와 계보를 볼 수 있습니다.
+          표에서 작업을 선택하면 현재 상태, 다음 조치, 승인 대기 변경과 계보를 볼 수 있습니다.
         </p>
         <div class="inspector-content" id="inspector-content" hidden>
           <div class="inspector-block">
@@ -150,14 +150,86 @@
             <label>대기 조건</label>
             <p id="inspector-wait"></p>
           </div>
+          <div class="inspector-block review-feedback-block" id="review-feedback-block" hidden>
+            <label>수정 요청 내용</label>
+            <strong>검토자가 산출물 수정을 요청했습니다.</strong>
+            <p id="review-feedback-note"></p>
+            <small id="review-feedback-meta"></small>
+          </div>
+          <div class="inspector-block tool-approval-block" id="tool-approval-block" hidden>
+            <div class="approval-heading">
+              <div>
+                <label>결재 요청</label>
+                <strong id="tool-change-title"></strong>
+              </div>
+              <span class="review-badge" id="tool-change-state"></span>
+            </div>
+            <div class="decision-brief">
+              <section class="review-section">
+                <h3>무엇이 바뀌나요?</h3>
+                <p id="tool-impact"></p>
+              </section>
+              <section class="review-section">
+                <h3>안전장치</h3>
+                <ul class="review-list safe" id="tool-safeguards"></ul>
+              </section>
+              <section class="review-section review-alert">
+                <h3>승인 전 알아둘 점</h3>
+                <p id="tool-verification"></p>
+              </section>
+            </div>
+            <details class="technical-details">
+              <summary>기술 상세 보기 <span>해시·정확한 코드 차이</span></summary>
+              <dl class="change-meta">
+                <div><dt>도구</dt><dd id="tool-name"></dd></div>
+                <div><dt>변경량</dt><dd id="tool-size"></dd></div>
+              </dl>
+              <p class="hash-label">정확한 호출 해시</p>
+              <p class="mono hash-value" id="tool-call-hash"></p>
+              <pre class="artifact-preview code-preview" id="tool-content"></pre>
+            </details>
+            <p class="tool-warning" id="tool-warning" hidden></p>
+            <button class="primary-button approval-button" id="tool-approve-button" type="button" data-tool-approve>
+              위 내용을 확인하고 변경 승인
+            </button>
+          </div>
+          <div class="inspector-block artifact-review-block" id="artifact-block" hidden>
+            <div class="approval-heading">
+              <div>
+                <label>산출물 결재</label>
+                <strong id="artifact-deliverable"></strong>
+              </div>
+              <span class="review-badge" id="artifact-confidence"></span>
+            </div>
+            <p class="review-lead" id="artifact-summary"></p>
+            <section class="review-section">
+              <h3>검증 결과</h3>
+              <ul class="review-list" id="artifact-checks"></ul>
+            </section>
+            <section class="review-section review-alert">
+              <h3>확인된 위험</h3>
+              <ul class="review-list" id="artifact-risks"></ul>
+            </section>
+            <section class="review-section">
+              <h3>권장 후속 조치</h3>
+              <ul class="review-list next" id="artifact-next-actions"></ul>
+            </section>
+            <details class="technical-details">
+              <summary>기술 상세 보기 <span>원문·정확한 해시</span></summary>
+              <p class="hash-label">산출물 SHA-256</p>
+              <p class="mono hash-value" id="artifact-hash"></p>
+              <pre class="artifact-preview" id="artifact-content"></pre>
+            </details>
+          </div>
+          <div class="inspector-block review-source-block" id="task-instructions-block" hidden>
+            <details class="technical-details">
+              <summary>원래 작업 지시 보기 <span>모델 입력 원문</span></summary>
+              <p id="task-instructions"></p>
+            </details>
+          </div>
           <div class="inspector-block">
             <label>계보</label>
             <p class="mono" id="inspector-lineage"></p>
-          </div>
-          <div class="inspector-block" id="artifact-block" hidden>
-            <label>검토 산출물 · 정확한 해시</label>
-            <p class="mono" id="artifact-hash"></p>
-            <pre class="artifact-preview" id="artifact-content"></pre>
           </div>
           <div class="inspector-actions" id="inspector-actions"></div>
         </div>

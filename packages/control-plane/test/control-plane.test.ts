@@ -144,6 +144,157 @@ test("wait conditions are explicit and actionable counts exclude blocked work", 
   }
 });
 
+test("dashboard treats an unapproved pending tool call as human review", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Review exact tool arguments",
+      summary: "A pending local write must surface in the review queue.",
+      actor: "human:test",
+      idempotencyKey: "tool-review:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "tool-review:triage",
+    });
+    const claim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "tool-review:claim",
+    });
+    const callHash = "e".repeat(64);
+    controlPlane.recordPendingToolCall({
+      id: item.id,
+      runId: claim.runId,
+      attemptId: claim.attemptId,
+      callHash,
+      toolName: "workspace.write_file",
+      arguments: { path: "src/result.ts", content: "export {};\n" },
+      createdAt: new Date().toISOString(),
+      actor: "runner:test",
+    });
+
+    const beforeApproval = controlPlane.dashboard();
+    assert.equal(beforeApproval.summary.approvals, 1);
+    assert.equal(beforeApproval.userActions[0]?.category, "human_review");
+    assert.equal(beforeApproval.userActions[0]?.priority, 110);
+
+    controlPlane.approveToolCall({
+      id: item.id,
+      callHash,
+      toolName: "workspace.write_file",
+      note: "Exact arguments reviewed.",
+      actor: "human:test",
+      idempotencyKey: "tool-review:approve",
+    });
+    const afterApproval = controlPlane.dashboard();
+    assert.equal(afterApproval.summary.approvals, 0);
+    assert.notEqual(afterApproval.userActions[0]?.category, "human_review");
+
+    const malformedItem = controlPlane.intake({
+      title: "Reject malformed tool arguments",
+      summary: "Malformed arguments cannot enter the approval queue.",
+      actor: "human:test",
+      idempotencyKey: "tool-review:malformed-intake",
+    });
+    controlPlane.triage({
+      id: malformedItem.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "tool-review:malformed-triage",
+    });
+    const malformedClaim = controlPlane.claim({
+      id: malformedItem.id,
+      actor: "runner:test",
+      idempotencyKey: "tool-review:malformed-claim",
+    });
+    assert.throws(
+      () =>
+        controlPlane.recordPendingToolCall({
+          id: malformedItem.id,
+          runId: malformedClaim.runId,
+          attemptId: malformedClaim.attemptId,
+          callHash: "f".repeat(64),
+          toolName: "workspace.write_file",
+          arguments: { unparsed: "{\"path\":" },
+          createdAt: new Date().toISOString(),
+          actor: "runner:test",
+        }),
+      /fully parsed/u,
+    );
+    controlPlane.failRun({
+      id: malformedItem.id,
+      generation: malformedClaim.generation,
+      attemptId: malformedClaim.attemptId,
+      errorCode: "TOOL_ARGUMENTS_INVALID",
+      errorMessage: "Tool arguments were incomplete.",
+      actor: "runner:test",
+      idempotencyKey: "tool-review:malformed-fail",
+    });
+    const unapprovable = controlPlane.dashboard();
+    assert.equal(unapprovable.summary.approvals, 0);
+    assert.notEqual(
+      unapprovable.userActions.find(
+        ({ workItemId }) => workItemId === malformedItem.id,
+      )?.category,
+      "human_review",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("changes requested retain the human review note", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Revise one artifact",
+      summary: "The reviewer must be able to explain the requested change.",
+      actor: "human:test",
+      idempotencyKey: "review-note:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "review-note:triage",
+    });
+    const claim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "review-note:claim",
+    });
+    const submission = controlPlane.submitArtifact({
+      id: item.id,
+      content: '{"summary":"draft"}',
+      generation: claim.generation,
+      actor: "runner:test",
+      idempotencyKey: "review-note:submit",
+    });
+    controlPlane.decide({
+      id: item.id,
+      decision: "changes_requested",
+      artifactHash: submission.sha256,
+      note: "검증 결과를 첨부하고 다시 제출하세요.",
+      actor: "human:test",
+      idempotencyKey: "review-note:decision",
+    });
+    const decision = controlPlane.latestArtifactDecision(item.id);
+    assert.equal(decision?.decision, "changes_requested");
+    assert.equal(
+      decision?.note,
+      "검증 결과를 첨부하고 다시 제출하세요.",
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("idempotency replays the original response and rejects command reuse", () => {
   const { database, controlPlane } = fixture();
   try {
@@ -407,6 +558,11 @@ test("failed runs are retryable with a new fenced generation", () => {
       idempotencyKey: "retry:fail",
     });
     assert.equal(controlPlane.get(item.id).status, "failed");
+    const failedProjection = controlPlane.dashboard();
+    assert.equal(failedProjection.summary.actionable, 0);
+    assert.equal(failedProjection.summary.approvals, 0);
+    assert.equal(failedProjection.userActions[0]?.category, "retry");
+    assert.equal(failedProjection.userActions[0]?.actionable, false);
     controlPlane.retry({
       id: item.id,
       actor: "human:test",
@@ -574,7 +730,11 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
       summary: "Record only hashes and safe path evidence.",
       actor: "human:test",
       idempotencyKey: "tool:intake",
+      requiredTools: ["workspace.write_file"],
     });
+    assert.deepEqual(controlPlane.requiredTools(item.id), [
+      "workspace.write_file",
+    ]);
     controlPlane.triage({
       id: item.id,
       ownerRole: "operator",
@@ -588,6 +748,38 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
       idempotencyKey: "tool:claim",
     });
     const callHash = "a".repeat(64);
+    controlPlane.recordPendingToolCall({
+      id: item.id,
+      runId: claim.runId,
+      attemptId: claim.attemptId,
+      callHash,
+      toolName: "workspace.write_file",
+      arguments: {
+        path: "src/result.ts",
+        content: "export const result = true;\n",
+      },
+      createdAt: new Date().toISOString(),
+      actor: "runner:test",
+    });
+    const waiting = controlPlane.get(item.id);
+    assert.equal(waiting.status, "in_progress");
+    assert.equal(waiting.availability, "approval_waiting");
+    assert.equal(waiting.wait?.reference, callHash);
+    assert.equal(
+      (
+        database
+          .prepare("SELECT status FROM runs WHERE id = ?")
+          .get(claim.runId) as { status: string }
+      ).status,
+      "waiting",
+    );
+    const pending = controlPlane.listPendingToolCalls(item.id);
+    assert.equal(pending.length, 1);
+    assert.deepEqual(pending[0]?.arguments, {
+      path: "src/result.ts",
+      content: "export const result = true;\n",
+    });
+    assert.equal(controlPlane.approvedPendingToolCall(item.id), null);
     assert.equal(
       controlPlane.isToolCallApproved(
         item.id,
@@ -624,6 +816,22 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
       ),
       true,
     );
+    const ready = controlPlane.get(item.id);
+    assert.equal(ready.status, "ready");
+    assert.equal(ready.availability, "ready");
+    assert.equal(ready.wait, null);
+    assert.equal(
+      controlPlane.approvedPendingToolCall(item.id)?.callHash,
+      callHash,
+    );
+    const executed = controlPlane.markPendingToolCallExecuted({
+      id: item.id,
+      callHash,
+      actor: "runner:test",
+      idempotencyKey: "tool:pending-executed",
+    });
+    assert.equal(executed.status, "executed");
+    assert.equal(controlPlane.approvedPendingToolCall(item.id), null);
     controlPlane.recordToolEvidence({
       evidenceId: "tool-evidence-test",
       id: item.id,
