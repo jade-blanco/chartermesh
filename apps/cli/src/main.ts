@@ -2483,7 +2483,23 @@ async function evaluateCollaborationCommand(
     target,
     option(args, "--engine-id"),
   );
-  const report = await evaluateCollaboration(engine, { repetitions });
+  const reviewerEngineId = option(args, "--reviewer-engine-id");
+  const reviewerEngine = reviewerEngineId
+    ? configuredEngine(runtime, target, reviewerEngineId)
+    : undefined;
+  const fixtureIds = options(args, "--fixture");
+  const report = await evaluateCollaboration(engine, {
+    repetitions,
+    ...(fixtureIds.length > 0 ? { fixtureIds } : {}),
+    ...(reviewerEngine
+      ? {
+          delegatedEngineForRole: (role) =>
+            role === "verifier" || role === "synthesizer"
+              ? reviewerEngine
+              : engine,
+        }
+      : {}),
+  });
   if (has(args, "--json")) {
     writeJsonEnvelope("evaluate-collaboration", report);
   } else {
@@ -2617,7 +2633,7 @@ Commands:
   chartermesh scheduler list --target PATH [--schedule ID] [--json]
   chartermesh scheduler watch --target PATH [--poll-ms 30000] [--json]
   chartermesh evaluate-model --target PATH --live [--engine-id ID] [--json]
-  chartermesh evaluate-collaboration --target PATH --live
+  chartermesh evaluate-collaboration --target PATH --live [--engine-id ID] [--reviewer-engine-id ID] [--fixture ID]
     [--engine-id ID] [--repetitions 1] [--json]
   chartermesh capabilities list|recommend [--kind KIND] [--json]
   chartermesh skills list [--json]

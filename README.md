@@ -229,11 +229,16 @@ After the engine is configured and serving:
 ```powershell
 node bin/chartermesh.mjs evaluate-model --target C:\path\to\project --live --json
 node bin/chartermesh.mjs evaluate-collaboration --target C:\path\to\project --live --repetitions 3 --json
+node bin/chartermesh.mjs evaluate-collaboration --target C:\path\to\project --live `
+  --engine-id small-worker --reviewer-engine-id stronger-reviewer `
+  --fixture concurrent-claim-hardening --json
 ```
 
 The evaluation sends only three synthetic tasks. It records structure
 compliance, instruction retention, latency, and token counts when available.
-It never sends project files. See
+It never sends project files. Repeated `--fixture` options run an explicitly
+reported screening subset. A reviewer engine affects only verifier and
+synthesizer in the delegated condition. See
 [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md).
 
 ## Operate from the CLI

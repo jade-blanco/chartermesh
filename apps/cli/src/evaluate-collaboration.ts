@@ -52,6 +52,7 @@ export interface CollaborationEvaluationReport {
   };
   suiteId: "small-model-company-work-v1";
   suiteHash: string;
+  fixtureIds: string[];
   startedAt: string;
   finishedAt: string;
   repetitions: number;
@@ -358,6 +359,7 @@ export async function evaluateCollaboration(
   engine: ModelEngine,
   options: {
     repetitions?: number;
+    fixtureIds?: string[];
     delegatedEngineForRole?: Parameters<
       DelegationController["run"]
     >[1]["engineForRole"];
@@ -367,11 +369,25 @@ export async function evaluateCollaboration(
   if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 10) {
     throw new Error("repetitions must be an integer from 1 to 10.");
   }
+  const requestedFixtureIds = options.fixtureIds ?? [];
+  if (new Set(requestedFixtureIds).size !== requestedFixtureIds.length) {
+    throw new Error("fixtureIds must not contain duplicates.");
+  }
+  const selectedFixtures =
+    requestedFixtureIds.length === 0
+      ? fixtures
+      : requestedFixtureIds.map((fixtureId) => {
+          const fixture = fixtures.find(({ id }) => id === fixtureId);
+          if (!fixture) {
+            throw new Error(`Unknown collaboration fixture '${fixtureId}'.`);
+          }
+          return fixture;
+        });
   const evaluationId = `collaboration-evaluation-${randomUUID()}`;
   const startedAt = new Date().toISOString();
   const trials: CollaborationTrial[] = [];
   for (let repetition = 1; repetition <= repetitions; repetition += 1) {
-    for (const [fixtureIndex, fixture] of fixtures.entries()) {
+    for (const [fixtureIndex, fixture] of selectedFixtures.entries()) {
       const trialId = `${evaluationId}:${fixture.id}:${repetition}`;
       const delegatedFirst = (fixtureIndex + repetition) % 2 === 0;
       let single: CollaborationConditionResult;
@@ -454,6 +470,7 @@ export async function evaluateCollaboration(
     suiteHash: createHash("sha256")
       .update(JSON.stringify(fixtures))
       .digest("hex"),
+    fixtureIds: selectedFixtures.map(({ id }) => id),
     startedAt,
     finishedAt: new Date().toISOString(),
     repetitions,

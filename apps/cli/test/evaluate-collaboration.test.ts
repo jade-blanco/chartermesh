@@ -54,6 +54,11 @@ test("collaboration evaluation compares paired bounded conditions", async () => 
     single: ["scripted-evaluation"],
     delegated: ["scripted-evaluation"],
   });
+  assert.deepEqual(report.fixtureIds, [
+    "repair-relay-company-bootstrap",
+    "concurrent-claim-hardening",
+    "human-review-release-gate",
+  ]);
   assert.equal(report.aggregate.singlePassRate, 1);
   assert.equal(report.aggregate.delegatedPassRate, 1);
   assert.deepEqual(report.aggregate.observedTokens, {
@@ -124,6 +129,53 @@ test("collaboration evaluation reports hybrid role engines", async () => {
     single: ["small-worker"],
     delegated: ["small-worker", "large-reviewer"],
   });
+});
+
+test("collaboration evaluation can screen an exact fixture subset", async () => {
+  const engine: ModelEngine = {
+    manifest: {
+      kind: "model_engine",
+      profileId: "fixture-screen",
+      adapter: "scripted",
+      contractVersion: "v1alpha1",
+      capabilities: [],
+    },
+    async generate(request) {
+      return {
+        invocationId: request.invocationId,
+        text: JSON.stringify({
+          apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+          summary: "Fixture screen.",
+          deliverable: allConcepts,
+          checks: [],
+          risks: [],
+          nextActions: [],
+          confidence: "medium",
+        }),
+        toolCalls: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          cost: 0,
+          measurementStatus: "measured",
+        },
+      };
+    },
+  };
+  const report = await evaluateCollaboration(engine, {
+    fixtureIds: ["concurrent-claim-hardening"],
+  });
+  assert.deepEqual(report.fixtureIds, ["concurrent-claim-hardening"]);
+  assert.equal(report.trials.length, 1);
+  await assert.rejects(
+    evaluateCollaboration(engine, {
+      fixtureIds: ["not-a-fixture"],
+    }),
+    /Unknown collaboration fixture/u,
+  );
 });
 
 test("collaboration evaluation records a condition failure and continues", async () => {

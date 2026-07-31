@@ -91,6 +91,13 @@ node bin/chartermesh.mjs evaluate-collaboration `
   --json
 ```
 
+Use repeated `--fixture ID` options for a bounded screening subset. When the
+runtime contains more than one engine profile, `--engine-id ID` selects the
+single/planner/implementer engine and `--reviewer-engine-id ID` routes verifier
+and synthesizer stages to a second engine. The report records both engine ids
+and the exact fixture ids, so a screening run cannot be mistaken for the full
+suite.
+
 The suite is deterministic-scored and sends no project files. It measures
 constraint coverage, unsupported completion phrases, latency, stage count, and
 reported usage. It is a smoke/reference experiment, not proof of coding
@@ -115,3 +122,6 @@ recorded in
 The E4B-versus-26B, hybrid role-routing, and unified-memory investigation is
 recorded in
 [`evaluations/2026-07-31-gemma-4-model-size-and-hybrid.md`](evaluations/2026-07-31-gemma-4-model-size-and-hybrid.md).
+The expanded E4B, DeepSeek 8B NPU, Gemma 26B, and Qwen 122B tier matrix is
+recorded in
+[`evaluations/2026-07-31-local-model-tier-matrix.md`](evaluations/2026-07-31-local-model-tier-matrix.md).

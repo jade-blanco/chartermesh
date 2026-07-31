@@ -61,6 +61,11 @@ Observed input/output/cost values remain measured, estimated, or unknown
 according to the engine response. Synthetic scoring is a compatibility smoke
 test, not proof of production coding quality.
 
+The evaluator may resolve verifier and synthesizer to a second configured
+ModelEngine. This role routing is provider-neutral and the report records the
+engine ids and exact fixture subset. It does not change the normal delegated
+run path or imply that a measured hybrid is active in runtime configuration.
+
 ## Consequences
 
 - Any compatible local or remote ModelEngine can run the bounded experiment.
