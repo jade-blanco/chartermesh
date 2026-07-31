@@ -229,8 +229,6 @@ export function openControlPlaneDatabase(
       WHERE status IN ('running', 'waiting');
     CREATE INDEX IF NOT EXISTS schedule_ticks_schedule_idx
       ON schedule_ticks(schedule_id, started_at DESC);
-    CREATE INDEX IF NOT EXISTS attempts_parent_idx
-      ON attempts(run_id, parent_attempt_id, attempt_no);
   `);
   const workItemColumns = database
     .prepare("PRAGMA table_info(work_items)")

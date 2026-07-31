@@ -27,6 +27,10 @@ import {
 import {
   createArtifactWorkflowExecutor,
   createIdentityAttestingWorkflowEngine,
+  WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+  WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
+  WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
+  WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
   type WorkflowProviderIdentityObservation,
 } from "./model-executors.ts";
 import {
@@ -53,8 +57,13 @@ export type WorkflowStudyTaskBinding =
       task: CodeWorkflowTask;
     };
 
+export const WORKFLOW_STUDY_PLAN_API_VERSION =
+  "chartermesh.dev/collaboration-study-plan/v1alpha2" as const;
+export const WORKFLOW_STUDY_HARNESS_VERSION =
+  "chartermesh.dev/collaboration-study-harness/v1alpha2" as const;
+
 export interface WorkflowStudyPlan {
-  apiVersion: "chartermesh.dev/collaboration-study-plan/v1alpha1";
+  apiVersion: typeof WORKFLOW_STUDY_PLAN_API_VERSION;
   studyId: string;
   planHash: string;
   suiteHash: string;
@@ -67,7 +76,16 @@ export interface WorkflowStudyPlan {
   }>;
   conditions: string[];
   conditionOrdering: "seeded_williams_square_v1";
-  harnessVersion: "chartermesh.dev/collaboration-study-harness/v1alpha1";
+  harnessVersion: typeof WORKFLOW_STUDY_HARNESS_VERSION;
+  responseSchemaPolicy: {
+    version: typeof WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION;
+    maximumGrammarRepetition: typeof WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION;
+    oversizedBoundAction: typeof WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION;
+    acceptedOutputValidation: "original_application_contract";
+    repetitionKeywords: Array<
+      (typeof WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS)[number]
+    >;
+  };
   feedbackAdapterVersion: typeof WORKFLOW_FEEDBACK_ADAPTER_VERSION;
   feedbackInterventionHashes: {
     neutralRepeat: string;
@@ -146,8 +164,20 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
     plan.liveReady !== expectedLiveReady ||
     hash(plan.conditions) !== hash(expectedConditions) ||
     plan.conditionOrdering !== "seeded_williams_square_v1" ||
-    plan.harnessVersion !==
-      "chartermesh.dev/collaboration-study-harness/v1alpha1" ||
+    plan.apiVersion !== WORKFLOW_STUDY_PLAN_API_VERSION ||
+    plan.harnessVersion !== WORKFLOW_STUDY_HARNESS_VERSION ||
+    hash(plan.responseSchemaPolicy) !==
+      hash({
+        version: WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
+        maximumGrammarRepetition:
+          WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+        oversizedBoundAction:
+          WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
+        acceptedOutputValidation: "original_application_contract",
+        repetitionKeywords: [
+          ...WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
+        ],
+      }) ||
     plan.feedbackAdapterVersion !== WORKFLOW_FEEDBACK_ADAPTER_VERSION ||
     hash(plan.feedbackInterventionHashes) !==
       hash(expectedFeedbackHashes) ||
@@ -337,7 +367,7 @@ export function createWorkflowStudyPlan(input: {
     );
   }
   const committed = {
-    apiVersion: "chartermesh.dev/collaboration-study-plan/v1alpha1" as const,
+    apiVersion: WORKFLOW_STUDY_PLAN_API_VERSION,
     suiteHash: workflowStudyTaskBindingsHash(input.taskBindings),
     seed: input.seed,
     tasks: input.taskBindings.map((binding) => {
@@ -352,8 +382,18 @@ export function createWorkflowStudyPlan(input: {
     }),
     conditions: WORKFLOW_STUDY_CONDITIONS.map(workflowConditionId),
     conditionOrdering: "seeded_williams_square_v1" as const,
-    harnessVersion:
-      "chartermesh.dev/collaboration-study-harness/v1alpha1" as const,
+    harnessVersion: WORKFLOW_STUDY_HARNESS_VERSION,
+    responseSchemaPolicy: {
+      version: WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
+      maximumGrammarRepetition:
+        WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+      oversizedBoundAction:
+        WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
+      acceptedOutputValidation: "original_application_contract" as const,
+      repetitionKeywords: [
+        ...WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
+      ],
+    },
     feedbackAdapterVersion: WORKFLOW_FEEDBACK_ADAPTER_VERSION,
     feedbackInterventionHashes: {
       neutralRepeat: NEUTRAL_REPEAT_FEEDBACK_SHA256,

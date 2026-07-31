@@ -162,6 +162,17 @@ live runner rechecks those bindings and
 limits. Full, artifact-only, and code-only live runs additionally require
 explicit large-run acknowledgement.
 
+The plan also binds a versioned structured-output portability policy. The
+candidate-engine boundary clones every response schema and omits grammar
+repetition bounds above 1,000 before provider transmission. The original
+application parser still enforces the full contract after generation. Omitting
+an oversized provider-side bound avoids both local grammar-compiler failures
+and the experimental bias that would result from truncating legitimate
+document or code candidates to 1,000 characters. Both architectures receive
+the same transform. A policy or ceiling change therefore produces a different
+plan hash and requires fresh approval. Earlier v1alpha1 smoke outputs affected
+by grammar compilation are infrastructure diagnostics, not comparison data.
+
 The Codex proxy requires an absolute executable path and expected SHA-256,
 re-attests it before and after execution, and runs in a fresh ephemeral
 read-only context with host extensions and shell access disabled. A live plan
@@ -202,6 +213,8 @@ resource limits.
   and latency.
 - Codex feedback remains useful without weakening the human-approval boundary.
 - Censoring prevents a stalled model or server from causing an unbounded run.
+- Provider grammar limits do not silently narrow the accepted artifact, and
+  the exact portability transform is part of the approved protocol.
 - A 3-, 15-, or 18-task development study cannot establish autonomous-company
   readiness; a private holdout and repeated independent trials remain
   necessary.

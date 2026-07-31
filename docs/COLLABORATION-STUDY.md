@@ -145,6 +145,24 @@ setup hook makes no additional model call.
 Setup and final approvals are issued by `system:synthetic-evaluator`. They are
 experimental bookkeeping events, not production human approvals.
 
+### Portable structured-output boundary
+
+Every study response schema passes through one provider-neutral portability
+layer at the candidate-engine boundary. Grammar repetition bounds above 1,000
+are omitted from the provider-facing clone because some local structured-output
+servers reject otherwise valid schemas while compiling their grammars. The
+original schema is never mutated, and the existing application parser and
+sealed evaluator still enforce the complete artifact contract after
+generation. Oversized bounds are not reduced to 1,000, which would truncate
+valid document and code candidates and bias the comparison.
+
+The plan hash commits the portability-policy version, the 1,000-repetition
+ceiling, the `omit` action, and post-generation validation against the original
+application contract. Changing any part of that policy requires a new plan
+hash and approval. A provider grammar-compilation failure is an infrastructure
+failure, not evidence that either the single-model or team condition lacks
+task capability. Both architectures receive the identical transform.
+
 ### Team communication
 
 In the team condition, only the declared C-level role may dispatch work or
@@ -367,6 +385,7 @@ The plan hash commits the selected task hashes and execution boundaries,
 condition matrix, `seeded_williams_square_v1` ordering, harness and feedback
 adapter versions, the exact neutral/fixed intervention hashes, the Codex
 review protocol hash, seed, every trajectory limit, candidate runtime profile,
+the versioned structured-output portability policy and its affected keywords,
 Codex executable/model/timeout, and—when code is selected—the sandbox backend
 id, collected code-provenance hash, launcher commitment, and launcher
 attestation mode. The live runner rechecks the

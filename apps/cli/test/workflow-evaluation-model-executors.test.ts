@@ -10,6 +10,9 @@ import { canonicalArtifactJson } from "../src/workflow-evaluation/artifacts.ts";
 import {
   PeerTeamArtifactWorkflowExecutor,
   SingleArtifactWorkflowExecutor,
+  WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+  WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
+  WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
   boundedWorkflowInferenceRequest,
   createIdentityAttestingWorkflowEngine,
 } from "../src/workflow-evaluation/model-executors.ts";
@@ -93,6 +96,75 @@ test("candidate requests reserve a conservative input bound before assigning out
   );
 });
 
+test("engine boundary omits oversized grammar bounds without mutating the application contract", async () => {
+  const responseSchema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["payload", "items"],
+    properties: {
+      payload: {
+        type: "string",
+        minLength: 1,
+        maxLength: 20_000,
+      },
+      items: {
+        type: "array",
+        maxItems: 1_001,
+        items: { type: "string", maxLength: 1_000 },
+      },
+      literal: {
+        const: { maxLength: 20_000 },
+        enum: [{ maxItems: 2_000 }],
+      },
+      default: { type: "string", maxLength: 10_000 },
+    },
+  } satisfies Record<string, unknown>;
+  const original = structuredClone(responseSchema);
+  let forwarded: Record<string, unknown> | undefined;
+  const raw = engine(async (request) => {
+    forwarded = request.responseSchema;
+    return {
+      ...result(request, '{"payload":"ok","items":[]}'),
+      providerIdentity: {
+        reportedModelId: "expected-model",
+        reportedSystemFingerprint: "fingerprint-a",
+      },
+    };
+  });
+  const wrapped = createIdentityAttestingWorkflowEngine({
+    engine: raw,
+    expectedModelId: "expected-model",
+    observed: new Map(),
+  });
+
+  await wrapped.generate({
+    invocationId: "portable-schema",
+    messages: [{ role: "user", content: "Return the object." }],
+    responseSchema,
+  });
+
+  assert.deepEqual(responseSchema, original);
+  assert.notEqual(forwarded, responseSchema);
+  const properties = forwarded?.properties as Record<
+    string,
+    Record<string, unknown>
+  >;
+  assert.equal(properties.payload.maxLength, undefined);
+  assert.equal(properties.items.maxItems, undefined);
+  assert.equal(
+    (properties.items.items as Record<string, unknown>).maxLength,
+    WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+  );
+  assert.deepEqual(properties.literal.const, { maxLength: 20_000 });
+  assert.deepEqual(properties.literal.enum, [{ maxItems: 2_000 }]);
+  assert.equal(properties.default.maxLength, undefined);
+  assert.equal(
+    WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
+    "chartermesh.dev/workflow-response-schema-portability/v1alpha1",
+  );
+  assert.equal(WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION, "omit");
+});
+
 test("engine-boundary identity attestation precedes output parsing", async () => {
   const raw = engine(async (request) => ({
     ...result(request, "not valid structured output"),
@@ -167,6 +239,10 @@ test("peer-team executor forms a task-specific team and only returns after a com
   const implementation = engine(async (request) => {
     const system = request.messages.find(({ role }) => role === "system")?.content ?? "";
     if (system.includes("Design a small task-specific peer team")) {
+      assert.match(
+        system,
+        /cLevelRole must exactly equal the id of the single role/u,
+      );
       return result(
         request,
         JSON.stringify({

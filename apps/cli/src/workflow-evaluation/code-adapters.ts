@@ -394,6 +394,7 @@ export class PeerTeamCodeWorkflowExecutor extends CodeExecutorBase {
             content: [
               "Design a task-specific code-maintenance peer team and concise plan.",
               "Return strict team-orientation JSON with one c_level and at least one worker.",
+              "cLevelRole must exactly equal the id of the single role whose class is c_level.",
               "Do not implement yet. A valid setup is automatically approved by the synthetic evaluator.",
             ].join("\n"),
           },

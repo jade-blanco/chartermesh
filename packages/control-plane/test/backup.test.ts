@@ -137,6 +137,24 @@ test("opening an older schema creates a migration safety backup", () => {
       "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
     )
     .run(new Date().toISOString());
+  initial.exec(`
+    DROP INDEX attempts_parent_idx;
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE attempts_legacy (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      attempt_no INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      FOREIGN KEY(run_id) REFERENCES runs(id)
+    );
+    DROP TABLE attempts;
+    ALTER TABLE attempts_legacy RENAME TO attempts;
+    PRAGMA foreign_keys = ON;
+  `);
   initial.exec("DROP TABLE artifacts");
   initial.close();
 

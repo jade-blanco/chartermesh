@@ -4,8 +4,16 @@ import {
   createArtifactWorkflowStudyPlan,
   createWorkflowStudyPlan,
   runBoundWorkflowStudy,
+  WORKFLOW_STUDY_HARNESS_VERSION,
+  WORKFLOW_STUDY_PLAN_API_VERSION,
   workflowStudyValueHash,
 } from "../src/workflow-evaluation/runner.ts";
+import {
+  WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+  WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
+  WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
+  WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
+} from "../src/workflow-evaluation/model-executors.ts";
 import { generateReferenceCodeWorkflowSuite } from "../src/workflow-evaluation/code-adapters.ts";
 import { generateReferenceArtifactSuite } from "../src/workflow-evaluation/suite.ts";
 import { DEFAULT_WORKFLOW_TRAJECTORY_LIMITS } from "../src/workflow-evaluation/trajectory.ts";
@@ -36,6 +44,15 @@ test("workflow plan hash deterministically binds sealed fixtures, limits, and en
   assert.deepEqual(first, second);
   assert.equal(first.liveReady, true);
   assert.equal(first.conditionOrdering, "seeded_williams_square_v1");
+  assert.equal(first.apiVersion, WORKFLOW_STUDY_PLAN_API_VERSION);
+  assert.equal(first.harnessVersion, WORKFLOW_STUDY_HARNESS_VERSION);
+  assert.deepEqual(first.responseSchemaPolicy, {
+    version: WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
+    maximumGrammarRepetition: WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
+    oversizedBoundAction: WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
+    acceptedOutputValidation: "original_application_contract",
+    repetitionKeywords: [...WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS],
+  });
   assert.match(first.feedbackInterventionHashes.neutralRepeat, /^[a-f0-9]{64}$/u);
   assert.match(first.feedbackInterventionHashes.fixedSelfReview, /^[a-f0-9]{64}$/u);
   assert.match(first.feedbackInterventionHashes.codexGeneralist, /^[a-f0-9]{64}$/u);
@@ -159,7 +176,8 @@ test("live execution rejects a rehashed plan using stale protocol constants", as
     bindings,
   });
   const tampered = structuredClone(plan) as unknown as Record<string, unknown>;
-  tampered.feedbackAdapterVersion = "stale-feedback-adapter";
+  (tampered.responseSchemaPolicy as Record<string, unknown>)
+    .maximumGrammarRepetition = 999;
   const {
     studyId: _studyId,
     planHash: _planHash,

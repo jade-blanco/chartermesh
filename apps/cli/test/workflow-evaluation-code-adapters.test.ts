@@ -188,6 +188,10 @@ test("team code workflow reaches review only after a command-mediated worker han
       const system =
         request.messages.find(({ role }) => role === "system")?.content ?? "";
       if (system.includes("Design a task-specific code-maintenance peer team")) {
+        assert.match(
+          system,
+          /cLevelRole must exactly equal the id of the single role/u,
+        );
         return result(
           request,
           JSON.stringify({

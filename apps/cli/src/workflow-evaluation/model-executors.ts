@@ -47,6 +47,95 @@ export interface WorkflowProviderIdentityObservation {
   systemFingerprint: string | null;
 }
 
+export const WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION =
+  "chartermesh.dev/workflow-response-schema-portability/v1alpha1" as const;
+export const WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION = 1_000 as const;
+export const WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION = "omit" as const;
+
+export const WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS = [
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "minProperties",
+  "maxProperties",
+  "minContains",
+  "maxContains",
+] as const;
+const REPETITION_BOUND_KEYS = new Set<string>(
+  WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
+);
+const SCHEMA_DATA_KEYS = new Set([
+  "const",
+  "default",
+  "enum",
+  "examples",
+]);
+const SCHEMA_MAP_KEYS = new Set([
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+  "patternProperties",
+  "properties",
+]);
+
+function cloneSchemaValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneSchemaValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, child]) => [
+      key,
+      cloneSchemaValue(child),
+    ]),
+  );
+}
+
+function portableSchemaNode(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(portableSchemaNode);
+  if (!value || typeof value !== "object") return value;
+  const portable: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(
+    value as Record<string, unknown>,
+  )) {
+    if (
+      REPETITION_BOUND_KEYS.has(key) &&
+      typeof child === "number" &&
+      child > WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION
+    ) {
+      continue;
+    }
+    if (
+      SCHEMA_MAP_KEYS.has(key) &&
+      child &&
+      typeof child === "object" &&
+      !Array.isArray(child)
+    ) {
+      portable[key] = Object.fromEntries(
+        Object.entries(child as Record<string, unknown>).map(
+          ([name, subschema]) => [name, portableSchemaNode(subschema)],
+        ),
+      );
+      continue;
+    }
+    portable[key] = SCHEMA_DATA_KEYS.has(key)
+      ? cloneSchemaValue(child)
+      : portableSchemaNode(child);
+  }
+  return portable;
+}
+
+/**
+ * Clone a trusted internal response schema and omit grammar repetition bounds
+ * above the study portability ceiling. The original application parser still
+ * enforces the full contract after generation, so this does not redefine the
+ * accepted artifact or truncate large code/document fields.
+ */
+export function portableWorkflowResponseSchema(
+  schema: Record<string, unknown>,
+): Record<string, unknown> {
+  return portableSchemaNode(schema) as Record<string, unknown>;
+}
+
 export function createIdentityAttestingWorkflowEngine(input: {
   engine: ModelEngine;
   expectedModelId: string;
@@ -57,7 +146,15 @@ export function createIdentityAttestingWorkflowEngine(input: {
     manifest: engine.manifest,
     async generate(request, options) {
       const startedAt = performance.now();
-      const inference = await engine.generate(request, options);
+      const portableRequest = request.responseSchema
+        ? {
+            ...request,
+            responseSchema: portableWorkflowResponseSchema(
+              request.responseSchema,
+            ),
+          }
+        : request;
+      const inference = await engine.generate(portableRequest, options);
       const identity = {
         engineProfileId: engine.manifest.profileId,
         role: "engine-boundary",
@@ -624,6 +721,7 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
               "Design a small task-specific peer team and a concise implementation plan.",
               "Return exactly one JSON object matching the supplied schema.",
               "Create exactly one c_level coordinator and at least one worker.",
+              "cLevelRole must exactly equal the id of the single role whose class is c_level.",
               "Worker role ids represent teams or specialties that the C-level may call by command.",
               `At most ${Math.min(7, this.#maxParallelAgents)} worker calls may be useful concurrently.`,
               "Do not implement the deliverable yet. The synthetic evaluator will always approve a valid setup.",
