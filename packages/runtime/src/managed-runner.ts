@@ -28,7 +28,7 @@ export interface StructuredArtifact {
   confidence: "low" | "medium" | "high";
 }
 
-const MAX_MODEL_OUTPUT_TOKENS = 4_096;
+const DEFAULT_MAX_MODEL_OUTPUT_TOKENS = 4_096;
 
 export const structuredArtifactSchema = {
   type: "object",
@@ -179,6 +179,17 @@ export class BuiltInManagedRunner implements ManagedRunner {
         support: "native",
         stability: "stable",
       },
+      {
+        name: "orchestration.delegated",
+        support: "emulated",
+        stability: "experimental",
+        constraints: {
+          maxDepth: 1,
+          maxChildren: 4,
+          communication: "parent_only",
+          concurrency: 1,
+        },
+      },
     ],
   };
 
@@ -193,6 +204,18 @@ export class BuiltInManagedRunner implements ManagedRunner {
       cleanup: () => void;
     }
   >();
+  private readonly options: { maxOutputTokens?: number };
+
+  constructor(options: { maxOutputTokens?: number } = {}) {
+    this.options = options;
+    const value =
+      options.maxOutputTokens ?? DEFAULT_MAX_MODEL_OUTPUT_TOKENS;
+    if (!Number.isInteger(value) || value < 128 || value > 32_768) {
+      throw new Error(
+        "maxOutputTokens must be an integer from 128 to 32768.",
+      );
+    }
+  }
 
   async start(
     request: HostRunRequest,
@@ -270,7 +293,8 @@ export class BuiltInManagedRunner implements ManagedRunner {
         invocationId: `${request.attemptId}:1`,
         messages,
         responseSchema: structuredArtifactSchema,
-        maxOutputTokens: MAX_MODEL_OUTPUT_TOKENS,
+        maxOutputTokens:
+          this.options.maxOutputTokens ?? DEFAULT_MAX_MODEL_OUTPUT_TOKENS,
       };
       const toolLoop = options.toolRuntime
         ? await options.toolRuntime.run(
@@ -307,7 +331,9 @@ export class BuiltInManagedRunner implements ManagedRunner {
             },
           ],
           responseSchema: structuredArtifactSchema,
-          maxOutputTokens: MAX_MODEL_OUTPUT_TOKENS,
+          maxOutputTokens:
+            this.options.maxOutputTokens ??
+            DEFAULT_MAX_MODEL_OUTPUT_TOKENS,
         },
         { signal: controller.signal },
       );

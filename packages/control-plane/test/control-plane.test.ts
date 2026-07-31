@@ -101,6 +101,97 @@ test("intake through approval completes and resurfaces a successor", () => {
   }
 });
 
+test("delegated attempts retain bounded parent-child lineage", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const work = controlPlane.intake({
+      title: "Coordinate a bounded task",
+      summary: "Exercise durable delegated attempt lineage.",
+      actor: "human:test",
+      idempotencyKey: "intake:delegated-attempts",
+    });
+    controlPlane.triage({
+      id: work.id,
+      ownerRole: "operator",
+      executionTarget: "builtin-managed-runner",
+      actor: "human:test",
+      idempotencyKey: "triage:delegated-attempts",
+    });
+    const claim = controlPlane.claim({
+      id: work.id,
+      actor: "runner:test",
+      idempotencyKey: "claim:delegated-attempts",
+    });
+    const planner = controlPlane.startChildAttempt({
+      parentAttemptId: claim.attemptId,
+      roleId: "planner",
+      actor: "runner:test",
+      maxChildren: 2,
+    });
+    const implementer = controlPlane.startChildAttempt({
+      parentAttemptId: claim.attemptId,
+      roleId: "implementer",
+      actor: "runner:test",
+      maxChildren: 2,
+    });
+    assert.equal(planner.parentAttemptId, claim.attemptId);
+    assert.equal(planner.kind, "delegated");
+    assert.equal(implementer.attemptNo, planner.attemptNo + 1);
+    assert.throws(
+      () =>
+        controlPlane.startChildAttempt({
+          parentAttemptId: claim.attemptId,
+          roleId: "verifier",
+          actor: "runner:test",
+          maxChildren: 2,
+        }),
+      /child limit/u,
+    );
+    assert.throws(
+      () =>
+        controlPlane.startChildAttempt({
+          parentAttemptId: planner.id,
+          roleId: "nested",
+          actor: "runner:test",
+        }),
+      /depth is limited/u,
+    );
+    assert.equal(
+      controlPlane.finishChildAttempt({
+        id: planner.id,
+        status: "succeeded",
+        actor: "runner:test",
+      }).status,
+      "succeeded",
+    );
+    assert.equal(
+      controlPlane.finishChildAttempt({
+        id: implementer.id,
+        status: "canceled",
+        actor: "runner:test",
+        errorCode: "RUN_CANCELED",
+        errorMessage: "Canceled by the parent signal.",
+      }).status,
+      "canceled",
+    );
+    const attempts = controlPlane.listAttempts(claim.runId);
+    assert.deepEqual(
+      attempts.map(({ kind, roleId, status }) => ({
+        kind,
+        roleId,
+        status,
+      })),
+      [
+        { kind: "primary", roleId: null, status: "running" },
+        { kind: "delegated", roleId: "planner", status: "succeeded" },
+        { kind: "delegated", roleId: "implementer", status: "canceled" },
+      ],
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("wait conditions are explicit and actionable counts exclude blocked work", () => {
   const { database, controlPlane } = fixture();
   try {

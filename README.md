@@ -228,6 +228,7 @@ After the engine is configured and serving:
 
 ```powershell
 node bin/chartermesh.mjs evaluate-model --target C:\path\to\project --live --json
+node bin/chartermesh.mjs evaluate-collaboration --target C:\path\to\project --live --repetitions 3 --json
 ```
 
 The evaluation sends only three synthetic tasks. It records structure
@@ -241,6 +242,7 @@ It never sends project files. See
 node bin/chartermesh.mjs request "Prepare release notes" --summary "Draft concise reviewed notes." --target TARGET
 node bin/chartermesh.mjs triage --id work-000001 --role operator --target TARGET
 node bin/chartermesh.mjs run --id work-000001 --target TARGET
+node bin/chartermesh.mjs run --id work-000001 --delegated --target TARGET
 node bin/chartermesh.mjs decide --id work-000001 --decision approve --artifact-hash SHA256_FROM_RUN --note "Reviewed." --target TARGET
 node bin/chartermesh.mjs complete --id work-000001 --target TARGET
 ```

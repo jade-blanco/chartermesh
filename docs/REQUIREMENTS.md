@@ -25,7 +25,7 @@ Status values: `done`, `partial`, `planned`, `decision`.
 | COLLAB-001 | Native subagents and agent teams are host capabilities, not the ledger | 1/4 | product refresh, ADR 0005 | done |
 | COLLAB-002 | Parent/child permissions do not satisfy human approval | 1/4 | ADR 0005; adapter contract tests | partial |
 | COLLAB-003 | Parallel writes require worktree or file ownership isolation | 1/4 | validator test | done |
-| COLLAB-004 | Child execution usage is measured or explicitly unknown | 2/4 | usage model and adapter tests | planned |
+| COLLAB-004 | Child execution usage is measured or explicitly unknown | 2/4 | delegated Attempt and Invocation lifecycle tests | done |
 | COLLAB-005 | Goal/thread continuity is recoverable from the DB ledger | 2/4 | lease recovery and retry generation tests | partial |
 | COLLAB-006 | Experimental peer teams require explicit opt-in and drift checks | 1/4 | validator test and capability manifest | partial |
 | SCHED-001 | Local, hosted, and chat-continuation schedules are distinct capabilities | 1/4 | ADR 0005, capability namespace | done |
@@ -69,6 +69,8 @@ Status values: `done`, `partial`, `planned`, `decision`.
 | WEB-001 | Optional search is provider-neutral, bounded, allowlisted, and exact-query approved before egress | 4 | SearXNG adapter, config schema, approval and loopback HTTP tests | done |
 | MCP-001 | Generic MCP client projects capabilities through the Control Plane rather than bypassing it | 4 | ADR 0015 | planned |
 | EVAL-002 | ManagedRunner separates performed checks from unperformed verification for constrained models | 4 | prompt regression and local Gemma workflow | done |
+| COLLAB-007 | A provider-neutral ManagedRunner can execute bounded depth-1 delegation without an AgentHost | 2/4 | DelegationController, child Attempt lineage, CLI E2E | done |
+| EVAL-003 | Single and delegated small-model work are compared on paired synthetic company tasks with an honest generation budget ceiling | 4 | evaluate-collaboration contract and scripted-engine test | done |
 
 ## Engine/host separation acceptance tests
 
@@ -89,5 +91,6 @@ Status values: `done`, `partial`, `planned`, `decision`.
   explicit, non-overlapping file ownership.
 - Host identifiers are references only; WorkItem and Run identifiers remain
   authoritative.
-- Every child execution becomes an Attempt or an explicitly unknown usage
-  record in Phase 2.
+- Every built-in delegated child execution becomes an Attempt and durable model
+  invocation. Native AgentHost children still require adapter-specific
+  projection before they can make the same claim.

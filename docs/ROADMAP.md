@@ -47,9 +47,13 @@ models, and approval-gated optional search.
 - Optional bounded SearXNG search with exact-query approval and no commercial
   search API requirement
 - Explicit small-model evidence discipline validated with local Gemma 4
+- Experimental provider-neutral depth-1 delegation with planner, implementer,
+  verifier, and synthesizer child Attempts
+- Paired single-versus-delegated small-model collaboration evaluation
 
 ## Next: execution hardening
 
+- Crash-resumable child WorkItems, join latches, and independent child retry
 - Attempt-level retry/dead-letter policy distinct from external outbox delivery
 - Broader recurrence rules, durable service installation, and missed-tick
   policy for the local scheduler
@@ -62,6 +66,7 @@ models, and approval-gated optional search.
 - Provider-neutral MCP client lifecycle with capability projection,
   supply-chain pinning, cancellation, approval, and evidence
 - Optional external AgentHost adapters
+- Projection of native AgentHost children into the same parent/child ledger
 - Runtime capability discovery and drift reporting
 - Registry release automation and clean-machine install/uninstall matrix
 

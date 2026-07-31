@@ -5,6 +5,13 @@ export {
   type StructuredArtifact,
 } from "./managed-runner.ts";
 export {
+  DelegationController,
+  type DelegatedRole,
+  type DelegatedRunResult,
+  type DelegatedStage,
+  type DelegationLifecycle,
+} from "./delegation-controller.ts";
+export {
   ToolApprovalRequiredError,
   ToolIterationLimitError,
   ToolRuntime,

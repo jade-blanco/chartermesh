@@ -262,6 +262,21 @@ capability는 단순 boolean이 아니라 `stability`, `surface`, `minVersion`,
 상세 판단과 검증 근거는 `docs/adr/0005-native-collaboration-boundary.md`와
 `docs/REQUIREMENTS.md`에서 추적한다.
 
+### Built-in 로컬 위임의 최소 실행 경계
+
+외부 `AgentHost`가 없어도 임의의 `ModelEngine` 위에서 제한된 위임을
+실험할 수 있다. Built-in `DelegationController`는 planner, implementer,
+verifier, synthesizer를 서로 독립된 context와 child Attempt로 순차 실행한다.
+각 child는 부모 Run·Attempt에 결박되고 모델 호출 전에 durable invocation을
+만든다. 깊이는 1, child는 4개, 통신은 parent-only, 동시성은 1로 고정한다.
+마지막 synthesizer 산출물만 기존 exact-hash 사람 검토로 올라간다.
+
+이 기능은 `orchestration.delegated`의 experimental emulation이며 Codex,
+Claude 또는 그 밖의 host-native subagent 기능이 아니다. `peer_team`,
+child-to-child messaging, 병렬 writer, 독립 child WorkItem 재시도는 지원한다고
+주장하지 않는다. Tool Runtime을 사용하는 implementer도 기존 exact-call
+사람 승인을 우회할 수 없다. 상세 결정은 ADR 0016에서 추적한다.
+
 ## 0. 한 줄 정의와 결론
 
 > 사용자의 업무 목표를 인터뷰한 C레벨 에이전트가 팀·역할·프롬프트·

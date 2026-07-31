@@ -46,6 +46,30 @@ Typical local ports include:
 Ports and model identifiers are runtime configuration, not CharterMesh
 assumptions. Confirm them in the selected runtime.
 
+### Context length belongs to the serving runtime
+
+CharterMesh does not lower or expand the model context window. Check both the
+model's trained context and the server's loaded context. For `llama-server`,
+`/v1/models` reports `n_ctx` and `n_ctx_train`, and `--ctx-size N` selects the
+loaded limit. A desktop runtime may store a smaller global or per-model value
+even when the underlying model and backend support more.
+
+Use `scripts/test-openai-long-context.mjs` only against a trusted loopback
+endpoint to test an actual request. The script generates synthetic repeated
+text in memory and sends no project data:
+
+```powershell
+node scripts/test-openai-long-context.mjs `
+  http://127.0.0.1:8080/v1/chat/completions `
+  LOCAL_MODEL_ID `
+  21900 `
+  900000
+```
+
+Long context can be valid but operationally slow. Record prompt tokens, elapsed
+time, cache reuse, memory, and the exact server build rather than treating a
+successful model load as a throughput guarantee.
+
 ## Arbitrary local command process
 
 Use this when a local runtime or wrapper does not expose an OpenAI-compatible

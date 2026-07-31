@@ -44,6 +44,7 @@ import {
 } from "../../../packages/compiler/src/index.ts";
 import {
   BuiltInManagedRunner,
+  DelegationController,
   ToolApprovalRequiredError,
   capabilityCatalog,
   createWorkspaceToolRuntime,
@@ -63,6 +64,7 @@ import {
   type ProposalProfile,
 } from "./proposal.ts";
 import { evaluateModelEngine } from "./evaluate-model.ts";
+import { evaluateCollaboration } from "./evaluate-collaboration.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
 const CHARTERMESH_VERSION = "0.0.7-alpha.1";
@@ -1321,13 +1323,14 @@ export interface SchedulerTickSummary {
 export async function runWork(
   target: string,
   id?: string,
-  options: { quiet?: boolean; json?: boolean } = {},
+  options: { quiet?: boolean; json?: boolean; delegated?: boolean } = {},
 ): Promise<RunWorkResult> {
   const runtime = readRuntime(target);
   const { database, controlPlane } = controlPlaneFor(target);
   let heartbeat: NodeJS.Timeout | undefined;
   let cancellationPoll: NodeJS.Timeout | undefined;
   let invocationId: string | undefined;
+  let activeAttemptId: string | undefined;
   const runController = new AbortController();
   let removeSignalHandlers = () => {};
   let claim:
@@ -1373,11 +1376,20 @@ export async function runWork(
             availability === "ready",
         );
     if (!candidate) throw new Error("No claimable work is available.");
+    if (options.delegated) {
+      const executionTarget = organization.spec.executionTargets.find(
+        ({ id: targetId }) => targetId === candidate.executionTarget,
+      );
+      if (!executionTarget || executionTarget.kind !== "managed_runner") {
+        throw new Error("DELEGATION_TARGET_UNSUPPORTED");
+      }
+    }
     claim = controlPlane.claim({
       id: candidate.id,
       actor: "runner:local",
       idempotencyKey: `cli:claim:${candidate.id}:${randomUUID()}`,
     });
+    activeAttemptId = claim.attemptId;
     const requestSignalCancellation = (signal: string) => {
       try {
         controlPlane.requestRunCancellation({
@@ -1427,7 +1439,6 @@ export async function runWork(
     }, 500);
     cancellationPoll.unref();
     try {
-      const runner = new BuiltInManagedRunner();
       const role = organization.spec.roles.find(
         ({ id: roleId }) => roleId === candidate.ownerRole,
       );
@@ -1452,7 +1463,7 @@ export async function runWork(
             evidenceId: evidence.id,
             id: candidate.id,
             runId: claim!.runId,
-            attemptId: claim!.attemptId,
+            attemptId: activeAttemptId ?? claim!.attemptId,
             callHash: evidence.callHash,
             toolName: evidence.toolName,
             status: evidence.status,
@@ -1502,49 +1513,132 @@ export async function runWork(
         )
         .map(({ content }) => content)
         .join("\n\n");
-      invocationId = controlPlane.startInvocation({
-        attemptId: claim.attemptId,
-        engineId: engine.manifest.profileId,
-        modelId,
-      }).id;
-      const handle = await runner.start(
-        {
-          taskPacket: {
-            objective: candidate.title,
-            context: [
-              candidate.summary,
-              skillGuidance
-                ? `Assigned portable skill guidance:\n${skillGuidance}`
-                : "",
-              requiredTools.length > 0
-                ? [
-                    "Required execution evidence:",
-                    ...requiredTools.map(
-                      (toolName) =>
-                        `- A successful ${toolName} result is required before final submission.`,
-                    ),
-                    "Do not return a completion artifact until every required tool succeeds.",
-                  ].join("\n")
-                : "",
-              replayedEvidence.length > 0
-                ? "An exact human-approved pending tool call was replayed successfully in this run. Inspect the resulting workspace state before final submission."
-                : "",
-            ].filter(Boolean).join("\n\n"),
-            acceptanceCriteria: [
-              "Return a structured artifact suitable for exact-hash review.",
-              "Do not claim external side effects.",
-              "State checks, risks, next actions, and confidence explicitly.",
-            ],
-          },
-          organizationRevision: 1,
-          workItemId: candidate.id,
-          runId: claim.runId,
-          attemptId: claim.attemptId,
-          generation: claim.generation,
+      const hostRequest = {
+        taskPacket: {
+          objective: candidate.title,
+          context: [
+            candidate.summary,
+            skillGuidance
+              ? `Assigned portable skill guidance:\n${skillGuidance}`
+              : "",
+            requiredTools.length > 0
+              ? [
+                  "Required execution evidence:",
+                  ...requiredTools.map(
+                    (toolName) =>
+                      `- A successful ${toolName} result is required before final submission.`,
+                  ),
+                  "Do not return a completion artifact until every required tool succeeds.",
+                ].join("\n")
+              : "",
+            replayedEvidence.length > 0
+              ? "An exact human-approved pending tool call was replayed successfully in this run. Inspect the resulting workspace state before final submission."
+              : "",
+          ].filter(Boolean).join("\n\n"),
+          acceptanceCriteria: [
+            "Return a structured artifact suitable for exact-hash review.",
+            "Do not claim external side effects.",
+            "State checks, risks, next actions, and confidence explicitly.",
+          ],
         },
-        { engine, toolRuntime, signal: runController.signal },
-      );
-      const result = await runner.result(handle.hostRunId);
+        organizationRevision: 1,
+        workItemId: candidate.id,
+        runId: claim.runId,
+        attemptId: claim.attemptId,
+        generation: claim.generation,
+      };
+      let result;
+      if (options.delegated) {
+        const stageInvocations = new Map<string, string>();
+        const controller = new DelegationController();
+        result = await controller.run(hostRequest, {
+          engine,
+          toolRuntime,
+          signal: runController.signal,
+          lifecycle: {
+            startStage({ role: delegatedRole }) {
+              const child = controlPlane.startChildAttempt({
+                parentAttemptId: claim!.attemptId,
+                roleId: delegatedRole,
+                actor: "runner:local",
+                maxChildren: 4,
+              });
+              activeAttemptId = child.id;
+              try {
+                const invocation = controlPlane.startInvocation({
+                  attemptId: child.id,
+                  engineId: engine.manifest.profileId,
+                  modelId,
+                });
+                stageInvocations.set(child.id, invocation.id);
+                return { attemptId: child.id };
+              } catch (error) {
+                controlPlane.finishChildAttempt({
+                  id: child.id,
+                  status: "failed",
+                  actor: "runner:local",
+                  errorCode: "MODEL_START_REJECTED",
+                  errorMessage:
+                    error instanceof Error
+                      ? error.message
+                      : "Model start was rejected.",
+                });
+                throw error;
+              }
+            },
+            finishStage({
+              attemptId,
+              status,
+              inference,
+              error,
+            }) {
+              const stageInvocationId = stageInvocations.get(attemptId);
+              if (stageInvocationId) {
+                controlPlane.finishInvocation({
+                  id: stageInvocationId,
+                  status,
+                  inputTokens: inference?.usage.inputTokens ?? null,
+                  outputTokens: inference?.usage.outputTokens ?? null,
+                  cost: inference?.usage.cost ?? null,
+                  measurementStatus:
+                    inference?.usage.measurementStatus ?? "unknown",
+                });
+              }
+              controlPlane.finishChildAttempt({
+                id: attemptId,
+                status,
+                actor: "runner:local",
+                ...(status === "succeeded"
+                  ? {}
+                  : {
+                      errorCode:
+                        status === "canceled"
+                          ? "RUN_CANCELED"
+                          : "DELEGATED_STAGE_FAILED",
+                      errorMessage:
+                        error instanceof Error
+                          ? error.message
+                          : "Delegated stage failed.",
+                    }),
+              });
+              activeAttemptId = claim!.attemptId;
+            },
+          },
+        });
+      } else {
+        const runner = new BuiltInManagedRunner();
+        invocationId = controlPlane.startInvocation({
+          attemptId: claim.attemptId,
+          engineId: engine.manifest.profileId,
+          modelId,
+        }).id;
+        const handle = await runner.start(hostRequest, {
+          engine,
+          toolRuntime,
+          signal: runController.signal,
+        });
+        result = await runner.result(handle.hostRunId);
+      }
       const successfulTools = new Set(
         [...replayedEvidence, ...result.toolEvidence]
           .filter(({ status }) => status === "succeeded")
@@ -1558,14 +1652,16 @@ export async function runWork(
           `REQUIRED_TOOL_EVIDENCE_MISSING: ${missingRequiredTools.join(", ")}`,
         );
       }
-      controlPlane.finishInvocation({
-        id: invocationId,
-        status: "succeeded",
-        inputTokens: result.inference.usage.inputTokens,
-        outputTokens: result.inference.usage.outputTokens,
-        cost: result.inference.usage.cost,
-        measurementStatus: result.inference.usage.measurementStatus,
-      });
+      if (invocationId) {
+        controlPlane.finishInvocation({
+          id: invocationId,
+          status: "succeeded",
+          inputTokens: result.inference.usage.inputTokens,
+          outputTokens: result.inference.usage.outputTokens,
+          cost: result.inference.usage.cost,
+          measurementStatus: result.inference.usage.measurementStatus,
+        });
+      }
       const submission = controlPlane.submitArtifact({
         id: candidate.id,
         content: result.inference.text,
@@ -1641,26 +1737,35 @@ export async function runWork(
           measurementStatus: "unknown",
         });
       }
-      controlPlane.failRun({
-        id: candidate.id,
-        generation: claim.generation,
-        attemptId: claim.attemptId,
-        errorCode,
-        errorMessage:
-          errorCode === "STRUCTURED_ARTIFACT_INVALID"
-            ? "The model did not return a valid structured artifact."
-            : errorCode === "TOOL_APPROVAL_REQUIRED"
-              ? rawMessage
-              : errorCode === "REQUIRED_TOOL_EVIDENCE_MISSING"
+      if (errorCode === "RUN_CANCELED") {
+        controlPlane.cancelRun({
+          id: candidate.id,
+          generation: claim.generation,
+          actor: "runner:local",
+          idempotencyKey:
+            `cli:canceled:${candidate.id}:${claim.generation}`,
+        });
+      } else {
+        controlPlane.failRun({
+          id: candidate.id,
+          generation: claim.generation,
+          attemptId: claim.attemptId,
+          errorCode,
+          errorMessage:
+            errorCode === "STRUCTURED_ARTIFACT_INVALID"
+              ? "The model did not return a valid structured artifact."
+              : errorCode === "TOOL_APPROVAL_REQUIRED"
                 ? rawMessage
-              : errorCode === "TOOL_ITERATION_LIMIT"
-                ? "The model exceeded the OrgSpec tool iteration limit."
-                : errorCode === "RUN_CANCELED"
-                  ? "The model invocation was canceled."
+                : errorCode === "REQUIRED_TOOL_EVIDENCE_MISSING"
+                  ? rawMessage
+                : errorCode === "TOOL_ITERATION_LIMIT"
+                  ? "The model exceeded the OrgSpec tool iteration limit."
                   : "The configured model invocation failed.",
-        actor: "runner:local",
-        idempotencyKey: `cli:fail:${candidate.id}:${claim.generation}`,
-      });
+          actor: "runner:local",
+          idempotencyKey:
+            `cli:fail:${candidate.id}:${claim.generation}`,
+        });
+      }
       throw error;
     }
   } finally {
@@ -2362,6 +2467,42 @@ async function evaluateModel(target: string, args: string[]): Promise<number> {
   return report.passed ? 0 : 2;
 }
 
+async function evaluateCollaborationCommand(
+  target: string,
+  args: string[],
+): Promise<number> {
+  if (!has(args, "--live")) {
+    throw new Error(
+      "evaluate-collaboration starts real model inference. Repeat with --live to opt in.",
+    );
+  }
+  const repetitions = Number(option(args, "--repetitions") ?? 1);
+  const runtime = readRuntime(target);
+  const engine = configuredEngine(
+    runtime,
+    target,
+    option(args, "--engine-id"),
+  );
+  const report = await evaluateCollaboration(engine, { repetitions });
+  if (has(args, "--json")) {
+    writeJsonEnvelope("evaluate-collaboration", report);
+  } else {
+    console.log(
+      `Collaboration evaluation ${report.evaluationId}: single ${report.aggregate.singleMeanScore.toFixed(3)}, delegated ${report.aggregate.delegatedMeanScore.toFixed(3)}, delta ${report.aggregate.meanScoreDelta.toFixed(3)}.`,
+    );
+    for (const trial of report.trials) {
+      console.log(
+        `- ${trial.fixtureId} #${trial.repetition}: single ${trial.single.score.toFixed(3)}, delegated ${trial.delegated.score.toFixed(3)} (${trial.scoreDelta >= 0 ? "+" : ""}${trial.scoreDelta.toFixed(3)})`,
+      );
+    }
+  }
+  return report.trials.every(
+    ({ single, delegated }) => single.passed && delegated.passed,
+  )
+    ? 0
+    : 2;
+}
+
 function capabilitiesCommand(args: string[]): void {
   const subcommand = args[1] ?? "list";
   if (!["list", "recommend"].includes(subcommand)) {
@@ -2458,7 +2599,7 @@ Commands:
   chartermesh triage --id WORK --role ROLE --target PATH [--json]
   chartermesh list --target PATH [--json] [--limit N --cursor CURSOR]
     [--active-only] [--include-archived]
-  chartermesh run --id WORK --target PATH [--json]
+  chartermesh run --id WORK --target PATH [--delegated] [--json]
   chartermesh cancel --id WORK --target PATH [--json]
   chartermesh archive --id WORK --target PATH [--json]
   chartermesh wait --id WORK --type user_input --reason TEXT --target PATH
@@ -2476,6 +2617,8 @@ Commands:
   chartermesh scheduler list --target PATH [--schedule ID] [--json]
   chartermesh scheduler watch --target PATH [--poll-ms 30000] [--json]
   chartermesh evaluate-model --target PATH --live [--engine-id ID] [--json]
+  chartermesh evaluate-collaboration --target PATH --live
+    [--engine-id ID] [--repetitions 1] [--json]
   chartermesh capabilities list|recommend [--kind KIND] [--json]
   chartermesh skills list [--json]
   chartermesh skills show --id SKILL [--json]
@@ -2558,7 +2701,10 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (command === "run") {
-    await runWork(target, option(args, "--id"), { json: has(args, "--json") });
+    await runWork(target, option(args, "--id"), {
+      json: has(args, "--json"),
+      delegated: has(args, "--delegated"),
+    });
     return 0;
   }
   if (command === "cancel") {
@@ -2607,6 +2753,9 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   }
   if (command === "evaluate-model") {
     return evaluateModel(target, args);
+  }
+  if (command === "evaluate-collaboration") {
+    return evaluateCollaborationCommand(target, args);
   }
   if (command === "dashboard") {
     const { startDashboard } = await import("../../dashboard/src/server.ts");

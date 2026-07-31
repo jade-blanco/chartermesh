@@ -146,6 +146,65 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   assert.equal(listed.status, 0, listed.stderr);
   assert.match(listed.stdout, /\| done \| completed \|/u);
 
+  const delegatedRequest = cli([
+    "request",
+    "Prepare a delegated synthetic artifact",
+    "--summary",
+    "Use four bounded roles and leave one final review artifact.",
+    "--target",
+    target,
+  ]);
+  const delegatedWorkId =
+    delegatedRequest.stdout.match(/(work-\d{6}) created/u)?.[1];
+  assert.ok(delegatedWorkId, delegatedRequest.stdout);
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      delegatedWorkId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+  const delegatedRun = cli([
+    "run",
+    "--id",
+    delegatedWorkId,
+    "--delegated",
+    "--target",
+    target,
+  ]);
+  assert.equal(
+    delegatedRun.status,
+    0,
+    delegatedRun.stdout + delegatedRun.stderr,
+  );
+  const delegatedDatabase = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  try {
+    const attempts = new ControlPlane(
+      delegatedDatabase,
+      join(target, ".chartermesh", "artifacts"),
+    ).listAttempts();
+    assert.deepEqual(
+      attempts
+        .filter(({ kind }) => kind === "delegated")
+        .map(({ roleId, status }) => ({ roleId, status })),
+      [
+        { roleId: "planner", status: "succeeded" },
+        { roleId: "implementer", status: "succeeded" },
+        { roleId: "verifier", status: "succeeded" },
+        { roleId: "synthesizer", status: "succeeded" },
+      ],
+    );
+  } finally {
+    delegatedDatabase.close();
+  }
+
   const evidenceRequest = cli([
     "request",
     "Require a real workspace read",
@@ -1090,7 +1149,7 @@ test("a separate CLI cancellation durably ends a running invocation", async () =
       database,
       join(target, ".chartermesh", "artifacts"),
     );
-    assert.equal(controlPlane.get(workId).status, "failed");
+    assert.equal(controlPlane.get(workId).status, "canceled");
     assert.equal(controlPlane.listInvocations()[0]?.status, "canceled");
   } finally {
     database.close();

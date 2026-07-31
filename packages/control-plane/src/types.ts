@@ -204,6 +204,25 @@ export interface ModelInvocationRecord {
   finishedAt: string | null;
 }
 
+export interface AttemptRecord {
+  id: string;
+  runId: string;
+  parentAttemptId: string | null;
+  roleId: string | null;
+  kind: "primary" | "delegated";
+  attemptNo: number;
+  status:
+    | "running"
+    | "waiting"
+    | "succeeded"
+    | "failed"
+    | "canceled";
+  startedAt: string;
+  finishedAt: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
 export interface OutboxDelivery {
   id: number;
   eventId: number;

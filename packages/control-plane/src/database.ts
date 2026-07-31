@@ -34,7 +34,7 @@ export function openControlPlaneDatabase(
         )
         .get() as { version: number };
       const priorVersion = Number(row.version);
-      if (priorVersion > 0 && priorVersion < 8) {
+      if (priorVersion > 0 && priorVersion < 9) {
         createControlPlaneBackup(
           database,
           join(dirname(path), "backups"),
@@ -106,13 +106,17 @@ export function openControlPlaneDatabase(
     CREATE TABLE IF NOT EXISTS attempts (
       id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL,
+      parent_attempt_id TEXT,
+      role_id TEXT,
+      kind TEXT NOT NULL DEFAULT 'primary',
       attempt_no INTEGER NOT NULL,
       status TEXT NOT NULL,
       started_at TEXT NOT NULL,
       finished_at TEXT,
       error_code TEXT,
       error_message TEXT,
-      FOREIGN KEY(run_id) REFERENCES runs(id)
+      FOREIGN KEY(run_id) REFERENCES runs(id),
+      FOREIGN KEY(parent_attempt_id) REFERENCES attempts(id)
     );
 
     CREATE TABLE IF NOT EXISTS leases (
@@ -225,6 +229,8 @@ export function openControlPlaneDatabase(
       WHERE status IN ('running', 'waiting');
     CREATE INDEX IF NOT EXISTS schedule_ticks_schedule_idx
       ON schedule_ticks(schedule_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS attempts_parent_idx
+      ON attempts(run_id, parent_attempt_id, attempt_no);
   `);
   const workItemColumns = database
     .prepare("PRAGMA table_info(work_items)")
@@ -244,6 +250,23 @@ export function openControlPlaneDatabase(
   if (!attemptColumns.some(({ name }) => name === "error_message")) {
     database.exec("ALTER TABLE attempts ADD COLUMN error_message TEXT");
   }
+  if (!attemptColumns.some(({ name }) => name === "parent_attempt_id")) {
+    database.exec(
+      "ALTER TABLE attempts ADD COLUMN parent_attempt_id TEXT REFERENCES attempts(id)",
+    );
+  }
+  if (!attemptColumns.some(({ name }) => name === "role_id")) {
+    database.exec("ALTER TABLE attempts ADD COLUMN role_id TEXT");
+  }
+  if (!attemptColumns.some(({ name }) => name === "kind")) {
+    database.exec(
+      "ALTER TABLE attempts ADD COLUMN kind TEXT NOT NULL DEFAULT 'primary'",
+    );
+  }
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS attempts_parent_idx
+      ON attempts(run_id, parent_attempt_id, attempt_no);
+  `);
   const leaseColumns = database
     .prepare("PRAGMA table_info(leases)")
     .all() as Array<{ name: string }>;
@@ -413,6 +436,12 @@ export function openControlPlaneDatabase(
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (8, ?)
+    `)
+    .run(new Date().toISOString());
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (9, ?)
     `)
     .run(new Date().toISOString());
   return database;

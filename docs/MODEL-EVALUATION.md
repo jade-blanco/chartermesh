@@ -68,6 +68,34 @@ version, hardware, and the complete JSON report. Run multiple trials before
 drawing conclusions because inference servers may use nondeterministic
 sampling.
 
+## Compare single and delegated execution
+
+The collaboration smoke suite uses three fictional company-work tasks and
+compares:
+
+- one built-in managed worker with up to 4096 output tokens per call; and
+- planner, implementer, verifier, and synthesizer child calls with up to 1024
+  output tokens per call.
+
+Both conditions have the same maximum requested output-token ceiling when the
+single allowed repair turn is included: 8192. This is deliberately named
+`generation-budget-ceiling-matched`. It is not a claim that total input plus
+output tokens are equal. The report includes observed usage, and marks missing
+provider usage instead of inventing it.
+
+```powershell
+node bin/chartermesh.mjs evaluate-collaboration `
+  --target TARGET `
+  --live `
+  --repetitions 3 `
+  --json
+```
+
+The suite is deterministic-scored and sends no project files. It measures
+constraint coverage, unsupported completion phrases, latency, stage count, and
+reported usage. It is a smoke/reference experiment, not proof of coding
+correctness or a general multi-agent benchmark.
+
 ## Gemma 4 experiment
 
 For a local Gemma 4 GGUF, use an OpenAI-compatible server such as llama.cpp and
@@ -81,3 +109,6 @@ The first recorded run is
 The clean GitHub install, real-workflow evidence failure, prompt correction,
 and successful rerun are recorded in
 [`evaluations/2026-07-30-gemma-4-26b-a4b-q4km-evidence.md`](evaluations/2026-07-30-gemma-4-26b-a4b-q4km-evidence.md).
+The bounded local-delegation and Gemma 4 E4B context/quality experiment is
+recorded in
+[`evaluations/2026-07-31-gemma-4-e4b-delegation.md`](evaluations/2026-07-31-gemma-4-e4b-delegation.md).

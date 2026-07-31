@@ -466,6 +466,39 @@ npx --yes github:jade-blanco/chartermesh evaluate-model `
 `--live`는 실제 모델 호출에 대한 명시적 동의입니다. 이 시험은 세 개의 합성
 작업만 보내며 프로젝트 파일은 보내지 않습니다.
 
+### 7.5 소형 모델 멀티에이전트 시험
+
+일반 실행은 하나의 worker입니다. 아래처럼 `--delegated`를 붙이면 같은
+ModelEngine을 planner → implementer → verifier → synthesizer 순서로 네 번
+독립 실행합니다. 각 역할은 부모 Run 아래 별도 Attempt와 모델 사용량으로
+기록되고 마지막 산출물 하나만 사람 검토로 올라옵니다.
+
+```powershell
+npx --yes github:jade-blanco/chartermesh run `
+  --id work-000001 `
+  --delegated `
+  --target $Target
+```
+
+이 모드는 깊이 1, 역할 4개, 순차 실행, parent-only 전달로 제한된 실험
+기능입니다. 에이전트가 사람 승인을 대신하지 않으며, 파일 쓰기 도구는
+기존과 똑같이 정확한 호출 해시 승인을 받아야 합니다. Codex나 Claude의
+네이티브 subagent/agent team을 사용한다는 뜻도 아닙니다.
+
+단일 실행과 위임 실행의 품질을 같은 합성 업무로 비교하려면:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh evaluate-collaboration `
+  --target $Target `
+  --live `
+  --repetitions 3 `
+  --json
+```
+
+이 평가는 프로젝트 파일을 보내지 않습니다. 두 조건의 최대 출력 토큰 요청
+상한은 같지만 입력+출력 총 토큰이 같다고 주장하지 않으며, 실제 사용량은
+공급자가 제공한 값 그대로 별도 표시합니다.
+
 ## 8. 비용과 실행 한도
 
 CharterMesh 자체에는 모델 가격이 없습니다. 사용자가 선택한 모델, 계정,

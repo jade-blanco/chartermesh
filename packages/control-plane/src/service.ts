@@ -11,6 +11,7 @@ import type {
   AuditRecord,
   ArtifactReviewDecision,
   ArtifactEvidence,
+  AttemptRecord,
   DashboardProjection,
   ModelInvocationRecord,
   OperationalState,
@@ -120,6 +121,9 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "engineId",
   "modelId",
   "measurementStatus",
+  "parentAttemptId",
+  "roleId",
+  "kind",
 ]);
 
 function allowlistedAuditPayload(
@@ -194,6 +198,24 @@ function asInvocation(row: Row): ModelInvocationRecord {
     ) as ModelInvocationRecord["measurementStatus"],
     startedAt: String(row.started_at),
     finishedAt: row.finished_at ? String(row.finished_at) : null,
+  };
+}
+
+function asAttempt(row: Row): AttemptRecord {
+  return {
+    id: String(row.id),
+    runId: String(row.run_id),
+    parentAttemptId: row.parent_attempt_id
+      ? String(row.parent_attempt_id)
+      : null,
+    roleId: row.role_id ? String(row.role_id) : null,
+    kind: String(row.kind ?? "primary") as AttemptRecord["kind"],
+    attemptNo: Number(row.attempt_no),
+    status: String(row.status) as AttemptRecord["status"],
+    startedAt: String(row.started_at),
+    finishedAt: row.finished_at ? String(row.finished_at) : null,
+    errorCode: row.error_code ? String(row.error_code) : null,
+    errorMessage: row.error_message ? String(row.error_message) : null,
   };
 }
 
@@ -350,6 +372,22 @@ export class ControlPlane {
       if (Number(unknown.count) > 0) {
         throw new Error("BUDGET_UNKNOWN_COST_BLOCKED");
       }
+    }
+  }
+
+  private assertModelStartBudget(): void {
+    if (!this.budgets) return;
+    const dayStart = new Date();
+    dayStart.setUTCHours(0, 0, 0, 0);
+    const daily = this.database
+      .prepare(`
+        SELECT COUNT(*) AS count
+        FROM model_invocations
+        WHERE started_at >= ?
+      `)
+      .get(dayStart.toISOString()) as Row;
+    if (Number(daily.count) >= this.budgets.maxDailyModelStarts) {
+      throw new Error("BUDGET_DAILY_MODEL_STARTS_EXCEEDED");
     }
   }
 
@@ -1135,6 +1173,175 @@ export class ControlPlane {
     });
   }
 
+  startChildAttempt(input: {
+    parentAttemptId: string;
+    roleId: string;
+    actor: string;
+    maxChildren?: number;
+  }): AttemptRecord {
+    return this.transact(() => {
+      const parent = this.database
+        .prepare(`
+          SELECT a.id, a.run_id, a.kind, a.status, r.work_item_id,
+                 r.status AS run_status
+          FROM attempts a
+          JOIN runs r ON r.id = a.run_id
+          WHERE a.id = ?
+        `)
+        .get(input.parentAttemptId) as Row | undefined;
+      if (
+        !parent ||
+        parent.status !== "running" ||
+        parent.run_status !== "running"
+      ) {
+        throw new Error("Delegation parent attempt is not active.");
+      }
+      if (String(parent.kind ?? "primary") !== "primary") {
+        throw new Error("Delegation depth is limited to one.");
+      }
+      const maxChildren = input.maxChildren ?? 4;
+      if (
+        !Number.isInteger(maxChildren) ||
+        maxChildren < 1 ||
+        maxChildren > 16
+      ) {
+        throw new Error("maxChildren must be an integer from 1 to 16.");
+      }
+      const count = this.database
+        .prepare(`
+          SELECT COUNT(*) AS count
+          FROM attempts
+          WHERE parent_attempt_id = ?
+        `)
+        .get(input.parentAttemptId) as Row;
+      if (Number(count.count) >= maxChildren) {
+        throw new Error("Delegation child limit reached.");
+      }
+      const number = this.database
+        .prepare(`
+          SELECT COALESCE(MAX(attempt_no), 0) + 1 AS attempt_no
+          FROM attempts
+          WHERE run_id = ?
+        `)
+        .get(String(parent.run_id)) as Row;
+      const id = this.nextId("attempt");
+      const roleId = assertText(input.roleId, "roleId").slice(0, 100);
+      const stamp = now();
+      this.database
+        .prepare(`
+          INSERT INTO attempts(
+            id, run_id, parent_attempt_id, role_id, kind,
+            attempt_no, status, started_at
+          ) VALUES (?, ?, ?, ?, 'delegated', ?, 'running', ?)
+        `)
+        .run(
+          id,
+          String(parent.run_id),
+          input.parentAttemptId,
+          roleId,
+          Number(number.attempt_no),
+          stamp,
+        );
+      this.event(
+        "attempt.delegated.started",
+        String(parent.work_item_id),
+        input.actor,
+        {
+          attemptId: id,
+          parentAttemptId: input.parentAttemptId,
+          roleId,
+          kind: "delegated",
+          runId: String(parent.run_id),
+        },
+      );
+      return asAttempt(
+        this.database
+          .prepare("SELECT * FROM attempts WHERE id = ?")
+          .get(id) as Row,
+      );
+    });
+  }
+
+  finishChildAttempt(input: {
+    id: string;
+    status: "succeeded" | "failed" | "canceled";
+    actor: string;
+    errorCode?: string;
+    errorMessage?: string;
+  }): AttemptRecord {
+    return this.transact(() => {
+      const current = this.database
+        .prepare(`
+          SELECT a.*, r.work_item_id
+          FROM attempts a
+          JOIN runs r ON r.id = a.run_id
+          WHERE a.id = ?
+        `)
+        .get(input.id) as Row | undefined;
+      if (!current || String(current.kind) !== "delegated") {
+        throw new Error(`Unknown delegated attempt '${input.id}'.`);
+      }
+      if (current.status === "running") {
+        const errorCode = input.errorCode
+          ? assertText(input.errorCode, "errorCode").slice(0, 100)
+          : null;
+        const errorMessage = input.errorMessage
+          ? assertText(input.errorMessage, "errorMessage").slice(0, 1_000)
+          : null;
+        this.database
+          .prepare(`
+            UPDATE attempts
+            SET status = ?, finished_at = ?, error_code = ?,
+                error_message = ?
+            WHERE id = ? AND status = 'running'
+          `)
+          .run(
+            input.status,
+            now(),
+            errorCode,
+            errorMessage,
+            input.id,
+          );
+        this.event(
+          `attempt.delegated.${input.status}`,
+          String(current.work_item_id),
+          input.actor,
+          {
+            attemptId: input.id,
+            parentAttemptId: String(current.parent_attempt_id),
+            roleId: String(current.role_id),
+            kind: "delegated",
+            runId: String(current.run_id),
+            ...(errorCode ? { errorCode } : {}),
+          },
+        );
+      }
+      return asAttempt(
+        this.database
+          .prepare("SELECT * FROM attempts WHERE id = ?")
+          .get(input.id) as Row,
+      );
+    });
+  }
+
+  listAttempts(runId?: string): AttemptRecord[] {
+    const rows = runId
+      ? (this.database
+          .prepare(`
+            SELECT * FROM attempts
+            WHERE run_id = ?
+            ORDER BY attempt_no, id
+          `)
+          .all(runId) as Row[])
+      : (this.database
+          .prepare(`
+            SELECT * FROM attempts
+            ORDER BY started_at, attempt_no, id
+          `)
+          .all() as Row[]);
+    return rows.map(asAttempt);
+  }
+
   requestRunCancellation(input: {
     id: string;
     actor: string;
@@ -1189,6 +1396,77 @@ export class ControlPlane {
       `)
       .get(runId) as Row | undefined;
     return Boolean(row?.cancel_requested_at);
+  }
+
+  cancelRun(input: {
+    id: string;
+    generation: number;
+    actor: string;
+    idempotencyKey: string;
+  }): WorkItem {
+    return this.command(input.idempotencyKey, "run.cancel", () => {
+      const current = this.get(input.id);
+      if (current.status !== "in_progress") {
+        throw new Error("Only in-progress work can cancel an active run.");
+      }
+      this.assertActiveGeneration(input.id, input.generation);
+      const run = this.database
+        .prepare(`
+          SELECT id
+          FROM runs
+          WHERE work_item_id = ? AND generation = ?
+            AND status IN ('running', 'waiting')
+        `)
+        .get(input.id, input.generation) as Row | undefined;
+      if (!run) throw new Error("Active run was not found.");
+      const stamp = now();
+      this.database
+        .prepare(`
+          UPDATE model_invocations
+          SET status = 'canceled', finished_at = ?
+          WHERE status = 'running'
+            AND attempt_id IN (
+              SELECT id FROM attempts WHERE run_id = ?
+            )
+        `)
+        .run(stamp, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE attempts
+          SET status = 'canceled', finished_at = ?,
+              error_code = 'RUN_CANCELED',
+              error_message = 'The run was canceled by a human request.'
+          WHERE run_id = ? AND status IN ('running', 'waiting')
+        `)
+        .run(stamp, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE runs SET status = 'canceled', finished_at = ?
+          WHERE id = ?
+        `)
+        .run(stamp, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE leases SET released_at = ?
+          WHERE run_id = ? AND released_at IS NULL
+        `)
+        .run(stamp, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE work_items
+          SET status = 'canceled', availability = 'completed',
+              next_action = 'No action required.',
+              version = version + 1, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(stamp, input.id);
+      this.event("run.canceled", input.id, input.actor, {
+        runId: String(run.id),
+        generation: input.generation,
+        status: "canceled",
+      });
+      return this.get(input.id);
+    });
   }
 
   heartbeat(input: {
@@ -1349,26 +1627,30 @@ export class ControlPlane {
           .prepare(`
             SELECT id
             FROM model_invocations
-            WHERE attempt_id = ? AND status = 'running'
+            WHERE attempt_id IN (
+              SELECT id FROM attempts WHERE run_id = ?
+            ) AND status = 'running'
             ORDER BY id
           `)
-          .all(String(row.attempt_id)) as Row[];
+          .all(String(row.run_id)) as Row[];
         this.database
           .prepare(`
             UPDATE attempts
             SET status = 'failed', finished_at = ?,
                 error_code = 'LEASE_EXPIRED',
                 error_message = 'The worker lease expired before completion.'
-            WHERE id = ? AND status = 'running'
+            WHERE run_id = ? AND status = 'running'
           `)
-          .run(stamp, String(row.attempt_id));
+          .run(stamp, String(row.run_id));
         this.database
           .prepare(`
             UPDATE model_invocations
             SET status = 'abandoned', finished_at = ?
-            WHERE attempt_id = ? AND status = 'running'
+            WHERE attempt_id IN (
+              SELECT id FROM attempts WHERE run_id = ?
+            ) AND status = 'running'
           `)
-          .run(stamp, String(row.attempt_id));
+          .run(stamp, String(row.run_id));
         this.database
           .prepare(`
             UPDATE runs SET status = 'failed', finished_at = ?
@@ -1834,6 +2116,7 @@ export class ControlPlane {
     modelId: string;
   }): ModelInvocationRecord {
     return this.transact(() => {
+      this.assertModelStartBudget();
       const attempt = this.database
         .prepare(`
           SELECT a.id, r.work_item_id

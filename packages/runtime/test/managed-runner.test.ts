@@ -5,7 +5,10 @@ import type {
   InferenceResult,
   ModelEngine,
 } from "../../adapter-sdk/src/types.ts";
-import { BuiltInManagedRunner } from "../src/index.ts";
+import {
+  BuiltInManagedRunner,
+  DelegationController,
+} from "../src/index.ts";
 
 const usage: InferenceResult["usage"] = {
   inputTokens: 2,
@@ -180,4 +183,97 @@ test("runner cancellation aborts the active model request", async () => {
   );
   await runner.cancel(handle.hostRunId);
   assert.equal(aborted, true);
+});
+
+test("delegation controller runs four isolated bounded roles with typed lineage", async () => {
+  const requests: Array<{
+    invocationId: string;
+    user: string;
+    maxOutputTokens: number | undefined;
+  }> = [];
+  const engine: ModelEngine = {
+    manifest,
+    async generate(request) {
+      requests.push({
+        invocationId: request.invocationId,
+        user:
+          request.messages.find(({ role }) => role === "user")?.content ?? "",
+        maxOutputTokens: request.maxOutputTokens,
+      });
+      const role =
+        request.invocationId.match(/:(planner|implementer|verifier|synthesizer):/u)?.[1] ??
+        "worker";
+      return {
+        invocationId: request.invocationId,
+        text: JSON.stringify({
+          apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+          summary: `${role} result`,
+          deliverable: `${role} bounded deliverable`,
+          checks: [],
+          risks: [],
+          nextActions: [],
+          confidence: "medium",
+        }),
+        toolCalls: [],
+        finishReason: "stop",
+        usage,
+      };
+    },
+  };
+  const started: string[] = [];
+  const finished: string[] = [];
+  const controller = new DelegationController(256);
+  assert.equal(
+    new BuiltInManagedRunner().manifest.capabilities.some(
+      ({ name, support, stability }) =>
+        name === "orchestration.delegated" &&
+        support === "emulated" &&
+        stability === "experimental",
+    ),
+    true,
+  );
+  const result = await controller.run(
+    {
+      taskPacket: {
+        objective: "Prepare a synthetic release note.",
+        context: "Do not perform external actions.",
+        acceptanceCriteria: ["Return a bounded result."],
+      },
+      organizationRevision: 1,
+      workItemId: "work-delegated",
+      runId: "run-delegated",
+      attemptId: "attempt-parent",
+      generation: 1,
+    },
+    {
+      engine,
+      lifecycle: {
+        startStage({ role }) {
+          started.push(role);
+          return { attemptId: `attempt-parent:${role}` };
+        },
+        finishStage({ role, status }) {
+          finished.push(`${role}:${status}`);
+        },
+      },
+    },
+  );
+  assert.deepEqual(started, [
+    "planner",
+    "implementer",
+    "verifier",
+    "synthesizer",
+  ]);
+  assert.deepEqual(finished, started.map((role) => `${role}:succeeded`));
+  assert.equal(result.stages.length, 4);
+  assert.equal(result.generationBudget.maxGeneratedTokensRequested, 2_048);
+  assert.equal(
+    requests.every(({ maxOutputTokens }) => maxOutputTokens === 256),
+    true,
+  );
+  assert.doesNotMatch(requests[0]!.user, /HANDOFF/u);
+  assert.match(requests[1]!.user, /PLANNER HANDOFF/u);
+  assert.match(requests[2]!.user, /IMPLEMENTER HANDOFF/u);
+  assert.match(requests[3]!.user, /VERIFIER HANDOFF/u);
+  assert.match(result.inference.text, /synthesizer bounded deliverable/u);
 });

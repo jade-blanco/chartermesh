@@ -23,6 +23,7 @@ export type {
   AuditRecord,
   ArtifactReviewDecision,
   ArtifactEvidence,
+  AttemptRecord,
   ModelInvocationRecord,
   OperationalState,
   OutboxDelivery,
