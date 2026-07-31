@@ -65,9 +65,13 @@ export interface CodeSandboxJob {
   cases: CodeTestCase[];
 }
 
+export interface CodeSandboxRunOptions {
+  signal?: AbortSignal;
+}
+
 export interface CodeSandboxBackend {
   readonly manifest: CodeSandboxManifest;
-  probe(): Promise<CodeSandboxProbe>;
+  probe(options?: CodeSandboxRunOptions): Promise<CodeSandboxProbe>;
   run(
     task: Pick<
       CodeEvaluationTask,
@@ -76,9 +80,11 @@ export interface CodeSandboxBackend {
     candidate: CodeCandidate,
     cases: CodeTestCase[],
     jobId?: string,
+    options?: CodeSandboxRunOptions,
   ): Promise<CodeSandboxRunResult>;
   runBatch?(
     jobs: CodeSandboxJob[],
+    options?: CodeSandboxRunOptions,
   ): Promise<CodeSandboxRunResult[]>;
 }
 
@@ -105,8 +111,21 @@ export function sandboxProbePassed(
 
 export async function requireSafeSandbox(
   backend: CodeSandboxBackend,
+  options: CodeSandboxRunOptions = {},
 ): Promise<CodeSandboxProbe> {
-  const probe = await backend.probe();
+  if (options.signal?.aborted) {
+    throw (
+      options.signal.reason ??
+      new Error("CODE_SANDBOX_EVALUATION_CANCELED")
+    );
+  }
+  const probe = await backend.probe(options);
+  if (options.signal?.aborted) {
+    throw (
+      options.signal.reason ??
+      new Error("CODE_SANDBOX_EVALUATION_CANCELED")
+    );
+  }
   if (!sandboxProbePassed(probe, backend.manifest)) {
     throw new Error(
       `CODE_SANDBOX_UNAVAILABLE: backend '${backend.manifest.id}' did not satisfy every VM isolation canary.`,
@@ -147,7 +166,17 @@ export function validateSandboxResults(
 export async function runSandboxJobs(
   backend: CodeSandboxBackend,
   jobs: CodeSandboxJob[],
+  options: CodeSandboxRunOptions = {},
 ): Promise<CodeSandboxRunResult[]> {
+  const throwIfAborted = (): void => {
+    if (options.signal?.aborted) {
+      throw (
+        options.signal.reason ??
+        new Error("CODE_SANDBOX_EVALUATION_CANCELED")
+      );
+    }
+  };
+  throwIfAborted();
   const jobIds = new Set<string>();
   for (const job of jobs) {
     if (!job.id || jobIds.has(job.id)) {
@@ -158,18 +187,23 @@ export async function runSandboxJobs(
     jobIds.add(job.id);
   }
   if (backend.runBatch) {
-    return validateSandboxResults(jobs, await backend.runBatch(jobs));
+    const batch = await backend.runBatch(jobs, options);
+    throwIfAborted();
+    return validateSandboxResults(jobs, batch);
   }
   const results: CodeSandboxRunResult[] = [];
   for (const job of jobs) {
+    throwIfAborted();
     results.push(
       await backend.run(
         job.task,
         job.candidate,
         job.cases,
         job.id,
+        options,
       ),
     );
   }
+  throwIfAborted();
   return validateSandboxResults(jobs, results);
 }

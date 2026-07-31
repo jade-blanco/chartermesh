@@ -43,6 +43,10 @@ export class FakeModelEngine implements ModelEngine {
       }),
       toolCalls: [],
       finishReason: "stop",
+      providerIdentity: {
+        reportedModelId: "fake-model-engine",
+        reportedSystemFingerprint: "fake-model-engine:v1",
+      },
       usage: {
         inputTokens: 0,
         outputTokens: 0,

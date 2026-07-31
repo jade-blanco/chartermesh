@@ -19,6 +19,27 @@ export {
   type DelegationLifecycle,
 } from "./delegation-controller.ts";
 export {
+  PEER_TEAM_CONCURRENCY_CAPABILITY,
+  PeerTeamController,
+  PeerTeamControllerError,
+  parsePeerTeamDirective,
+  type PeerArtifactAccess,
+  type PeerDispatchDirective,
+  type PeerDispatchRecipient,
+  type PeerHandoffEnvelope,
+  type PeerHandoffRecord,
+  type PeerReviewDirective,
+  type PeerTeamControllerConfig,
+  type PeerTeamDirective,
+  type PeerTeamErrorCode,
+  type PeerTeamLifecycle,
+  type PeerTeamRole,
+  type PeerTeamRunMetrics,
+  type PeerTeamRunResult,
+  type PeerTeamSetup,
+  type PeerTeamStage,
+} from "./peer-team-controller.ts";
+export {
   ToolApprovalRequiredError,
   ToolIterationLimitError,
   ToolRuntime,

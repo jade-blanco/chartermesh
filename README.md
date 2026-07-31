@@ -272,6 +272,25 @@ feature or any live canary is unavailable. Setup, engine fingerprint flags,
 and commands are documented in
 [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md).
 
+To compare single-model and command-mediated team workflows across coding,
+product, research, spreadsheet, document, and presentation tasks, first create
+a no-inference study plan. A live run requires the exact regenerated plan hash:
+
+```powershell
+node bin/chartermesh.mjs evaluate-workflow --target TARGET --fixture product-package-easy-001 `
+  --engine-id local-model --codex-executable C:\absolute\path\to\codex.exe `
+  --codex-sha256 SHA256 --codex-model CODEX_MODEL --json
+```
+
+The six-arm study is documented in
+[`docs/COLLABORATION-STUDY.md`](docs/COLLABORATION-STUDY.md). Codex is a
+simulated ordinary-user proxy, never the production human approver. Code
+fixtures additionally require a passing attested Windows Sandbox preflight.
+Live reports retain the exact approved plan, enforce the provider-reported
+model identity, and use a per-plan lock. After confirming a stopped process,
+`--restart-checkpoint` preserves its abandoned run and starts a fresh isolated
+ledger.
+
 ## Operate from the CLI
 
 ```powershell
@@ -355,6 +374,7 @@ Key documents:
 - [`docs/FIRST-RUN.md`](docs/FIRST-RUN.md) — first configuration
 - [`docs/LLM-CONNECTIONS.md`](docs/LLM-CONNECTIONS.md) — model connection guide
 - [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md) — small-model experiment
+- [`docs/COLLABORATION-STUDY.md`](docs/COLLABORATION-STUDY.md) — longitudinal single/team validation
 - [`docs/USAGE.md`](docs/USAGE.md) — operating workflow
 - [`docs/PRODUCT-DESIGN.md`](docs/PRODUCT-DESIGN.md) — architecture source of truth
 - [`SECURITY.md`](SECURITY.md) — security and vulnerability reporting

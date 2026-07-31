@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -65,6 +66,32 @@ import {
 } from "./proposal.ts";
 import { evaluateModelEngine } from "./evaluate-model.ts";
 import { evaluateCollaboration } from "./evaluate-collaboration.ts";
+import { collectCodeEvaluationProvenance } from "./code-evaluation/provenance.ts";
+import {
+  SandboxContainmentError,
+  WindowsSandboxCodeBackend,
+} from "./code-evaluation/windows-sandbox.ts";
+import { CodexCliFeedbackProvider } from "./workflow-evaluation/codex-proxy.ts";
+import {
+  generateReferenceCodeWorkflowSuite,
+  preflightCodeWorkflowSandbox,
+} from "./workflow-evaluation/code-adapters.ts";
+import { createControlPlaneWorkflowStudyPersistence } from "./workflow-evaluation/control-plane-persistence.ts";
+import {
+  createWorkflowStudyPlan,
+  runBoundWorkflowStudy,
+  workflowStudyValueHash,
+  type WorkflowStudyTaskBinding,
+} from "./workflow-evaluation/runner.ts";
+import { generateReferenceArtifactSuite } from "./workflow-evaluation/suite.ts";
+import {
+  DEFAULT_WORKFLOW_TRAJECTORY_LIMITS,
+  WorkflowAbortSettlementError,
+} from "./workflow-evaluation/trajectory.ts";
+import type {
+  WorkflowTrajectoryLimits,
+  WorkflowTrajectoryReport,
+} from "./workflow-evaluation/types.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
 const CHARTERMESH_VERSION = "0.0.7-alpha.1";
@@ -1502,6 +1529,32 @@ export async function runWork(
           ? String(engine.config.model)
           : "deterministic-fixture";
       const requiredTools = controlPlane.requiredTools(candidate.id);
+      const revisionContext = (() => {
+        if (candidate.status !== "changes_requested") return "";
+        const decision = controlPlane.latestArtifactDecision(candidate.id);
+        const previousArtifact = controlPlane.latestArtifact(candidate.id);
+        if (
+          !decision ||
+          decision.decision !== "changes_requested" ||
+          !previousArtifact ||
+          decision.artifactHash !== previousArtifact.sha256
+        ) {
+          throw new Error("REVISION_CONTEXT_NOT_HASH_BOUND");
+        }
+        const context = [
+          "A reviewer requested changes to the previous immutable artifact.",
+          `Previous artifact SHA-256: ${previousArtifact.sha256}`,
+          "Exact review feedback:",
+          decision.note,
+          "Revise the prior artifact in response to this feedback. Do not claim the feedback itself is execution evidence.",
+          "Previous artifact:",
+          previousArtifact.content,
+        ].join("\n\n");
+        if (Buffer.byteLength(context, "utf8") > 131_072) {
+          throw new Error("REVISION_CONTEXT_SIZE_LIMIT_EXCEEDED");
+        }
+        return context;
+      })();
       const skillGuidance = portableSkillDocuments()
         .filter(
           ({ id: skillId }) =>
@@ -1518,6 +1571,7 @@ export async function runWork(
           objective: candidate.title,
           context: [
             candidate.summary,
+            revisionContext,
             skillGuidance
               ? `Assigned portable skill guidance:\n${skillGuidance}`
               : "",
@@ -2519,6 +2573,641 @@ async function evaluateCollaborationCommand(
     : 2;
 }
 
+function boundedIntegerOption(
+  args: string[],
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const raw = option(args, name);
+  const value = raw === undefined ? fallback : Number(raw);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw new Error(
+      `${name} must be an integer from ${minimum} to ${maximum}.`,
+    );
+  }
+  return value;
+}
+
+function workflowTrajectoryLimits(args: string[]): WorkflowTrajectoryLimits {
+  const maximumTotalTokens = option(args, "--max-total-tokens");
+  const wallClockMinutes = boundedIntegerOption(
+    args,
+    "--max-wall-clock-minutes",
+    DEFAULT_WORKFLOW_TRAJECTORY_LIMITS.maxWallClockMs / 60_000,
+    1,
+    1_440,
+  );
+  const limits: WorkflowTrajectoryLimits = {
+    boundedCheckpoint: boundedIntegerOption(
+      args,
+      "--checkpoint-feedback-rounds",
+      DEFAULT_WORKFLOW_TRAJECTORY_LIMITS.boundedCheckpoint,
+      1,
+      100,
+    ),
+    maxFeedbackRounds: boundedIntegerOption(
+      args,
+      "--max-feedback-rounds",
+      DEFAULT_WORKFLOW_TRAJECTORY_LIMITS.maxFeedbackRounds,
+      1,
+      1_000,
+    ),
+    maxWallClockMs: wallClockMinutes * 60_000,
+    maxModelCalls: boundedIntegerOption(
+      args,
+      "--max-model-calls",
+      DEFAULT_WORKFLOW_TRAJECTORY_LIMITS.maxModelCalls,
+      1,
+      100_000,
+    ),
+    maxTotalTokens:
+      maximumTotalTokens === undefined
+        ? null
+        : boundedIntegerOption(
+            args,
+            "--max-total-tokens",
+            1,
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+    identicalArtifactLimit: boundedIntegerOption(
+      args,
+      "--identical-artifact-limit",
+      DEFAULT_WORKFLOW_TRAJECTORY_LIMITS.identicalArtifactLimit,
+      2,
+      100,
+    ),
+    maxParallelAgents: boundedIntegerOption(
+      args,
+      "--max-parallel-agents",
+      DEFAULT_WORKFLOW_TRAJECTORY_LIMITS.maxParallelAgents,
+      1,
+      32,
+    ),
+  };
+  if (limits.maxFeedbackRounds < limits.boundedCheckpoint) {
+    throw new Error(
+      "--max-feedback-rounds must be at least --checkpoint-feedback-rounds.",
+    );
+  }
+  return limits;
+}
+
+function writeWorkflowStudyCheckpoint(
+  output: string,
+  value: unknown,
+): void {
+  mkdirSync(dirname(output), { recursive: true });
+  const temporary = `${output}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    renameSync(temporary, output);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function workflowStudyProcessIsRunning(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function acquireWorkflowStudyLock(input: {
+  path: string;
+  planHash: string;
+  recoverStale: boolean;
+}): { release(): void; recoveredStale: boolean } {
+  mkdirSync(dirname(input.path), { recursive: true });
+  const nonce = randomUUID();
+  const value = `${JSON.stringify({
+    apiVersion: "chartermesh.dev/collaboration-study-lock/v1alpha1",
+    planHash: input.planHash,
+    pid: process.pid,
+    nonce,
+    createdAt: new Date().toISOString(),
+  })}\n`;
+  let recoveredStale = false;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(input.path, value, { encoding: "utf8", flag: "wx" });
+      return {
+        recoveredStale,
+        release() {
+          try {
+            const current = JSON.parse(
+              readFileSync(input.path, "utf8"),
+            ) as { nonce?: unknown };
+            if (current.nonce === nonce) rmSync(input.path, { force: true });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+              throw error;
+            }
+          }
+        },
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let owner: { planHash?: unknown; pid?: unknown };
+      try {
+        owner = JSON.parse(readFileSync(input.path, "utf8")) as {
+          planHash?: unknown;
+          pid?: unknown;
+        };
+      } catch {
+        throw new Error(
+          "WORKFLOW_STUDY_LOCK_INVALID: the existing lock cannot be safely recovered.",
+        );
+      }
+      if (
+        typeof owner.pid === "number" &&
+        workflowStudyProcessIsRunning(owner.pid)
+      ) {
+        throw new Error(
+          `WORKFLOW_STUDY_ALREADY_RUNNING: process ${owner.pid} owns this plan.`,
+        );
+      }
+      if (!input.recoverStale) {
+        throw new Error(
+          "WORKFLOW_STUDY_STALE_LOCK: repeat with --restart-checkpoint only after confirming the earlier process stopped.",
+        );
+      }
+      if (owner.planHash !== input.planHash) {
+        throw new Error("WORKFLOW_STUDY_STALE_LOCK_PLAN_MISMATCH");
+      }
+      renameSync(
+        input.path,
+        `${input.path}.abandoned-${randomUUID()}`,
+      );
+      recoveredStale = true;
+    }
+  }
+  throw new Error("WORKFLOW_STUDY_LOCK_ACQUISITION_FAILED");
+}
+
+function assertRestartableWorkflowCheckpoint(
+  output: string,
+  planHash: string,
+): void {
+  const info = statSync(output);
+  if (!info.isFile() || info.size > 64 * 1024 * 1024) {
+    throw new Error("WORKFLOW_STUDY_CHECKPOINT_INVALID");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(output, "utf8"));
+  } catch {
+    throw new Error("WORKFLOW_STUDY_CHECKPOINT_INVALID");
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !["running", "failed"].includes(
+      String((value as { status?: unknown }).status),
+    ) ||
+    (value as { plan?: { planHash?: unknown } }).plan?.planHash !== planHash
+  ) {
+    throw new Error("WORKFLOW_STUDY_CHECKPOINT_NOT_RESTARTABLE");
+  }
+}
+
+async function evaluateWorkflowCommand(
+  target: string,
+  args: string[],
+): Promise<number> {
+  const artifactBindings: WorkflowStudyTaskBinding[] =
+    generateReferenceArtifactSuite().map((task) => ({
+      kind: "artifact",
+      task,
+    }));
+  const codeBindings: WorkflowStudyTaskBinding[] =
+    generateReferenceCodeWorkflowSuite().map((task) => ({
+      kind: "code",
+      task,
+    }));
+  const allTasks = [...artifactBindings, ...codeBindings];
+  const requestedFixtures = options(args, "--fixture");
+  const artifactOnly = has(args, "--artifacts-only");
+  const codeOnly = has(args, "--code-only");
+  const selectors = [
+    has(args, "--full"),
+    artifactOnly,
+    codeOnly,
+    requestedFixtures.length > 0,
+  ].filter(Boolean).length;
+  if (selectors > 1) {
+    throw new Error(
+      "Use only one of --full, --artifacts-only, --code-only, or --fixture.",
+    );
+  }
+  const requestedSet = new Set(requestedFixtures);
+  if (requestedSet.size !== requestedFixtures.length) {
+    throw new Error("Each --fixture may be supplied only once.");
+  }
+  for (const id of requestedSet) {
+    if (
+      !allTasks.some((binding) =>
+        binding.kind === "artifact"
+          ? binding.task.id === id
+          : binding.task.task.id === id,
+      )
+    ) {
+      throw new Error(`Unknown workflow-evaluation fixture '${id}'.`);
+    }
+  }
+  const tasks =
+    requestedSet.size > 0
+      ? allTasks.filter((binding) =>
+          requestedSet.has(
+            binding.kind === "artifact"
+              ? binding.task.id
+              : binding.task.task.id,
+          ),
+        )
+      : artifactOnly
+        ? artifactBindings
+        : codeOnly
+          ? codeBindings
+          : allTasks;
+  const limits = workflowTrajectoryLimits(args);
+  const seed = boundedIntegerOption(
+    args,
+    "--seed",
+    20260731,
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const engineId = option(args, "--engine-id");
+  const codexExecutable = option(args, "--codex-executable");
+  const codexSha256 = option(args, "--codex-sha256")?.toLowerCase();
+  const codexModel = option(args, "--codex-model");
+  const codexTimeoutMs = boundedIntegerOption(
+    args,
+    "--codex-timeout-ms",
+    120_000,
+    1_000,
+    900_000,
+  );
+  let runtime: RuntimeConfig | undefined;
+  let engineProfile: RuntimeConfig["modelEngines"][number] | undefined;
+  if (engineId) {
+    runtime = readRuntime(target);
+    engineProfile = runtime.modelEngines.find(({ id }) => id === engineId);
+    if (!engineProfile) throw new Error(`Unknown model engine '${engineId}'.`);
+  }
+  const configuredModelId = engineProfile
+    ? engineProfile.adapter === "fake"
+      ? "fake-model-engine"
+      : engineProfile.model ?? null
+    : null;
+  const manifestProfileId = engineProfile
+    ? engineProfile.adapter === "fake"
+      ? "fake-model-engine"
+      : engineProfile.id
+    : null;
+  const runtimeProfileHash = engineProfile
+    ? createHash("sha256")
+        .update(JSON.stringify(engineProfile))
+        .digest("hex")
+    : null;
+  const hasCodeTasks = tasks.some(({ kind }) => kind === "code");
+  const codeRuntimeExecutable = resolve(
+    option(args, "--code-runtime-executable") ?? process.execPath,
+  );
+  const requestedCodeSandboxLauncher = option(args, "--wsb-executable")
+    ? resolve(option(args, "--wsb-executable")!)
+    : "wsb.exe";
+  let codeSandboxLauncherExecutable = requestedCodeSandboxLauncher;
+  let codeSandboxLauncherAttestation:
+    | "file_sha256"
+    | "command_name_only"
+    | null = null;
+  let codeSandboxLauncherCommitment: string | null = null;
+  let codeSandboxLauncherSha256: string | null = null;
+  if (hasCodeTasks) {
+    const defaultWsbPath = process.env.SystemRoot
+      ? join(process.env.SystemRoot, "System32", "wsb.exe")
+      : null;
+    const launcherFile = option(args, "--wsb-executable")
+      ? requestedCodeSandboxLauncher
+      : defaultWsbPath && existsSync(defaultWsbPath)
+        ? defaultWsbPath
+        : null;
+    if (
+      option(args, "--wsb-executable") &&
+      !existsSync(requestedCodeSandboxLauncher)
+    ) {
+      throw new Error("--wsb-executable must name an existing file.");
+    }
+    codeSandboxLauncherExecutable = launcherFile ?? "wsb.exe";
+    codeSandboxLauncherAttestation = launcherFile
+      ? "file_sha256"
+      : "command_name_only";
+    codeSandboxLauncherSha256 = launcherFile
+      ? createHash("sha256").update(readFileSync(launcherFile)).digest("hex")
+      : null;
+    codeSandboxLauncherCommitment = workflowStudyValueHash({
+      attestation: codeSandboxLauncherAttestation,
+      value: codeSandboxLauncherSha256 ?? "wsb.exe",
+    });
+  }
+  let codeProvenance:
+    | Awaited<ReturnType<typeof collectCodeEvaluationProvenance>>
+    | undefined;
+  let codeProvenanceHash: string | null = null;
+  if (hasCodeTasks) {
+    const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+    const roots = [
+      resolve(moduleDirectory, "../../.."),
+      resolve(moduleDirectory, "../../../.."),
+    ];
+    const packageRoot = roots.find(
+      (candidate) =>
+        existsSync(join(candidate, "package.json")) &&
+        existsSync(join(candidate, "scripts", "windows-sandbox")),
+    );
+    if (!packageRoot) {
+      throw new Error(
+        "CODE_WORKFLOW_BUNDLE_NOT_FOUND: package.json and scripts/windows-sandbox are required.",
+      );
+    }
+    codeProvenance = await collectCodeEvaluationProvenance({
+      packageJson: join(packageRoot, "package.json"),
+      repositoryDirectory: packageRoot,
+      runtimeExecutable: codeRuntimeExecutable,
+      guestBundleDirectory: join(
+        packageRoot,
+        "scripts",
+        "windows-sandbox",
+      ),
+    });
+    codeProvenanceHash = workflowStudyValueHash(codeProvenance);
+  }
+  const plan = createWorkflowStudyPlan({
+    taskBindings: tasks,
+    limits,
+    seed,
+    bindings: {
+      candidateEngineId: manifestProfileId,
+      candidateRuntimeProfileHash: runtimeProfileHash,
+      candidateConfiguredModelId: configuredModelId,
+      codexExecutableSha256: codexSha256 ?? null,
+      codexModelId: codexModel ?? null,
+      codexTimeoutMs:
+        codexExecutable && codexSha256 && codexModel
+          ? codexTimeoutMs
+          : null,
+      codeSandboxId: hasCodeTasks
+        ? "windows-sandbox-protected-client"
+        : null,
+      codeSandboxProvenanceHash: codeProvenanceHash,
+      codeSandboxLauncherCommitment,
+      codeSandboxLauncherAttestation,
+    },
+  });
+
+  if (!has(args, "--live")) {
+    if (has(args, "--json")) {
+      writeJsonEnvelope("evaluate-workflow plan", plan);
+    } else {
+      console.log(
+        `Workflow study plan ${plan.studyId}: ${plan.tasks.length} tasks × ${plan.conditions.length} conditions = ${plan.plannedTrajectories} trajectories.`,
+      );
+      console.log(
+        `Checkpoint: ${plan.boundedCheckpointFeedbackRounds} feedback directives; convergence cap: ${plan.maximumFeedbackRoundsPerTrajectory}.`,
+      );
+      console.log(
+        "No model was called. Bind --engine-id, --codex-executable, --codex-sha256, and --codex-model; then approve the exact plan hash with --approve before adding --live.",
+      );
+      console.log(`Approval token: ${plan.planHash}`);
+      for (const task of plan.tasks) {
+        console.log(`- ${task.id} | ${task.family} | ${task.difficulty}`);
+      }
+    }
+    return 0;
+  }
+
+  if (selectors === 0) {
+    throw new Error(
+      "A live workflow study requires --fixture, --full, --artifacts-only, or --code-only.",
+    );
+  }
+  if (
+    (has(args, "--full") || artifactOnly || codeOnly) &&
+    !has(args, "--acknowledge-large-run")
+  ) {
+    throw new Error(
+      "The full study can make many local/provider calls. Repeat with --acknowledge-large-run.",
+    );
+  }
+  if (!engineId || !codexExecutable || !codexSha256 || !codexModel) {
+    throw new Error(
+      "Live workflow evaluation requires --engine-id ID, --codex-executable ABSOLUTE_PATH, --codex-sha256 SHA256, and --codex-model MODEL.",
+    );
+  }
+  if (!plan.liveReady) {
+    throw new Error(
+      "The selected runtime profile must record an explicit model id before live evaluation.",
+    );
+  }
+  if (option(args, "--approve") !== plan.planHash) {
+    throw new Error(
+      `Live workflow evaluation requires --approve ${plan.planHash}.`,
+    );
+  }
+  const engine = configuredEngine(
+    runtime!,
+    target,
+    engineId,
+  );
+  const codex = new CodexCliFeedbackProvider({
+    executablePath: codexExecutable,
+    executableSha256: codexSha256,
+    model: codexModel,
+    timeoutMs: codexTimeoutMs,
+  });
+  const codeSandbox = codeProvenance
+    ? {
+        backend: new WindowsSandboxCodeBackend({
+          provenance: codeProvenance,
+          runtimeExecutable: codeRuntimeExecutable,
+          wsbExecutable: codeSandboxLauncherExecutable,
+          ...(codeSandboxLauncherSha256
+            ? { wsbExecutableSha256: codeSandboxLauncherSha256 }
+            : {}),
+        }),
+        provenanceHash: codeProvenanceHash!,
+        launcherCommitment: codeSandboxLauncherCommitment!,
+        launcherAttestation: codeSandboxLauncherAttestation!,
+      }
+    : undefined;
+  const output = join(
+    statePaths(target).exports,
+    `${plan.studyId}.json`,
+  );
+  const restartRequested = has(args, "--restart-checkpoint");
+  const evaluationBase = join(statePaths(target).root, "evaluations");
+  const lock = acquireWorkflowStudyLock({
+    path: join(evaluationBase, `${plan.studyId}.lock`),
+    planHash: plan.planHash,
+    recoverStale: restartRequested,
+  });
+  let retainStudyLock = false;
+  const studyAbort = new AbortController();
+  const cancelStudy = (source: "SIGINT" | "SIGTERM"): void => {
+    if (!studyAbort.signal.aborted) {
+      studyAbort.abort(new Error(`WORKFLOW_STUDY_CANCELED_${source}`));
+    }
+  };
+  const onStudySigint = (): void => cancelStudy("SIGINT");
+  const onStudySigterm = (): void => cancelStudy("SIGTERM");
+  process.once("SIGINT", onStudySigint);
+  process.once("SIGTERM", onStudySigterm);
+  try {
+    if (existsSync(output)) {
+      if (!restartRequested) {
+        throw new Error(`Workflow study output already exists: ${output}`);
+      }
+      assertRestartableWorkflowCheckpoint(output, plan.planHash);
+    }
+    if (codeSandbox) {
+      await preflightCodeWorkflowSandbox(
+        codeSandbox.backend,
+        studyAbort.signal,
+      );
+    }
+    const restarting =
+      restartRequested && (existsSync(output) || lock.recoveredStale);
+    if (existsSync(output)) {
+      renameSync(output, `${output}.abandoned-${randomUUID()}`);
+    }
+    const evaluationRoot = join(
+      evaluationBase,
+      restarting
+        ? `${plan.studyId}-restart-${randomUUID()}`
+        : plan.studyId,
+    );
+    const evaluationDatabasePath = join(evaluationRoot, "state.db");
+    const evaluationArtifactPath = join(evaluationRoot, "artifacts");
+    const completedTrials: WorkflowTrajectoryReport[] = [];
+    writeWorkflowStudyCheckpoint(output, {
+      apiVersion: "chartermesh.dev/collaboration-study-checkpoint/v1alpha1",
+      status: "running",
+      updatedAt: new Date().toISOString(),
+      plan,
+      completedTrials,
+      evaluationControlPlane: evaluationDatabasePath,
+    });
+    let report;
+    try {
+      const evaluationDatabase = openControlPlaneDatabase(
+        evaluationDatabasePath,
+      );
+      const evaluationControlPlane = new ControlPlane(
+        evaluationDatabase,
+        evaluationArtifactPath,
+      );
+      try {
+        report = await runBoundWorkflowStudy({
+          plan,
+          taskBindings: tasks,
+          limits,
+          engine,
+          codex,
+          ...(codeSandbox ? { codeSandbox } : {}),
+          signal: studyAbort.signal,
+          persistence: createControlPlaneWorkflowStudyPersistence({
+            controlPlane: evaluationControlPlane,
+            configuredModelId: configuredModelId!,
+            maxChildrenPerTrial: Math.min(1_000, limits.maxModelCalls),
+          }),
+          onTrial(trial) {
+            completedTrials.push(trial);
+            writeWorkflowStudyCheckpoint(output, {
+              apiVersion:
+                "chartermesh.dev/collaboration-study-checkpoint/v1alpha1",
+              status: "running",
+              updatedAt: new Date().toISOString(),
+              plan,
+              completedTrials,
+              evaluationControlPlane: evaluationDatabasePath,
+            });
+          },
+        });
+      } finally {
+        evaluationDatabase.close();
+      }
+    } catch (error) {
+      retainStudyLock = error instanceof WorkflowAbortSettlementError;
+      writeWorkflowStudyCheckpoint(output, {
+        apiVersion: "chartermesh.dev/collaboration-study-checkpoint/v1alpha1",
+        status: "failed",
+        updatedAt: new Date().toISOString(),
+        plan,
+        completedTrials,
+        evaluationControlPlane: evaluationDatabasePath,
+        failure: {
+          name: error instanceof Error ? error.name : "UnknownError",
+          messageHash: createHash("sha256")
+            .update(error instanceof Error ? error.message : String(error))
+            .digest("hex"),
+        },
+      });
+      throw error;
+    }
+    writeWorkflowStudyCheckpoint(output, report);
+    if (has(args, "--json")) {
+      writeJsonEnvelope("evaluate-workflow", {
+        output,
+        evaluationControlPlane: evaluationDatabasePath,
+        report,
+      });
+    } else {
+      const passed = report.trials.filter(
+        ({ outcome }) => outcome.status === "passed",
+      ).length;
+      console.log(
+        `Workflow study ${report.studyId}: ${passed}/${report.trials.length} trajectories reached the sealed pass gate.`,
+      );
+      console.log(`Report: ${output}`);
+      console.log(`Evaluation Control Plane: ${evaluationDatabasePath}`);
+      for (const item of report.aggregate) {
+        console.log(
+          `- ${item.conditionId}: checkpoint ${item.passedByCheckpoint}/${item.trials}, final ${item.finalPassed}/${item.trials}, calls ${item.totalModelCalls}`,
+        );
+      }
+    }
+    return report.trials.every(({ outcome }) => outcome.status === "passed")
+      ? 0
+      : 2;
+  } catch (error) {
+    if (
+      error instanceof WorkflowAbortSettlementError ||
+      error instanceof SandboxContainmentError
+    ) {
+      retainStudyLock = true;
+    }
+    throw error;
+  } finally {
+    process.removeListener("SIGINT", onStudySigint);
+    process.removeListener("SIGTERM", onStudySigterm);
+    if (!retainStudyLock) lock.release();
+  }
+}
+
 function capabilitiesCommand(args: string[]): void {
   const subcommand = args[1] ?? "list";
   if (!["list", "recommend"].includes(subcommand)) {
@@ -2635,6 +3324,18 @@ Commands:
   chartermesh evaluate-model --target PATH --live [--engine-id ID] [--json]
   chartermesh evaluate-collaboration --target PATH --live [--engine-id ID] [--reviewer-engine-id ID] [--fixture ID]
     [--engine-id ID] [--repetitions 1] [--json]
+  chartermesh evaluate-workflow --target PATH
+    [--fixture ID | --full | --artifacts-only | --code-only]
+    [--checkpoint-feedback-rounds 10] [--max-feedback-rounds 50]
+    [--max-model-calls 512] [--max-total-tokens N]
+    [--max-wall-clock-minutes 480] [--max-parallel-agents 1] [--json]
+    [--code-runtime-executable ABSOLUTE_PATH] [--wsb-executable ABSOLUTE_PATH]
+  chartermesh evaluate-workflow ... --live --engine-id ID \
+    --codex-executable ABSOLUTE_PATH --codex-sha256 SHA256 --codex-model MODEL \
+    --approve PLAN_HASH
+    [--codex-timeout-ms 120000]
+    [--acknowledge-large-run]
+    [--restart-checkpoint]
   chartermesh capabilities list|recommend [--kind KIND] [--json]
   chartermesh skills list [--json]
   chartermesh skills show --id SKILL [--json]
@@ -2772,6 +3473,9 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   }
   if (command === "evaluate-collaboration") {
     return evaluateCollaborationCommand(target, args);
+  }
+  if (command === "evaluate-workflow") {
+    return evaluateWorkflowCommand(target, args);
   }
   if (command === "dashboard") {
     const { startDashboard } = await import("../../dashboard/src/server.ts");

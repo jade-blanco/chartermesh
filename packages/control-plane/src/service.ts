@@ -124,6 +124,8 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "parentAttemptId",
   "roleId",
   "kind",
+  "handoffHash",
+  "commandId",
 ]);
 
 function allowlistedAuditPayload(
@@ -1178,6 +1180,8 @@ export class ControlPlane {
     roleId: string;
     actor: string;
     maxChildren?: number;
+    handoffHash?: string;
+    commandId?: string;
   }): AttemptRecord {
     return this.transact(() => {
       const parent = this.database
@@ -1203,9 +1207,21 @@ export class ControlPlane {
       if (
         !Number.isInteger(maxChildren) ||
         maxChildren < 1 ||
-        maxChildren > 16
+        maxChildren > 1_000
       ) {
-        throw new Error("maxChildren must be an integer from 1 to 16.");
+        throw new Error("maxChildren must be an integer from 1 to 1000.");
+      }
+      if (
+        input.handoffHash !== undefined &&
+        !/^[a-f0-9]{64}$/u.test(input.handoffHash)
+      ) {
+        throw new Error("handoffHash must be a lowercase SHA-256 digest.");
+      }
+      if (
+        input.commandId !== undefined &&
+        (input.commandId.trim().length === 0 || input.commandId.length > 128)
+      ) {
+        throw new Error("commandId must contain 1 to 128 characters.");
       }
       const count = this.database
         .prepare(`
@@ -1252,6 +1268,12 @@ export class ControlPlane {
           roleId,
           kind: "delegated",
           runId: String(parent.run_id),
+          ...(input.handoffHash
+            ? { handoffHash: assertText(input.handoffHash, "handoffHash") }
+            : {}),
+          ...(input.commandId
+            ? { commandId: assertText(input.commandId, "commandId") }
+            : {}),
         },
       );
       return asAttempt(
@@ -1896,6 +1918,27 @@ export class ControlPlane {
           byteSize,
           now(),
         );
+      const completedAt = now();
+      this.database
+        .prepare(`
+          UPDATE attempts
+          SET status = 'succeeded', finished_at = ?
+          WHERE run_id = ? AND status IN ('running', 'waiting')
+        `)
+        .run(completedAt, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE runs
+          SET status = 'succeeded', finished_at = ?
+          WHERE id = ? AND status = 'running'
+        `)
+        .run(completedAt, String(run.id));
+      this.database
+        .prepare(`
+          UPDATE leases SET released_at = ?
+          WHERE run_id = ? AND released_at IS NULL
+        `)
+        .run(completedAt, String(run.id));
       this.database
         .prepare(`
           UPDATE work_items
@@ -1906,7 +1949,7 @@ export class ControlPlane {
               version = version + 1, updated_at = ?
           WHERE id = ?
         `)
-        .run(digest, input.actor, now(), input.id);
+        .run(digest, input.actor, completedAt, input.id);
       this.event("artifact.submitted", input.id, input.actor, {
         artifactId,
         sha256: digest,

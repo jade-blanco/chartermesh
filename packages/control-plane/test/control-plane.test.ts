@@ -80,6 +80,20 @@ test("intake through approval completes and resurfaces a successor", () => {
     });
     assert.match(submission.sha256, /^[a-f0-9]{64}$/u);
     assert.equal(submission.workItem.status, "review_pending");
+    const runState = database
+      .prepare("SELECT status, finished_at FROM runs WHERE id = ?")
+      .get(claim.runId) as { status: string; finished_at: string | null };
+    const attemptState = database
+      .prepare("SELECT status, finished_at FROM attempts WHERE id = ?")
+      .get(claim.attemptId) as { status: string; finished_at: string | null };
+    const leaseState = database
+      .prepare("SELECT released_at FROM leases WHERE id = ?")
+      .get(claim.leaseId) as { released_at: string | null };
+    assert.equal(runState.status, "succeeded");
+    assert.ok(runState.finished_at);
+    assert.equal(attemptState.status, "succeeded");
+    assert.ok(attemptState.finished_at);
+    assert.ok(leaseState.released_at);
 
     controlPlane.decide({
       id: first.id,

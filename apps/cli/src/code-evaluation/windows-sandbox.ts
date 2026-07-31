@@ -9,6 +9,7 @@ import { existsSync } from "node:fs";
 import {
   chmod,
   lstat,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -17,10 +18,11 @@ import {
   readdir,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify, isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { CodeCandidate } from "./candidate.ts";
@@ -37,6 +39,7 @@ import type {
   CodeSandboxBackend,
   CodeSandboxJob,
   CodeSandboxProbe,
+  CodeSandboxRunOptions,
   CodeSandboxRunResult,
 } from "./sandbox.ts";
 import { requireSafeSandbox } from "./sandbox.ts";
@@ -48,6 +51,50 @@ const MAX_OUTPUT_TREE_ENTRIES = 512;
 const MAX_OUTPUT_TREE_DEPTH = 8;
 export const PROGRAM_OUTPUT_LIMIT_BYTES = 131_072;
 const MAX_AUTHENTICATED_PAYLOAD_BYTES = 98_304;
+const MAX_SESSION_JOURNAL_BYTES = 4_096;
+const SESSION_JOURNAL_API_VERSION =
+  "chartermesh.dev/windows-sandbox-session/v1alpha1";
+const UUID_PATTERN =
+  /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u;
+const OWNER_NONCE_PATTERN = /^[a-f0-9]{32}$/u;
+
+function sandboxAbortReason(signal?: AbortSignal): unknown {
+  return (
+    signal?.reason ?? new Error("CODE_SANDBOX_EVALUATION_CANCELED")
+  );
+}
+
+function throwIfSandboxAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw sandboxAbortReason(signal);
+}
+
+async function abortableDelay(
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfSandboxAborted(signal);
+  if (!signal) {
+    await new Promise((resolveDelay) =>
+      setTimeout(resolveDelay, milliseconds),
+    );
+    return;
+  }
+  await new Promise<void>((resolveDelay, rejectDelay) => {
+    const complete = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      resolveDelay();
+    };
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      rejectDelay(sandboxAbortReason(signal));
+    };
+    const timer = setTimeout(complete, milliseconds);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
 
 function bundledSandboxScript(name: string): string {
   const sourcePath = fileURLToPath(
@@ -376,6 +423,396 @@ function sameFileIdentity(
     left.ino === right.ino &&
     left.size === right.size
   );
+}
+
+export interface WindowsSandboxLauncherAttestation {
+  resolved: string;
+  dev: number | bigint;
+  ino: number | bigint;
+  size: number;
+}
+
+export async function attestWindowsSandboxLauncher(
+  path: string,
+  expectedSha256: string,
+  previous?: WindowsSandboxLauncherAttestation,
+): Promise<WindowsSandboxLauncherAttestation> {
+  if (!SHA256_PATTERN.test(expectedSha256)) {
+    throw new Error("SANDBOX_WSB_PROVENANCE_HASH_INVALID");
+  }
+  if (!isAbsolute(path)) {
+    throw new Error("SANDBOX_WSB_PROVENANCE_PATH_NOT_ABSOLUTE");
+  }
+  const absolutePath = resolve(path);
+  const before = await stableFileIdentity(absolutePath);
+  if (before.resolved.toLowerCase() !== absolutePath.toLowerCase()) {
+    throw new Error("SANDBOX_WSB_PROVENANCE_PATH_REDIRECT");
+  }
+  if (previous && !sameFileIdentity(previous, before)) {
+    throw new Error("SANDBOX_WSB_PROVENANCE_IDENTITY_CHANGED");
+  }
+  const handle = await open(before.resolved, "r");
+  try {
+    const opened = await handle.stat();
+    const digest = await hashFileHandle(handle);
+    const after = await stableFileIdentity(absolutePath);
+    if (
+      !opened.isFile() ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      digest.bytes !== opened.size ||
+      !sameFileIdentity(before, after)
+    ) {
+      throw new Error("SANDBOX_WSB_PROVENANCE_RACE");
+    }
+    if (digest.sha256 !== expectedSha256) {
+      throw new Error("SANDBOX_WSB_PROVENANCE_HASH_MISMATCH");
+    }
+    return before;
+  } finally {
+    await handle.close();
+  }
+}
+
+export interface WindowsSandboxSessionJournalRecord {
+  apiVersion: typeof SESSION_JOURNAL_API_VERSION;
+  sandboxId: string;
+  ownerPid: number;
+  ownerNonce: string;
+  createdAtMs: number;
+  launcherSha256: string | null;
+  checksum: string;
+}
+
+type WindowsSandboxSessionJournalPayload = Omit<
+  WindowsSandboxSessionJournalRecord,
+  "checksum"
+>;
+
+function sessionJournalPayload(
+  input: Omit<
+    WindowsSandboxSessionJournalPayload,
+    "apiVersion"
+  >,
+): WindowsSandboxSessionJournalPayload {
+  return {
+    apiVersion: SESSION_JOURNAL_API_VERSION,
+    sandboxId: input.sandboxId,
+    ownerPid: input.ownerPid,
+    ownerNonce: input.ownerNonce,
+    createdAtMs: input.createdAtMs,
+    launcherSha256: input.launcherSha256,
+  };
+}
+
+function sessionJournalChecksum(
+  payload: WindowsSandboxSessionJournalPayload,
+): string {
+  return sha256(JSON.stringify(payload));
+}
+
+export function createWindowsSandboxSessionJournal(
+  input: Omit<
+    WindowsSandboxSessionJournalPayload,
+    "apiVersion"
+  >,
+): WindowsSandboxSessionJournalRecord {
+  const payload = sessionJournalPayload(input);
+  // Validate values through the same parser used after a crash. This keeps
+  // the on-disk recovery contract narrower than the constructor's types.
+  return parseWindowsSandboxSessionJournal(
+    `${JSON.stringify({
+      ...payload,
+      checksum: sessionJournalChecksum(payload),
+    })}\n`,
+    input.launcherSha256 ?? undefined,
+  );
+}
+
+export function parseWindowsSandboxSessionJournal(
+  raw: string,
+  expectedLauncherSha256?: string,
+): WindowsSandboxSessionJournalRecord {
+  if (Buffer.byteLength(raw, "utf8") > MAX_SESSION_JOURNAL_BYTES) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_LIMIT");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("SANDBOX_SESSION_JOURNAL_INVALID");
+  }
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "apiVersion",
+      "sandboxId",
+      "ownerPid",
+      "ownerNonce",
+      "createdAtMs",
+      "launcherSha256",
+      "checksum",
+    ]) ||
+    value.apiVersion !== SESSION_JOURNAL_API_VERSION ||
+    typeof value.sandboxId !== "string" ||
+    !UUID_PATTERN.test(value.sandboxId) ||
+    typeof value.ownerPid !== "number" ||
+    !Number.isSafeInteger(value.ownerPid) ||
+    value.ownerPid < 1 ||
+    value.ownerPid > 4_294_967_295 ||
+    typeof value.ownerNonce !== "string" ||
+    !OWNER_NONCE_PATTERN.test(value.ownerNonce) ||
+    typeof value.createdAtMs !== "number" ||
+    !Number.isSafeInteger(value.createdAtMs) ||
+    value.createdAtMs < 1 ||
+    !(
+      value.launcherSha256 === null ||
+      (typeof value.launcherSha256 === "string" &&
+        SHA256_PATTERN.test(value.launcherSha256))
+    ) ||
+    typeof value.checksum !== "string" ||
+    !SHA256_PATTERN.test(value.checksum)
+  ) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_INVALID");
+  }
+  const record = value as unknown as WindowsSandboxSessionJournalRecord;
+  const payload = sessionJournalPayload({
+    sandboxId: record.sandboxId,
+    ownerPid: record.ownerPid,
+    ownerNonce: record.ownerNonce,
+    createdAtMs: record.createdAtMs,
+    launcherSha256: record.launcherSha256,
+  });
+  if (record.checksum !== sessionJournalChecksum(payload)) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_CHECKSUM_MISMATCH");
+  }
+  const expectedLauncher = expectedLauncherSha256 ?? null;
+  if (record.launcherSha256 !== expectedLauncher) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_LAUNCHER_MISMATCH");
+  }
+  return { ...record };
+}
+
+interface StableSessionJournal {
+  record: WindowsSandboxSessionJournalRecord;
+  resolved: string;
+  dev: number | bigint;
+  ino: number | bigint;
+  size: number;
+}
+
+function filesystemErrorCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
+async function validatedSessionJournalPath(path: string): Promise<string> {
+  if (!isAbsolute(path)) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_PATH_NOT_ABSOLUTE");
+  }
+  const absolutePath = resolve(path);
+  const parent = dirname(absolutePath);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const before = await lstat(parent);
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_PARENT_INVALID");
+  }
+  const resolvedParent = await realpath(parent);
+  const after = await lstat(parent);
+  if (
+    resolvedParent.toLowerCase() !== parent.toLowerCase() ||
+    after.isSymbolicLink() ||
+    !after.isDirectory() ||
+    before.dev !== after.dev ||
+    before.ino !== after.ino
+  ) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_PARENT_REDIRECT");
+  }
+  return absolutePath;
+}
+
+async function readWindowsSandboxSessionJournal(
+  path: string,
+  expectedLauncherSha256?: string,
+): Promise<StableSessionJournal | null> {
+  const absolutePath = await validatedSessionJournalPath(path);
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try {
+    before = await lstat(absolutePath);
+  } catch (error) {
+    if (filesystemErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.size < 1 ||
+    before.size > MAX_SESSION_JOURNAL_BYTES
+  ) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_FILE_INVALID");
+  }
+  const resolvedPath = await realpath(absolutePath);
+  if (resolvedPath.toLowerCase() !== absolutePath.toLowerCase()) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_PATH_REDIRECT");
+  }
+  const handle = await open(absolutePath, "r");
+  try {
+    const opened = await handle.stat();
+    const bytes = await handle.readFile();
+    const after = await lstat(absolutePath);
+    const resolvedAfter = await realpath(absolutePath);
+    if (
+      !opened.isFile() ||
+      opened.size !== bytes.byteLength ||
+      bytes.byteLength > MAX_SESSION_JOURNAL_BYTES ||
+      after.isSymbolicLink() ||
+      !after.isFile() ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      resolvedAfter.toLowerCase() !== resolvedPath.toLowerCase()
+    ) {
+      throw new Error("SANDBOX_SESSION_JOURNAL_RACE");
+    }
+    return {
+      record: parseWindowsSandboxSessionJournal(
+        bytes.toString("utf8"),
+        expectedLauncherSha256,
+      ),
+      resolved: resolvedPath,
+      dev: before.dev,
+      ino: before.ino,
+      size: before.size,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function persistWindowsSandboxSessionJournal(
+  path: string,
+  record: WindowsSandboxSessionJournalRecord,
+): Promise<void> {
+  const absolutePath = await validatedSessionJournalPath(path);
+  const validated = parseWindowsSandboxSessionJournal(
+    `${JSON.stringify(record)}\n`,
+    record.launcherSha256 ?? undefined,
+  );
+  const serialized = `${JSON.stringify(validated)}\n`;
+  const temporary = `${absolutePath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, "wx", 0o600);
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    try {
+      // A hard link publishes the completely flushed inode and, unlike
+      // rename on Windows, cannot replace an existing live journal.
+      await link(temporary, absolutePath);
+    } catch (error) {
+      if (filesystemErrorCode(error) === "EEXIST") {
+        throw new Error("SANDBOX_SESSION_JOURNAL_BUSY");
+      }
+      throw error;
+    }
+    const observed = await readWindowsSandboxSessionJournal(
+      absolutePath,
+      record.launcherSha256 ?? undefined,
+    );
+    if (
+      !observed ||
+      !isDeepStrictEqual(observed.record, validated)
+    ) {
+      throw new Error("SANDBOX_SESSION_JOURNAL_PERSIST_FAILED");
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function clearWindowsSandboxSessionJournal(
+  path: string,
+  expected: WindowsSandboxSessionJournalRecord,
+): Promise<void> {
+  const observed = await readWindowsSandboxSessionJournal(
+    path,
+    expected.launcherSha256 ?? undefined,
+  );
+  if (
+    !observed ||
+    !isDeepStrictEqual(observed.record, expected)
+  ) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_CHANGED");
+  }
+  const immediatelyBefore = await lstat(observed.resolved);
+  if (
+    immediatelyBefore.isSymbolicLink() ||
+    !immediatelyBefore.isFile() ||
+    immediatelyBefore.dev !== observed.dev ||
+    immediatelyBefore.ino !== observed.ino ||
+    immediatelyBefore.size !== observed.size
+  ) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_RACE");
+  }
+  // Never recurse here: the journal contains no filesystem path and a
+  // substituted directory or link must not become a deletion target.
+  await unlink(observed.resolved);
+}
+
+function processAppearsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return filesystemErrorCode(error) !== "ESRCH";
+  }
+}
+
+export async function recoverWindowsSandboxSessionJournal(options: {
+  path: string;
+  expectedLauncherSha256?: string;
+  currentOwnerNonce: string;
+  recoverableOwnedSandboxId?: string;
+  stopAndAttest: (sandboxId: string) => Promise<void>;
+  ownerAppearsAlive?: (pid: number) => boolean | Promise<boolean>;
+}): Promise<string | null> {
+  if (!OWNER_NONCE_PATTERN.test(options.currentOwnerNonce)) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_OWNER_INVALID");
+  }
+  const observed = await readWindowsSandboxSessionJournal(
+    options.path,
+    options.expectedLauncherSha256,
+  );
+  if (!observed) return null;
+  const ownedByCaller =
+    observed.record.ownerNonce === options.currentOwnerNonce;
+  if (
+    (ownedByCaller &&
+      observed.record.sandboxId !==
+        options.recoverableOwnedSandboxId) ||
+    (!ownedByCaller &&
+      (await (options.ownerAppearsAlive ?? processAppearsAlive)(
+        observed.record.ownerPid,
+      )))
+  ) {
+    throw new Error("SANDBOX_SESSION_JOURNAL_BUSY");
+  }
+  // stopAndAttest must include both the stop request and a structured `list`
+  // observation proving that this exact ID is absent or stopped.
+  await options.stopAndAttest(observed.record.sandboxId);
+  await clearWindowsSandboxSessionJournal(
+    options.path,
+    observed.record,
+  );
+  return observed.record.sandboxId;
 }
 
 export async function stageProvenanceFile(
@@ -893,6 +1330,7 @@ export class WindowsSandboxCodeBackend
   } as const;
 
   private readonly wsbExecutable: string;
+  private readonly wsbExecutableSha256?: string;
   private readonly guestRunner: string;
   private readonly candidateExecutor: string;
   private readonly candidateWorker: string;
@@ -901,12 +1339,16 @@ export class WindowsSandboxCodeBackend
   private readonly runtimeExecutable: string;
   private readonly runtimeExecutableSha256: string;
   private readonly guestFileHashes: ReadonlyMap<string, string>;
+  private readonly sessionJournalPath: string;
+  private readonly sessionOwnerNonce = randomUUID().replaceAll("-", "");
+  private recoverableOwnedSessionId?: string;
   private probeCache?: CodeSandboxProbe;
 
   constructor(
     options: {
       provenance: CodeEvaluationProvenance;
       wsbExecutable?: string;
+      wsbExecutableSha256?: string;
       guestRunner?: string;
       candidateExecutor?: string;
       candidateWorker?: string;
@@ -914,6 +1356,7 @@ export class WindowsSandboxCodeBackend
       canaryCandidate?: string;
       runtimeExecutable?: string;
       runtimeDirectory?: string;
+      sessionJournalPath?: string;
     },
   ) {
     validateCodeEvaluationProvenance(options.provenance);
@@ -923,6 +1366,21 @@ export class WindowsSandboxCodeBackend
       );
     }
     this.wsbExecutable = options.wsbExecutable ?? "wsb.exe";
+    const commandNameOnly =
+      !isAbsolute(this.wsbExecutable) &&
+      !/[\\/]/u.test(this.wsbExecutable);
+    if (!commandNameOnly && !options.wsbExecutableSha256) {
+      throw new Error("SANDBOX_WSB_PROVENANCE_HASH_REQUIRED");
+    }
+    if (options.wsbExecutableSha256) {
+      if (!isAbsolute(this.wsbExecutable)) {
+        throw new Error("SANDBOX_WSB_PROVENANCE_PATH_NOT_ABSOLUTE");
+      }
+      if (!SHA256_PATTERN.test(options.wsbExecutableSha256)) {
+        throw new Error("SANDBOX_WSB_PROVENANCE_HASH_INVALID");
+      }
+      this.wsbExecutableSha256 = options.wsbExecutableSha256;
+    }
     this.guestRunner =
       options.guestRunner ??
       bundledSandboxScript("guest-runner.mjs");
@@ -953,6 +1411,97 @@ export class WindowsSandboxCodeBackend
         ],
       ),
     );
+    this.sessionJournalPath =
+      options.sessionJournalPath ??
+      join(tmpdir(), "chartermesh-wsb-session-v1.json");
+    if (!isAbsolute(this.sessionJournalPath)) {
+      throw new Error("SANDBOX_SESSION_JOURNAL_PATH_NOT_ABSOLUTE");
+    }
+  }
+
+  private async recoverStaleSandboxSession(): Promise<void> {
+    let recovered: string | null;
+    try {
+      recovered = await recoverWindowsSandboxSessionJournal({
+        path: this.sessionJournalPath,
+        ...(this.wsbExecutableSha256
+          ? {
+              expectedLauncherSha256:
+                this.wsbExecutableSha256,
+            }
+          : {}),
+        currentOwnerNonce: this.sessionOwnerNonce,
+        ...(this.recoverableOwnedSessionId
+          ? {
+              recoverableOwnedSandboxId:
+                this.recoverableOwnedSessionId,
+            }
+          : {}),
+        stopAndAttest: (sandboxId) =>
+          this.stopSandbox(sandboxId),
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.startsWith("SANDBOX_STOP_UNATTESTED")
+      ) {
+        throw new SandboxContainmentError(
+          "journaled Windows Sandbox session",
+        );
+      }
+      throw error;
+    }
+    if (recovered) this.recoverableOwnedSessionId = undefined;
+  }
+
+  private async beginSandboxSession(
+    sandboxId: string,
+  ): Promise<WindowsSandboxSessionJournalRecord> {
+    await this.recoverStaleSandboxSession();
+    const record = createWindowsSandboxSessionJournal({
+      sandboxId,
+      ownerPid: process.pid,
+      ownerNonce: this.sessionOwnerNonce,
+      createdAtMs: Date.now(),
+      launcherSha256: this.wsbExecutableSha256 ?? null,
+    });
+    await persistWindowsSandboxSessionJournal(
+      this.sessionJournalPath,
+      record,
+    );
+    return record;
+  }
+
+  private async cleanupJournaledSandboxSession(options: {
+    root: string;
+    sandboxId: string;
+    journal?: WindowsSandboxSessionJournalRecord;
+    sandboxMayBeRunning: boolean;
+    sandboxStopped: boolean;
+    beforeRemove?: () => Promise<void>;
+  }): Promise<void> {
+    try {
+      await cleanupSandboxSession({
+        root: options.root,
+        sandboxMayBeRunning: options.sandboxMayBeRunning,
+        sandboxStopped: options.sandboxStopped,
+        stop: () => this.stopSandbox(options.sandboxId),
+        ...(options.beforeRemove
+          ? { beforeRemove: options.beforeRemove }
+          : {}),
+      });
+      if (options.journal) {
+        await clearWindowsSandboxSessionJournal(
+          this.sessionJournalPath,
+          options.journal,
+        );
+      }
+    } catch (error) {
+      if (options.journal) {
+        this.recoverableOwnedSessionId = options.sandboxId;
+      }
+      throw error;
+    }
   }
 
   private async stageRuntime(root: string): Promise<{
@@ -991,11 +1540,41 @@ export class WindowsSandboxCodeBackend
     );
   }
 
+  private async executeWsb(
+    args: string[],
+    options: {
+      timeout: number;
+      windowsHide: boolean;
+      signal?: AbortSignal;
+    },
+  ) {
+    const before = this.wsbExecutableSha256
+      ? await attestWindowsSandboxLauncher(
+          this.wsbExecutable,
+          this.wsbExecutableSha256,
+        )
+      : undefined;
+    try {
+      return await execFileAsync(
+        this.wsbExecutable,
+        args,
+        options,
+      );
+    } finally {
+      if (before && this.wsbExecutableSha256) {
+        await attestWindowsSandboxLauncher(
+          this.wsbExecutable,
+          this.wsbExecutableSha256,
+          before,
+        );
+      }
+    }
+  }
+
   private async stopSandbox(sandboxId: string): Promise<void> {
     let stopFailed = false;
     try {
-      await execFileAsync(
-        this.wsbExecutable,
+      await this.executeWsb(
         ["stop", "--raw", "--id", sandboxId],
         { timeout: 30_000, windowsHide: true },
       );
@@ -1007,8 +1586,7 @@ export class WindowsSandboxCodeBackend
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       try {
-        const { stdout } = await execFileAsync(
-          this.wsbExecutable,
+        const { stdout } = await this.executeWsb(
           ["list", "--raw"],
           { timeout: 15_000, windowsHide: true },
         );
@@ -1032,14 +1610,22 @@ export class WindowsSandboxCodeBackend
     );
   }
 
-  async probe(): Promise<CodeSandboxProbe> {
+  async probe(
+    options: CodeSandboxRunOptions = {},
+  ): Promise<CodeSandboxProbe> {
+    throwIfSandboxAborted(options.signal);
+    await this.recoverStaleSandboxSession();
+    throwIfSandboxAborted(options.signal);
     if (this.probeCache) return structuredClone(this.probeCache);
     const issues: string[] = [];
     try {
-      const { stdout, stderr } = await execFileAsync(
-        this.wsbExecutable,
+      const { stdout, stderr } = await this.executeWsb(
         ["--help"],
-        { timeout: 15_000, windowsHide: true },
+        {
+          timeout: 15_000,
+          windowsHide: true,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
       );
       const help = `${stdout}\n${stderr}`.toLowerCase();
       for (const command of ["start", "stop", "list"]) {
@@ -1048,6 +1634,7 @@ export class WindowsSandboxCodeBackend
         }
       }
     } catch {
+      throwIfSandboxAborted(options.signal);
       issues.push("WSB_CLI_UNAVAILABLE");
     }
     const evidence: CodeSandboxProbe["evidence"] = {
@@ -1069,8 +1656,12 @@ export class WindowsSandboxCodeBackend
       const sandboxId = randomUUID();
       let sandboxMayBeRunning = false;
       let sandboxStopped = false;
+      let sessionJournal:
+        | WindowsSandboxSessionJournalRecord
+        | undefined;
       let stagedProvenanceFiles: StagedProvenanceFile[] = [];
       try {
+        throwIfSandboxAborted(options.signal);
         await mkdir(input, { recursive: true });
         await mkdir(output, { recursive: true });
         const runtime = await this.stageRuntime(root);
@@ -1118,9 +1709,10 @@ export class WindowsSandboxCodeBackend
         await verifyStagedProvenanceFiles(
           stagedProvenanceFiles,
         );
+        throwIfSandboxAborted(options.signal);
+        sessionJournal = await this.beginSandboxSession(sandboxId);
         sandboxMayBeRunning = true;
-        await execFileAsync(
-          this.wsbExecutable,
+        await this.executeWsb(
           [
             "start",
             "--raw",
@@ -1129,10 +1721,15 @@ export class WindowsSandboxCodeBackend
             "--config",
             configuration,
           ],
-          { timeout: 120_000, windowsHide: true },
+          {
+            timeout: 120_000,
+            windowsHide: true,
+            ...(options.signal ? { signal: options.signal } : {}),
+          },
         );
         const deadline = Date.now() + 120_000;
         while (Date.now() < deadline) {
+          throwIfSandboxAborted(options.signal);
           const complete = await stat(
             join(output, "canary-complete.json"),
           ).then(
@@ -1140,12 +1737,11 @@ export class WindowsSandboxCodeBackend
             () => false,
           );
           if (complete) break;
-          await new Promise((resolveDelay) =>
-            setTimeout(resolveDelay, 250),
-          );
+          await abortableDelay(250, options.signal);
         }
         await this.stopSandbox(sandboxId);
         sandboxStopped = true;
+        throwIfSandboxAborted(options.signal);
         await verifyStagedProvenanceFiles(
           stagedProvenanceFiles,
         );
@@ -1194,14 +1790,18 @@ export class WindowsSandboxCodeBackend
           issues.push("CANARY_OUTPUT_ALLOWLIST_NOT_ENFORCED");
         }
       } catch {
+        throwIfSandboxAborted(options.signal);
         issues.push("WSB_CANARY_FAILED");
       } finally {
         try {
-          await cleanupSandboxSession({
+          await this.cleanupJournaledSandboxSession({
             root,
+            sandboxId,
+            ...(sessionJournal
+              ? { journal: sessionJournal }
+              : {}),
             sandboxMayBeRunning,
             sandboxStopped,
-            stop: () => this.stopSandbox(sandboxId),
             ...(sandboxMayBeRunning
               ? {
                   beforeRemove: () =>
@@ -1212,14 +1812,16 @@ export class WindowsSandboxCodeBackend
               : {}),
           });
         } catch (error) {
+          if (options.signal?.aborted) throw error;
           if (error instanceof SandboxContainmentError) {
-            issues.push("WSB_CANARY_STOP_UNATTESTED");
+            throw error;
           } else {
             issues.push("WSB_CANARY_CLEANUP_FAILED");
           }
         }
       }
     }
+    throwIfSandboxAborted(options.signal);
     const allEvidence = Object.values(evidence).every(Boolean);
     this.probeCache = {
       ok: issues.length === 0 && allEvidence,
@@ -1238,19 +1840,23 @@ export class WindowsSandboxCodeBackend
     candidate: CodeCandidate,
     cases: CodeTestCase[],
     jobId = task.id,
+    options: CodeSandboxRunOptions = {},
   ): Promise<CodeSandboxRunResult> {
     const [result] = await this.runBatch([
       { id: jobId, task, candidate, cases },
-    ]);
+    ], options);
     if (!result) throw new Error("SANDBOX_RESULT_MISSING");
     return result;
   }
 
   async runBatch(
     jobs: CodeSandboxJob[],
+    options: CodeSandboxRunOptions = {},
   ): Promise<CodeSandboxRunResult[]> {
+    throwIfSandboxAborted(options.signal);
     if (jobs.length === 0) return [];
-    await requireSafeSandbox(this);
+    await requireSafeSandbox(this, options);
+    throwIfSandboxAborted(options.signal);
     const root = await mkdtemp(join(tmpdir(), "chartermesh-wsb-eval-"));
     const input = join(root, "input");
     const output = join(root, "output");
@@ -1258,35 +1864,17 @@ export class WindowsSandboxCodeBackend
     const sandboxId = randomUUID();
     let sandboxMayBeRunning = false;
     let sandboxStopped = false;
+    let sessionJournal:
+      | WindowsSandboxSessionJournalRecord
+      | undefined;
     let stagedProvenanceFiles: StagedProvenanceFile[] = [];
     const started = performance.now();
     const totalCaseCount = jobs.reduce(
       (sum, job) => sum + job.cases.length,
       0,
     );
-    const failedResults = (
-      errorCode: CodeCaseResult["errorCode"],
-      violation: string,
-    ): CodeSandboxRunResult[] =>
-      jobs.map((job) => ({
-        jobId: job.id,
-        taskId: job.task.id,
-        passed: false,
-        cases: job.cases.map(({ id }) => ({
-          id,
-          passed: false,
-          exitCode: null,
-          latencyMs: Math.round(performance.now() - started),
-          errorCode,
-        })),
-        changedPaths: job.candidate.files
-          .map(({ path }) => path)
-          .sort(),
-        policyViolations: [violation],
-        survivorProcesses: 0,
-        outputBytes: 0,
-      }));
     try {
+      throwIfSandboxAborted(options.signal);
       const seenJobIds = new Set<string>();
       await mkdir(requests, { recursive: true });
       await mkdir(output, { recursive: true });
@@ -1411,9 +1999,10 @@ export class WindowsSandboxCodeBackend
         runtime: runtime.directory,
       });
       await verifyStagedProvenanceFiles(stagedProvenanceFiles);
+      throwIfSandboxAborted(options.signal);
+      sessionJournal = await this.beginSandboxSession(sandboxId);
       sandboxMayBeRunning = true;
-      await execFileAsync(
-        this.wsbExecutable,
+      await this.executeWsb(
         [
           "start",
           "--raw",
@@ -1422,18 +2011,21 @@ export class WindowsSandboxCodeBackend
           "--config",
           configuration,
         ],
-        { timeout: 120_000, windowsHide: true },
+        {
+          timeout: 120_000,
+          windowsHide: true,
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
       );
       const deadline = Date.now() + 180_000;
       while (Date.now() < deadline) {
+        throwIfSandboxAborted(options.signal);
         const complete = await stat(join(output, "complete.json")).then(
           (info) => info.isFile(),
           () => false,
         );
         if (complete) break;
-        await new Promise((resolveDelay) =>
-          setTimeout(resolveDelay, 250),
-        );
+        await abortableDelay(250, options.signal);
       }
       const completeExists = await stat(
         join(output, "complete.json"),
@@ -1444,16 +2036,15 @@ export class WindowsSandboxCodeBackend
       if (!completeExists) {
         await this.stopSandbox(sandboxId);
         sandboxStopped = true;
+        throwIfSandboxAborted(options.signal);
         await verifyStagedProvenanceFiles(
           stagedProvenanceFiles,
         );
-        return failedResults(
-          "SANDBOX_TIMEOUT",
-          "SANDBOX_SESSION_TIMEOUT",
-        );
+        throw new Error("SANDBOX_SESSION_TIMEOUT");
       }
       await this.stopSandbox(sandboxId);
       sandboxStopped = true;
+      throwIfSandboxAborted(options.signal);
       await verifyStagedProvenanceFiles(stagedProvenanceFiles);
       const complete = await boundedReadJson(
         join(output, "complete.json"),
@@ -1479,6 +2070,7 @@ export class WindowsSandboxCodeBackend
       const elapsed = Math.round(performance.now() - started);
       const results: CodeSandboxRunResult[] = [];
       for (const [jobIndex, job] of jobs.entries()) {
+        throwIfSandboxAborted(options.signal);
         const manifestJob = manifestJobs[jobIndex]!;
         const caseResults: CodeCaseResult[] = [];
         for (const [caseIndex, testCase] of job.cases.entries()) {
@@ -1519,23 +2111,26 @@ export class WindowsSandboxCodeBackend
           outputBytes: jobTree.bytes,
         });
       }
+      throwIfSandboxAborted(options.signal);
       return results;
     } catch (error) {
-      const violation =
+      if (options.signal?.aborted) {
+        throw sandboxAbortReason(options.signal);
+      }
+      if (
         error instanceof Error &&
         /^SANDBOX_[A-Z0-9_]+$/u.test(error.message)
-          ? error.message
-          : "SANDBOX_LAUNCH_FAILED";
-      return failedResults(
-        "SANDBOX_LAUNCH_FAILED",
-        violation,
-      );
+      ) {
+        throw error;
+      }
+      throw new Error("SANDBOX_INFRASTRUCTURE_FAILURE", { cause: error });
     } finally {
-      await cleanupSandboxSession({
+      await this.cleanupJournaledSandboxSession({
         root,
+        sandboxId,
+        ...(sessionJournal ? { journal: sessionJournal } : {}),
         sandboxMayBeRunning,
         sandboxStopped,
-        stop: () => this.stopSandbox(sandboxId),
         ...(sandboxMayBeRunning
           ? {
               beforeRemove: () =>

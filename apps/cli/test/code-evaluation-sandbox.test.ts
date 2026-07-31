@@ -8,6 +8,7 @@ import {
   readdir,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,11 +24,16 @@ import {
   type CodeSandboxRunResult,
 } from "../src/code-evaluation/sandbox.ts";
 import {
+  attestWindowsSandboxLauncher,
   cleanupSandboxSession,
   compareSandboxCase,
+  createWindowsSandboxSessionJournal,
   inspectSandboxOutputTree,
   parseAuthenticatedCandidateEnvelope,
+  parseWindowsSandboxSessionJournal,
+  persistWindowsSandboxSessionJournal,
   PROGRAM_OUTPUT_LIMIT_BYTES,
+  recoverWindowsSandboxSessionJournal,
   stageNodeRuntime,
   stageProvenanceFile,
   validateCanaryArtifacts,
@@ -134,6 +140,294 @@ test("runtime staging maps only one copied node executable", async () => {
       await readFile(join(runtime, "node.exe"), "utf8"),
       "trusted-node",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows Sandbox launcher attestation rejects path and content changes", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-wsb-launcher-test-"),
+  );
+  try {
+    const launcher = join(root, "wsb.exe");
+    const trusted = "trusted-wsb";
+    const expected = createHash("sha256")
+      .update(trusted)
+      .digest("hex");
+    await writeFile(launcher, trusted, "utf8");
+    const first = await attestWindowsSandboxLauncher(
+      launcher,
+      expected,
+    );
+    await writeFile(launcher, "mutated-wsb", "utf8");
+    await assert.rejects(
+      attestWindowsSandboxLauncher(launcher, expected, first),
+      /SANDBOX_WSB_PROVENANCE_(?:IDENTITY_CHANGED|HASH_MISMATCH)/u,
+    );
+    await assert.rejects(
+      attestWindowsSandboxLauncher("wsb.exe", expected),
+      /SANDBOX_WSB_PROVENANCE_PATH_NOT_ABSOLUTE/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows Sandbox session journals have a bounded exact recovery contract", () => {
+  const record = createWindowsSandboxSessionJournal({
+    sandboxId: "12345678-1234-1234-1234-1234567890ab",
+    ownerPid: 42,
+    ownerNonce: "a".repeat(32),
+    createdAtMs: 1,
+    launcherSha256: null,
+  });
+  assert.deepEqual(
+    parseWindowsSandboxSessionJournal(
+      `${JSON.stringify(record)}\n`,
+    ),
+    record,
+  );
+  assert.throws(
+    () =>
+      parseWindowsSandboxSessionJournal(
+        JSON.stringify({ ...record, root: "C:\\do-not-delete" }),
+      ),
+    /SANDBOX_SESSION_JOURNAL_INVALID/u,
+  );
+  assert.throws(
+    () =>
+      parseWindowsSandboxSessionJournal(
+        JSON.stringify({ ...record, ownerPid: 43 }),
+      ),
+    /SANDBOX_SESSION_JOURNAL_CHECKSUM_MISMATCH/u,
+  );
+  assert.throws(
+    () =>
+      parseWindowsSandboxSessionJournal(
+        JSON.stringify(record),
+        "b".repeat(64),
+      ),
+    /SANDBOX_SESSION_JOURNAL_LAUNCHER_MISMATCH/u,
+  );
+  assert.throws(
+    () =>
+      parseWindowsSandboxSessionJournal(
+        " ".repeat(4_097),
+      ),
+    /SANDBOX_SESSION_JOURNAL_LIMIT/u,
+  );
+});
+
+test("stale Sandbox journals clear only after an attested stop", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-session-journal-test-"),
+  );
+  const path = join(root, "session.json");
+  const sandboxId = "12345678-1234-1234-1234-1234567890ab";
+  const record = createWindowsSandboxSessionJournal({
+    sandboxId,
+    ownerPid: 42,
+    ownerNonce: "a".repeat(32),
+    createdAtMs: 1,
+    launcherSha256: null,
+  });
+  try {
+    await persistWindowsSandboxSessionJournal(path, record);
+    await assert.rejects(
+      persistWindowsSandboxSessionJournal(
+        path,
+        createWindowsSandboxSessionJournal({
+          ...record,
+          sandboxId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        }),
+      ),
+      /SANDBOX_SESSION_JOURNAL_BUSY/u,
+    );
+    await assert.rejects(
+      recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: "b".repeat(32),
+        ownerAppearsAlive: () => false,
+        async stopAndAttest(id) {
+          assert.equal(id, sandboxId);
+          throw new Error("list state ambiguous");
+        },
+      }),
+      /list state ambiguous/u,
+    );
+    assert.equal(
+      await stat(path).then(
+        (info) => info.isFile(),
+        () => false,
+      ),
+      true,
+    );
+    const stops: string[] = [];
+    assert.equal(
+      await recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: "b".repeat(32),
+        ownerAppearsAlive: () => false,
+        async stopAndAttest(id) {
+          stops.push(id);
+        },
+      }),
+      sandboxId,
+    );
+    assert.deepEqual(stops, [sandboxId]);
+    assert.equal(
+      await stat(path).then(
+        () => true,
+        () => false,
+      ),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a live journal owner blocks recovery and an explicit owned retry is exact", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-session-owner-test-"),
+  );
+  const path = join(root, "session.json");
+  const sandboxId = "12345678-1234-1234-1234-1234567890ab";
+  const ownerNonce = "a".repeat(32);
+  const record = createWindowsSandboxSessionJournal({
+    sandboxId,
+    ownerPid: process.pid,
+    ownerNonce,
+    createdAtMs: 1,
+    launcherSha256: null,
+  });
+  try {
+    await persistWindowsSandboxSessionJournal(path, record);
+    let stops = 0;
+    await assert.rejects(
+      recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: "b".repeat(32),
+        ownerAppearsAlive: () => true,
+        async stopAndAttest() {
+          stops += 1;
+        },
+      }),
+      /SANDBOX_SESSION_JOURNAL_BUSY/u,
+    );
+    await assert.rejects(
+      recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: ownerNonce,
+        ownerAppearsAlive: () => false,
+        async stopAndAttest() {
+          stops += 1;
+        },
+      }),
+      /SANDBOX_SESSION_JOURNAL_BUSY/u,
+    );
+    assert.equal(stops, 0);
+    await assert.rejects(
+      recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: ownerNonce,
+        recoverableOwnedSandboxId:
+          "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ownerAppearsAlive: () => false,
+        async stopAndAttest() {
+          stops += 1;
+        },
+      }),
+      /SANDBOX_SESSION_JOURNAL_BUSY/u,
+    );
+    await recoverWindowsSandboxSessionJournal({
+      path,
+      currentOwnerNonce: ownerNonce,
+      recoverableOwnedSandboxId: sandboxId,
+      ownerAppearsAlive: () => true,
+      async stopAndAttest(id) {
+        assert.equal(id, sandboxId);
+        stops += 1;
+      },
+    });
+    assert.equal(stops, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Sandbox recovery refuses a symlink journal without touching its target", async (t) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-session-link-test-"),
+  );
+  const target = join(root, "target");
+  const path = join(root, "session.json");
+  const marker = "do-not-touch";
+  try {
+    await mkdir(target);
+    await writeFile(join(target, "marker.txt"), marker, "utf8");
+    try {
+      // Directory junctions exercise the same lstat/realpath defense and do
+      // not require Windows Developer Mode on standard NTFS volumes.
+      await symlink(target, path, "junction");
+    } catch (error) {
+      if (
+        error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        ["EPERM", "EACCES"].includes(String(error.code))
+      ) {
+        t.skip("Creating file symlinks is not permitted on this host.");
+        return;
+      }
+      throw error;
+    }
+    let stopped = false;
+    await assert.rejects(
+      recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: "b".repeat(32),
+        ownerAppearsAlive: () => false,
+        async stopAndAttest() {
+          stopped = true;
+        },
+      }),
+      /SANDBOX_SESSION_JOURNAL_FILE_INVALID/u,
+    );
+    assert.equal(stopped, false);
+    assert.equal(
+      await readFile(join(target, "marker.txt"), "utf8"),
+      marker,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Sandbox recovery never recursively removes a directory at the journal path", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-session-directory-test-"),
+  );
+  const path = join(root, "session.json");
+  const marker = join(path, "must-remain.txt");
+  try {
+    await mkdir(path);
+    await writeFile(marker, "keep", "utf8");
+    let stopped = false;
+    await assert.rejects(
+      recoverWindowsSandboxSessionJournal({
+        path,
+        currentOwnerNonce: "b".repeat(32),
+        ownerAppearsAlive: () => false,
+        async stopAndAttest() {
+          stopped = true;
+        },
+      }),
+      /SANDBOX_SESSION_JOURNAL_FILE_INVALID/u,
+    );
+    assert.equal(stopped, false);
+    assert.equal(await readFile(marker, "utf8"), "keep");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

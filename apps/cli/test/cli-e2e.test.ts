@@ -244,6 +244,79 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   );
 });
 
+test("changes-requested feedback and the exact prior artifact reach the next generation", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-revision-"));
+  const bootstrapArgs = ["bootstrap", "--target", target, "--engine", "fake"];
+  const preview = cli(bootstrapArgs);
+  assert.equal(preview.status, 0, preview.stderr);
+  const planHash = preview.stdout.match(/Approval token: ([a-f0-9]{64})/u)?.[1];
+  assert.ok(planHash, preview.stdout);
+  const applied = cli([...bootstrapArgs, "--approve", planHash]);
+  assert.equal(applied.status, 0, applied.stderr);
+
+  const requested = cli([
+    "request",
+    "Revise the synthetic artifact",
+    "--summary",
+    "Keep this task deliberately short.",
+    "--target",
+    target,
+  ]);
+  assert.equal(requested.status, 0, requested.stderr);
+  const workId = requested.stdout.match(/(work-\d{6}) created/u)?.[1];
+  assert.ok(workId, requested.stdout);
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      workId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+
+  const firstRun = cli(["run", "--id", workId, "--target", target]);
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const firstHash = firstRun.stdout.match(/\(([a-f0-9]{64})\)/u)?.[1];
+  assert.ok(firstHash, firstRun.stdout);
+  const reviewNote = "Please make the status explanation understandable to a first-time user.";
+  const changes = cli([
+    "decide",
+    "--id",
+    workId,
+    "--decision",
+    "changes_requested",
+    "--artifact-hash",
+    firstHash,
+    "--note",
+    reviewNote,
+    "--target",
+    target,
+  ]);
+  assert.equal(changes.status, 0, changes.stderr);
+
+  const secondRun = cli(["run", "--id", workId, "--target", target]);
+  assert.equal(secondRun.status, 0, secondRun.stderr);
+  const database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  try {
+    const artifact = new ControlPlane(
+      database,
+      join(target, ".chartermesh", "artifacts"),
+    ).latestArtifact(workId);
+    assert.ok(artifact);
+    const envelope = JSON.parse(artifact.content) as { deliverable: string };
+    assert.match(envelope.deliverable, new RegExp(firstHash, "u"));
+    assert.match(envelope.deliverable, /first-time user/u);
+  } finally {
+    database.close();
+  }
+});
+
 test("capability catalog is agent-readable and external integrations stay disabled", () => {
   const listed = cli(["capabilities", "list", "--json"]);
   assert.equal(listed.status, 0, listed.stdout + listed.stderr);
