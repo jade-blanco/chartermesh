@@ -19,6 +19,8 @@ export interface OpenAICompatibleConfig {
   structuredOutputMode?: "prompt" | "json-schema";
   toolCalling?: boolean;
   reasoningMode?: "default" | "disabled";
+  temperature?: number;
+  seed?: number;
   pricing?: {
     inputPerMillionTokensUsd: number;
     outputPerMillionTokensUsd: number;
@@ -283,6 +285,12 @@ export class OpenAICompatibleModelEngine implements ModelEngine {
           ...(request.maxOutputTokens
             ? { max_tokens: request.maxOutputTokens }
             : {}),
+          ...(this.config.temperature !== undefined
+            ? { temperature: this.config.temperature }
+            : {}),
+          ...(this.config.seed !== undefined
+            ? { seed: this.config.seed }
+            : {}),
           ...(this.config.reasoningMode === "disabled"
             ? {
                 reasoning_effort: "none",
@@ -318,6 +326,14 @@ export class OpenAICompatibleModelEngine implements ModelEngine {
               ? "length"
               : "stop",
         usage: usageOf(payload.usage, this.config.pricing),
+        providerIdentity: {
+          reportedModelId:
+            typeof payload.model === "string" ? payload.model : null,
+          reportedSystemFingerprint:
+            typeof payload.system_fingerprint === "string"
+              ? payload.system_fingerprint
+              : null,
+        },
       };
     } finally {
       clearTimeout(timeout);
@@ -353,6 +369,20 @@ export function validateOpenAICompatibleConfig(
       config.timeoutMs > 600_000)
   ) {
     issues.push("Model timeout must be between 1000 and 600000 ms.");
+  }
+  if (
+    config.temperature !== undefined &&
+    (!Number.isFinite(config.temperature) ||
+      config.temperature < 0 ||
+      config.temperature > 2)
+  ) {
+    issues.push("Model temperature must be between 0 and 2.");
+  }
+  if (
+    config.seed !== undefined &&
+    !Number.isSafeInteger(config.seed)
+  ) {
+    issues.push("Model seed must be a safe integer.");
   }
   if (
     config.maxResponseBytes !== undefined &&

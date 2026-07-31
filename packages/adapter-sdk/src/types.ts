@@ -98,6 +98,10 @@ export interface InferenceResult {
   toolCalls: ModelToolCall[];
   finishReason: "stop" | "tool_call" | "length" | "canceled" | "error";
   usage: ModelUsage;
+  providerIdentity?: {
+    reportedModelId: string | null;
+    reportedSystemFingerprint: string | null;
+  };
 }
 
 export interface InferenceChunk {

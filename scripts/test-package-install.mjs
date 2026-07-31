@@ -81,20 +81,52 @@ assert.equal(
   ),
   true,
 );
+for (const binary of [
+  "chartermesh",
+  "chartermesh-evaluate-code-generate",
+  "chartermesh-evaluate-code-run",
+]) {
+  assert.equal(
+    existsSync(
+      join(
+        consumer,
+        "node_modules",
+        ".bin",
+        process.platform === "win32" ? `${binary}.cmd` : binary,
+      ),
+    ),
+    true,
+  );
+}
+const codeGenerationScript = join(
+  installed,
+  "scripts",
+  "run-code-generation-stage.mjs",
+);
+const codeEvaluationScript = join(
+  installed,
+  "scripts",
+  "run-code-sandbox-evaluation.mjs",
+);
+assert.equal(existsSync(codeGenerationScript), true);
+assert.equal(existsSync(codeEvaluationScript), true);
+for (const guestScript of [
+  "candidate-executor.mjs",
+  "candidate-worker.mjs",
+  "guest-canary.mjs",
+  "guest-runner.mjs",
+  "canary-candidate.mjs",
+]) {
+  assert.equal(
+    existsSync(
+      join(installed, "scripts", "windows-sandbox", guestScript),
+    ),
+    true,
+  );
+}
 assert.equal(
   existsSync(
     join(installed, "dist", "skills", "web-research", "SKILL.md"),
-  ),
-  true,
-);
-assert.equal(
-  existsSync(
-    join(
-      consumer,
-      "node_modules",
-      ".bin",
-      process.platform === "win32" ? "chartermesh.cmd" : "chartermesh",
-    ),
   ),
   true,
 );
@@ -104,6 +136,26 @@ const version = JSON.parse(
   }),
 );
 assert.equal(version.data.currentVersion, "0.0.7-alpha.1");
+
+for (const script of [codeGenerationScript, codeEvaluationScript]) {
+  const result = spawnSync(
+    process.execPath,
+    [script, "--unsupported-package-smoke", "1"],
+    {
+      cwd: target,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CHARTERMESH_NO_UPDATE_CHECK: "1",
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(
+    `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+    /Unknown argument '--unsupported-package-smoke'/u,
+  );
+}
 
 const proposal = JSON.parse(
   run(

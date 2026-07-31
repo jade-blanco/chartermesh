@@ -184,3 +184,158 @@ real project types.
 
 The first 100-task/302-output local run is recorded in
 [`evaluations/2026-07-31-local-autonomy-reliability.md`](evaluations/2026-07-31-local-autonomy-reliability.md).
+
+## Sealed code-maintenance pilot
+
+The code-maintenance pilot compares functional implementation, not keyword
+coverage. It uses six fictional dependency-free Node.js tasks across a work
+order ledger, equipment desk, and settlement pipeline. Each model receives
+the same repository state, ticket, and public examples. Hidden cases, oracle
+implementations, mutations, and hidden results are withheld from every model
+call.
+
+The fixed comparison is:
+
+| Condition | Calls per task | Requested output ceiling |
+|---|---:|---:|
+| Gemma 4 E4B single | 1 x 6,144 | 6,144 |
+| Gemma 4 26B A4B single | 1 x 6,144 | 6,144 |
+| Qwen 3.5 122B A10B single | 1 x 6,144 | 6,144 |
+| E4B draft, 26B review, Qwen final | 3 x 2,048 | 6,144 |
+
+There is one attempt per stage and no repair turn. The output-token ceiling is
+matched, but the tiered route necessarily consumes more input tokens and model
+invocation latency. The report records provider-reported token usage and
+inference-call latency. Cold model loading is performed and timed outside this
+pilot report, so it must be reported separately when comparing operational
+latency. Equal requested output ceilings do not imply equal compute, input
+tokens, tokenizer behavior, or final-stage capacity. Any tiered improvement is
+therefore not attributable to model diversity without a same-model,
+three-stage control condition.
+
+Generation is resumable and stores complete candidates only under the ignored
+`.chartermesh/artifacts/` directory. Run the stages while the corresponding
+loopback engine is loaded. The engine slot is bound to its model, quantization,
+context, server build, structured-output mode, reasoning mode, sampling
+settings, and required model-artifact hash before the first call:
+
+Publishable pilot generation must run from a source checkout at a clean Git
+commit. Before the state is created or read, the command records the
+CharterMesh package version, commit and dirty status, harness Node version,
+selected runtime-executable SHA-256, OS version/build, and a canonical
+SHA-256 manifest of every sandbox guest script. A missing commit or any dirty
+state stops the command before inference. Every later generation stage
+re-collects the same provenance and refuses to continue if it differs.
+
+Use `pnpm evaluate:code:generate --` from that clean source checkout. The
+installed `chartermesh-evaluate-code-generate` binary has no source-checkout
+Git attestation and therefore cannot produce this publishable pilot. Installed
+package evaluation remains non-publishable until a future package-artifact
+signature or equivalent release provenance is added.
+
+```powershell
+pnpm evaluate:code:generate -- `
+  --state .chartermesh/artifacts/code-pilot-state.json `
+  --condition e4b-single `
+  --stage final `
+  --engine-slot e4b `
+  --engine-id local-e4b `
+  --endpoint http://127.0.0.1:18081/v1 `
+  --model YOUR_E4B_MODEL_ID `
+  --quantization Q4_K_M `
+  --context-tokens 16384 `
+  --server-build llama.cpp-b9585 `
+  --model-artifact-sha256 SHA256_OF_THE_GGUF `
+  --model-artifact-hash-kind file `
+  --reasoning-mode disabled `
+  --temperature 0 `
+  --sampling-seed 20260731
+```
+
+The tiered stage order is `draft` with slot `e4b`, `review` with slot
+`gemma26b`, then `final` with slot `qwen`. The other single condition ids are
+`gemma26b-single` and `qwen-single`. Each command takes an exclusive state
+lock. It records an `invocation_running` attempt before inference; if the
+process dies during that call, resumption leaves the attempt indeterminate
+instead of silently charging and retrying it. Only a complete matrix can be
+atomically frozen for hidden evaluation.
+
+All three slots must provide an artifact hash and use the same adapter,
+context-token limit, structured-output mode, reasoning mode, temperature, and
+sampling seed. Model timeout and maximum response bytes must also match. Freeze
+fails if any of those comparison controls differ. Model id, quantization,
+artifact hash, endpoint, and server build remain part of the per-engine
+fingerprint and may differ. If the serving stacks differ, the result is a
+comparison of the recorded configuration bundles rather than a claim about
+model weights alone.
+
+For a split GGUF, hash every shard in lexical filename order, serialize the
+lowercase hashes as a compact JSON array, hash that UTF-8 JSON with SHA-256,
+and use `--model-artifact-hash-kind canonical-shard-manifest`. This preserves
+the distinction between a file digest and a deterministic multi-shard
+fingerprint.
+
+Generated code is never executed by the generation command. Evaluation
+requires a live VM canary:
+
+```powershell
+pnpm evaluate:code:run -- `
+  --state .chartermesh/artifacts/code-pilot-state.json `
+  --output .chartermesh/artifacts/code-pilot-report.json
+```
+
+An installed package exposes a `chartermesh-evaluate-code-run` binary, but its
+result is not publishable under this pilot contract without the future package
+artifact attestation described above.
+
+On Windows, install the Windows Sandbox optional feature from an elevated
+PowerShell session and restart if requested:
+
+```powershell
+Enable-WindowsOptionalFeature `
+  -FeatureName "Containers-DisposableClientVM" `
+  -All `
+  -Online `
+  -NoRestart
+```
+
+Restart Windows manually if the command reports that a restart is required.
+
+The evaluator does not silently use host Node, WSL, or a simulated backend if
+Windows Sandbox or any canary is unavailable. Its custom configuration
+disables networking, vGPU, clipboard, audio, video, and printer redirection,
+enables Protected Client, maps input and a freshly staged exact Node executable
+read-only, and maps only a disposable output directory writable. Each
+candidate is executed in its own VM session. ADR 0018 records the complete
+boundary. The exact runtime and guest scripts staged for each session are
+rehashed against the provenance frozen before generation. Candidate results
+are HMAC-framed by a separate secret-holding supervisor; that framing is not
+treated as same-user OS isolation.
+
+Before model candidates run, the evaluator checks all six oracle solutions,
+the declared baseline defects, and 18 seeded erroneous mutations. A condition
+passes a task only when its final response is strict JSON and every public and
+hidden case passes with no sandbox policy violation. Intermediate tier
+results are diagnostic only and are computed after all generation has ended,
+so they cannot influence the later reviewer.
+
+The suite source is intentionally published in this repository. Its hidden
+cases are withheld from model inference during an experiment, but they are not
+a secret certification set. Public reports bind each stage to request,
+candidate, raw-output, engine-fingerprint, and result hashes plus finish
+reason, usage, and latency. Model response rate and strict structured-output
+rate use all durable invocation attempts as their denominator, so transport
+failures cannot disappear from the reliability metric. Claims beyond this
+development comparison require a separately governed private holdout.
+
+OpenAI-compatible response `model` and `system_fingerprint` values are
+preserved when a server supplies them. They are provider-reported evidence,
+not a substitute for the required local artifact digest.
+
+The JSON report labels itself as a public six-task, one-trial development
+pilot with no statistical inference. The tiered condition is serial review
+routing with canonical interstage normalization; it does not exercise Control
+Plane child-agent creation, join, cancellation, or permission inheritance.
+Usage is provider-reported or unknown, the output ceiling is a requested
+limit rather than local tokenization proof, and latency is client-observed
+generation latency excluding cold model load.

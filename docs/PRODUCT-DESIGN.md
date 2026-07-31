@@ -1802,3 +1802,48 @@ This evaluator demonstrates only the checked bounded task family. It does not
 establish production autonomy, general coding ability, ambiguous planning,
 long-horizon recovery, or safe execution of generated programs. ADR 0017
 records the boundary and the conditions for a future code-execution sandbox.
+
+# Sealed code-evaluation amendment — 2026-07-31
+
+ADR 0018 adds the first opt-in generated-code evaluation boundary:
+
+- Six deterministic maintenance tasks expose only ticket text, fixed fixture
+  files, and public examples to model engines. Hidden cases, oracle source,
+  mutations, and hidden results remain outside every inference request. The
+  development suite is open-source; withheld means inference-separated, not
+  secret certification data.
+- A provider-neutral sandbox contract fails closed unless a live VM backend
+  proves network, host read/write, subprocess, timeout, and output-allowlist
+  controls. Host Node, normal WSL, and simulated backends are not fallbacks.
+- The Windows reference backend disables ambient redirection and networking,
+  enables Protected Client, stages only the exact Node executable read-only,
+  and executes every candidate in its own disposable VM session through an
+  HMAC-framed result envelope. The HMAC protects measurement framing from the
+  secretless candidate process; it is not a same-OS-user isolation boundary.
+- Oracle, known-defective baseline, and mutation preflight must pass before
+  any generated candidate is evaluated.
+- Every engine slot is bound to model, required artifact hash,
+  quantization, context, server build, structured-output and reasoning modes,
+  temperature, and seed. The complete generation matrix and these fingerprints
+  are atomically frozen before any hidden case runs.
+- This pilot requires every model artifact hash and identical adapter, context
+  limit, structured-output mode, reasoning mode, temperature, seed, timeout,
+  and response-byte limit across the three slots. The public report declares
+  six public development tasks, one trial, no statistical inference, and
+  serial review routing rather than child-agent delegation.
+- E4B, 26B, and Qwen single conditions are paired with an E4B-to-26B-to-Qwen
+  review chain under the same requested output-token ceiling, zero repair
+  retries, and zero hidden-test feedback.
+- Complete generated source remains in ignored local state. Reports separate
+  strict output compliance, functional hidden-test results, latency, token
+  usage, sandbox evidence, policy violations, and stage-level request,
+  candidate, raw-output, engine-fingerprint, and result hashes. Inference-call
+  latency is measured; cold model load time must be recorded separately.
+- A clean Git commit, exact Node executable, OS build, and canonical guest
+  script manifest are bound before the first model call. The runtime and guest
+  files actually staged for every VM are rehashed against that frozen
+  provenance before start and after stop.
+
+This pilot establishes only comparative evidence for the declared task
+families. It does not meet the sample size, repeated-run, or operational
+duration needed for a company-autonomy claim.

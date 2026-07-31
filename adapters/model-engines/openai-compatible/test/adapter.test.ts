@@ -36,6 +36,8 @@ test("adapter normalizes an OpenAI-compatible response", async () => {
       redirect = init?.redirect;
       return new Response(
         JSON.stringify({
+          model: "served-example-model",
+          system_fingerprint: "runtime-build-1",
           choices: [
             {
               message: { content: "Synthetic provider response" },
@@ -61,6 +63,10 @@ test("adapter normalizes an OpenAI-compatible response", async () => {
   assert.equal(result.text, "Synthetic provider response");
   assert.equal(result.usage.inputTokens, 12);
   assert.equal(result.usage.outputTokens, 5);
+  assert.deepEqual(result.providerIdentity, {
+    reportedModelId: "served-example-model",
+    reportedSystemFingerprint: "runtime-build-1",
+  });
 });
 
 test("adapter rejects an oversized response before JSON parsing", async () => {
@@ -129,6 +135,8 @@ test("adapter transports JSON schema and tool calls without provider coupling", 
       structuredOutputMode: "json-schema",
       toolCalling: true,
       reasoningMode: "disabled",
+      temperature: 0,
+      seed: 20260731,
     },
     {},
     async (_url, init) => {
@@ -202,11 +210,32 @@ test("adapter transports JSON schema and tool calls without provider coupling", 
   );
   assert.equal(transportedMessages[2]?.tool_call_id, "previous-call");
   assert.equal(requestBody.reasoning_effort, "none");
+  assert.equal(requestBody.temperature, 0);
+  assert.equal(requestBody.seed, 20260731);
   assert.deepEqual(requestBody.chat_template_kwargs, {
     enable_thinking: false,
   });
   assert.deepEqual(result.toolCalls[0]?.arguments, { path: "." });
   assert.equal(result.finishReason, "tool_call");
+});
+
+test("configuration validates deterministic sampling controls", () => {
+  assert.deepEqual(
+    validateOpenAICompatibleConfig(
+      {
+        id: "invalid-sampling",
+        endpoint: "http://127.0.0.1:8080/v1",
+        model: "local",
+        temperature: -0.1,
+        seed: Number.MAX_SAFE_INTEGER + 1,
+      },
+      {},
+    ),
+    [
+      "Model temperature must be between 0 and 2.",
+      "Model seed must be a safe integer.",
+    ],
+  );
 });
 
 test("adapter refuses credentials over non-loopback HTTP", () => {

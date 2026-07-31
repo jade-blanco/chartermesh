@@ -262,6 +262,16 @@ configuration data in temporary Git repositories and hidden deterministic
 tests. It does not execute model-generated source code or grant the model
 tools. See [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md).
 
+Repository contributors can opt into the stronger code-maintenance pilot to
+compare E4B, 26B, and Qwen single-model baselines with an
+E4B-to-26B-to-Qwen review chain under the same requested output-token ceiling.
+Generation never executes candidate code. A separate evaluation command runs
+each frozen candidate in its own verified Windows Sandbox VM with networking
+and ambient host channels disabled. The command fails closed when the VM
+feature or any live canary is unavailable. Setup, engine fingerprint flags,
+and commands are documented in
+[`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md).
+
 ## Operate from the CLI
 
 ```powershell
