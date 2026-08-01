@@ -182,6 +182,7 @@ export interface WorkflowTrajectoryLimits {
   maxModelCalls: number;
   maxTotalTokens: number | null;
   identicalArtifactLimit: number;
+  maxConsecutiveContractInvalidSubmissions: number;
   maxParallelAgents: number;
 }
 

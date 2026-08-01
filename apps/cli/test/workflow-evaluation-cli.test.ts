@@ -49,6 +49,14 @@ test("dry code-only planning binds three VM tasks without launching the sandbox"
   );
   assert.equal(plan.codeBoundary, "attested_vm_only");
   assert.equal(plan.liveReady, false);
+  assert.equal(
+    plan.limits.maxConsecutiveContractInvalidSubmissions,
+    3,
+  );
+  assert.equal(
+    plan.maximumConsecutiveContractInvalidSubmissionsPerTrajectory,
+    3,
+  );
   assert.match(
     plan.bindings.codeSandboxProvenanceHash,
     /^[a-f0-9]{64}$/u,
@@ -63,6 +71,38 @@ test("dry code-only planning binds three VM tasks without launching the sandbox"
     ),
   );
   assert.equal(JSON.stringify(plan).includes("System32"), false);
+
+  const changedGuard = cli([
+    "evaluate-workflow",
+    "--target",
+    target,
+    "--code-only",
+    "--max-consecutive-contract-invalid-submissions",
+    "4",
+    "--json",
+  ]);
+  assert.equal(changedGuard.status, 0, changedGuard.stdout + changedGuard.stderr);
+  const changedPlan = JSON.parse(changedGuard.stdout).data;
+  assert.equal(
+    changedPlan.limits.maxConsecutiveContractInvalidSubmissions,
+    4,
+  );
+  assert.notEqual(changedPlan.planHash, plan.planHash);
+
+  const invalidGuard = cli([
+    "evaluate-workflow",
+    "--target",
+    target,
+    "--code-only",
+    "--max-consecutive-contract-invalid-submissions",
+    "0",
+    "--json",
+  ]);
+  assert.equal(invalidGuard.status, 1);
+  assert.match(
+    invalidGuard.stdout,
+    /--max-consecutive-contract-invalid-submissions must be an integer from 1 to 100/u,
+  );
 });
 
 test("evaluate-workflow requires a hash-bound plan and persists every trial in an isolated Control Plane", (t) => {

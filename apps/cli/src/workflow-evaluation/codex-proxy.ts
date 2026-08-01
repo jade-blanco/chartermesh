@@ -120,6 +120,7 @@ export type CodexProxyErrorCode =
   | "CODEX_PROXY_REQUEST_INVALID"
   | "CODEX_PROXY_EXECUTABLE_INVALID"
   | "CODEX_PROXY_EXECUTABLE_HASH_MISMATCH"
+  | "CODEX_PROXY_HOME_UNAVAILABLE"
   | "CODEX_PROXY_SPAWN_FAILED"
   | "CODEX_PROXY_STDIN_FAILED"
   | "CODEX_PROXY_UNSUPPORTED_FLAGS"
@@ -177,6 +178,8 @@ export interface CodexCliFeedbackProviderOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   spawn?: CodexSpawnFunction;
+  /** Test-only environment hook; production callers inherit the host. */
+  environment?: NodeJS.ProcessEnv;
   /** Test-only isolation hook; production callers should use the OS temp dir. */
   temporaryRoot?: string;
 }
@@ -342,6 +345,18 @@ const CODEX_OUTPUT_SCHEMA = {
   },
 } as const;
 
+export const CODEX_PROXY_ENVIRONMENT_POLICY_VERSION =
+  "chartermesh.dev/codex-proxy-environment/v1alpha2" as const;
+
+const CODEX_PROXY_ENVIRONMENT_POLICY = {
+  version: CODEX_PROXY_ENVIRONMENT_POLICY_VERSION,
+  homeResolution: "HOME_or_USERPROFILE",
+  codexHomeResolution: "CODEX_HOME_or_HOME_dot_codex",
+  inheritedEnvironment: true,
+  snapshotAtProviderConstruction: true,
+  windowsPathMode: "drive_or_unc",
+} as const;
+
 const CODEX_FEEDBACK_PROMPT_LINES = [
   "You are a simulated ordinary-user proxy in a controlled evaluation.",
   "You are not a human and cannot grant or resolve any human approval.",
@@ -360,6 +375,7 @@ export const CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256 = sha256Utf8(
     responseApiVersion: SIMULATED_USER_FEEDBACK_API_VERSION,
     promptLines: CODEX_FEEDBACK_PROMPT_LINES,
     outputSchema: CODEX_OUTPUT_SCHEMA,
+    environmentPolicy: CODEX_PROXY_ENVIRONMENT_POLICY,
   }),
 );
 
@@ -384,6 +400,53 @@ function defaultSpawn(
 ): SpawnedCodexProcess {
   return spawnChildProcess(executablePath, [...args], options) as unknown as
     SpawnedCodexProcess;
+}
+
+function validEnvironmentPath(value: unknown): value is string {
+  const structurallyValid =
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 32_767 &&
+    !value.includes("\0") &&
+    isAbsolute(value);
+  if (!structurallyValid) return false;
+  if (process.platform !== "win32") return true;
+  return (
+    /^[A-Za-z]:[\\/]/u.test(value) ||
+    /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(value)
+  );
+}
+
+export function codexProxyEnvironment(
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const explicitHome = environment.HOME;
+  const home =
+    explicitHome === undefined || explicitHome.length === 0
+      ? environment.USERPROFILE
+      : explicitHome;
+  if (!validEnvironmentPath(home)) {
+    throw new CodexProxyError(
+      "CODEX_PROXY_HOME_UNAVAILABLE",
+      "Codex requires an absolute HOME or USERPROFILE for isolated authentication",
+    );
+  }
+  const explicitCodexHome = environment.CODEX_HOME;
+  const codexHome =
+    explicitCodexHome === undefined || explicitCodexHome.length === 0
+      ? join(home, ".codex")
+      : explicitCodexHome;
+  if (!validEnvironmentPath(codexHome)) {
+    throw new CodexProxyError(
+      "CODEX_PROXY_HOME_UNAVAILABLE",
+      "Codex requires an absolute CODEX_HOME when it is configured",
+    );
+  }
+  return {
+    ...environment,
+    HOME: home,
+    CODEX_HOME: codexHome,
+  };
 }
 
 function processFailure(
@@ -416,6 +479,7 @@ async function runCodexProcess(
   prompt: string,
   timeoutMs: number,
   maxOutputBytes: number,
+  environment: NodeJS.ProcessEnv,
   signal: AbortSignal | undefined,
 ): Promise<void> {
   if (signal?.aborted) {
@@ -430,6 +494,7 @@ async function runCodexProcess(
         shell: false,
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
+        env: environment,
       });
     } catch (error) {
       reject(
@@ -618,6 +683,7 @@ export class CodexCliFeedbackProvider
   readonly maxOutputBytes: number;
   readonly #spawn: CodexSpawnFunction;
   readonly #temporaryRoot: string;
+  readonly #environment: NodeJS.ProcessEnv;
 
   constructor(options: CodexCliFeedbackProviderOptions) {
     if (!isAbsolute(options.executablePath)) {
@@ -673,6 +739,10 @@ export class CodexCliFeedbackProvider
     this.maxOutputBytes = maxOutputBytes;
     this.#spawn = options.spawn ?? defaultSpawn;
     this.#temporaryRoot = temporaryRoot;
+    this.#environment = {
+      ...codexProxyEnvironment(options.environment ?? process.env),
+    };
+    Object.freeze(this.#environment);
   }
 
   async provideFeedback(
@@ -683,7 +753,6 @@ export class CodexCliFeedbackProvider
     if (options.signal?.aborted) {
       throw new CodexProxyError("CODEX_PROXY_ABORTED", "invocation was aborted");
     }
-
     const directory = await mkdtemp(
       join(this.#temporaryRoot, "chartermesh-codex-proxy-"),
     );
@@ -748,6 +817,7 @@ export class CodexCliFeedbackProvider
           feedbackPrompt(request),
           this.timeoutMs,
           this.maxOutputBytes,
+          this.#environment,
           options.signal,
         );
       } catch (error) {

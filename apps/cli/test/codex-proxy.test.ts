@@ -16,6 +16,7 @@ import test from "node:test";
 import {
   CodexCliFeedbackProvider,
   CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256,
+  CODEX_PROXY_ENVIRONMENT_POLICY_VERSION,
   CodexProxyError,
   FIXED_SELF_REVIEW_FEEDBACK,
   FIXED_SELF_REVIEW_FEEDBACK_SHA256,
@@ -65,6 +66,7 @@ interface SpawnObservation {
   cwd?: string;
   prompt?: string;
   schema?: unknown;
+  environment?: NodeJS.ProcessEnv;
   killSignals: Array<NodeJS.Signals | undefined>;
 }
 
@@ -86,6 +88,7 @@ function scriptedSpawn(
     observation.executablePath = executablePath;
     observation.args = [...args];
     observation.cwd = String(spawnOptions.cwd);
+    observation.environment = { ...spawnOptions.env };
     const events = new EventEmitter();
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -266,6 +269,10 @@ test("Codex provider attests the executable and uses the isolated exact CLI shap
     executablePath: fixture.path,
     executableSha256: fixture.digest,
     model: "gpt-test",
+    environment: {
+      USERPROFILE: fixture.directory,
+      PATH: "test-path",
+    },
     spawn: scriptedSpawn(
       {
         recommendation: "revise",
@@ -303,10 +310,20 @@ test("Codex provider attests the executable and uses the isolated exact CLI shap
   assert.equal(args.at(-2), "never");
   assert.equal(args.at(-1), "-");
   assert.ok(observation.cwd);
+  assert.equal(observation.environment?.HOME, fixture.directory);
+  assert.equal(
+    observation.environment?.CODEX_HOME,
+    join(fixture.directory, ".codex"),
+  );
+  assert.equal(observation.environment?.PATH, "test-path");
   assert.equal(await absent(observation.cwd!), true);
   assert.match(observation.prompt ?? "", /simulated ordinary-user proxy/u);
   assert.match(observation.prompt ?? "", /cannot grant or resolve any human approval/u);
   assert.match(observation.prompt ?? "", /"publicObjective"/u);
+  assert.equal(
+    CODEX_PROXY_ENVIRONMENT_POLICY_VERSION,
+    "chartermesh.dev/codex-proxy-environment/v1alpha2",
+  );
   assert.deepEqual(observation.schema, {
     $schema: "https://json-schema.org/draft/2020-12/schema",
     type: "object",
@@ -332,6 +349,75 @@ test("Codex provider attests the executable and uses the isolated exact CLI shap
       },
     },
   });
+});
+
+test("Codex provider fails closed when no absolute authentication home exists", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  assert.throws(
+    () =>
+      new CodexCliFeedbackProvider({
+        executablePath: fixture.path,
+        executableSha256: fixture.digest,
+        model: "gpt-test",
+        environment: {},
+      }),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_HOME_UNAVAILABLE",
+  );
+});
+
+test("Codex provider snapshots authentication homes at construction", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const environment: NodeJS.ProcessEnv = {
+    USERPROFILE: fixture.directory,
+  };
+  const observation: SpawnObservation = { killSignals: [] };
+  const provider = new CodexCliFeedbackProvider({
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-test",
+    environment,
+    spawn: scriptedSpawn(
+      { recommendation: "approve", feedback: [] },
+      observation,
+    ),
+  });
+  environment.USERPROFILE = join(fixture.directory, "changed");
+  environment.HOME = join(fixture.directory, "changed-home");
+  environment.CODEX_HOME = join(fixture.directory, "changed-codex-home");
+
+  await provider.provideFeedback(request());
+
+  assert.equal(observation.environment?.HOME, fixture.directory);
+  assert.equal(
+    observation.environment?.CODEX_HOME,
+    join(fixture.directory, ".codex"),
+  );
+});
+
+test("Codex provider rejects drive-relative authentication homes on Windows", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows path semantics only");
+    return;
+  }
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+
+  assert.throws(
+    () =>
+      new CodexCliFeedbackProvider({
+        executablePath: fixture.path,
+        executableSha256: fixture.digest,
+        model: "gpt-test",
+        environment: { HOME: "/drive-ambiguous-home" },
+      }),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_HOME_UNAVAILABLE",
+  );
 });
 
 test("Codex provider rejects implementation-shaped and extensible output", async (t) => {

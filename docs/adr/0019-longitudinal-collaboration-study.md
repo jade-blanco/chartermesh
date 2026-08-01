@@ -103,9 +103,12 @@ trajectories are the comparison unit.
 
 Convergence runs are finite and right-censored. Defaults are a ten-feedback
 checkpoint, at most 50 feedback rounds, eight hours, 512 model calls, three
-consecutive identical artifacts, one parallel agent, and an optional total
-token cap. Cancellation, safety failure, protocol failure, and execution error
-also stop a run.
+consecutive identical artifacts, three consecutive contract-invalid
+submissions, one parallel agent, and an optional total token cap.
+Contract-invalid counting is submission-based rather than internal-call-based,
+so single and team conditions receive the same failed artifact opportunities;
+a contract-valid submission resets it. Cancellation, safety failure, protocol
+failure, and execution error also stop a run.
 
 The report preserves the censor reason. A censored trajectory is neither a
 success nor proof that the condition would never succeed.
@@ -178,6 +181,14 @@ re-attests it before and after execution, and runs in a fresh ephemeral
 read-only context with host extensions and shell access disabled. A live plan
 containing code also runs the attested VM preflight before the first model
 call.
+
+The proxy also applies a versioned authentication-environment policy. A
+missing `HOME` is resolved from an absolute `USERPROFILE`, and a missing
+`CODEX_HOME` is resolved as `HOME/.codex`. The environment is snapshotted when
+the provider is constructed, before any candidate call; invalid, relative, and
+Windows drive-ambiguous values fail closed. The policy is committed by the
+Codex feedback-protocol hash so environment normalization cannot change beneath
+an approved plan.
 
 Live CLI runs use a study-specific Control Plane database rather than the
 target's operational database. Model invocations and peer-team child Attempts

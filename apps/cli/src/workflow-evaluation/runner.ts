@@ -58,9 +58,9 @@ export type WorkflowStudyTaskBinding =
     };
 
 export const WORKFLOW_STUDY_PLAN_API_VERSION =
-  "chartermesh.dev/collaboration-study-plan/v1alpha2" as const;
+  "chartermesh.dev/collaboration-study-plan/v1alpha3" as const;
 export const WORKFLOW_STUDY_HARNESS_VERSION =
-  "chartermesh.dev/collaboration-study-harness/v1alpha2" as const;
+  "chartermesh.dev/collaboration-study-harness/v1alpha3" as const;
 
 export interface WorkflowStudyPlan {
   apiVersion: typeof WORKFLOW_STUDY_PLAN_API_VERSION;
@@ -96,6 +96,7 @@ export interface WorkflowStudyPlan {
   boundedCheckpointFeedbackRounds: number;
   maximumFeedbackRoundsPerTrajectory: number;
   maximumTotalModelCallsPerTrajectory: number;
+  maximumConsecutiveContractInvalidSubmissionsPerTrajectory: number;
   codexProxyRequired: true;
   planGenerationModelCalls: false;
   liveExecutionRequiresExactApproval: true;
@@ -405,6 +406,8 @@ export function createWorkflowStudyPlan(input: {
     boundedCheckpointFeedbackRounds: input.limits.boundedCheckpoint,
     maximumFeedbackRoundsPerTrajectory: input.limits.maxFeedbackRounds,
     maximumTotalModelCallsPerTrajectory: input.limits.maxModelCalls,
+    maximumConsecutiveContractInvalidSubmissionsPerTrajectory:
+      input.limits.maxConsecutiveContractInvalidSubmissions,
     codexProxyRequired: true as const,
     planGenerationModelCalls: false as const,
     liveExecutionRequiresExactApproval: true as const,

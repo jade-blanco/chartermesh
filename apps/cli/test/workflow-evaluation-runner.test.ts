@@ -77,6 +77,10 @@ test("workflow plan hash deterministically binds sealed fixtures, limits, and en
     { maxWallClockMs: first.limits.maxWallClockMs + 1_000 },
     { maxTotalTokens: 12_345 },
     { identicalArtifactLimit: first.limits.identicalArtifactLimit + 1 },
+    {
+      maxConsecutiveContractInvalidSubmissions:
+        first.limits.maxConsecutiveContractInvalidSubmissions + 1,
+    },
     { maxParallelAgents: first.limits.maxParallelAgents + 1 },
   ]) {
     const changedPlan = createArtifactWorkflowStudyPlan({

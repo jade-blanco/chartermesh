@@ -461,6 +461,8 @@ export async function runWorkflowStudy(input: {
     maxModelCalls: input.limits?.maxModelCalls ?? 512,
     maxTotalTokens: input.limits?.maxTotalTokens ?? null,
     identicalArtifactLimit: input.limits?.identicalArtifactLimit ?? 3,
+    maxConsecutiveContractInvalidSubmissions:
+      input.limits?.maxConsecutiveContractInvalidSubmissions ?? 3,
     maxParallelAgents: input.limits?.maxParallelAgents ?? 1,
   };
   return {

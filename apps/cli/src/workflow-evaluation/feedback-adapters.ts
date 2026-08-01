@@ -16,7 +16,7 @@ import {
 } from "./types.ts";
 
 export const WORKFLOW_FEEDBACK_ADAPTER_VERSION =
-  "chartermesh.dev/workflow-feedback-adapter/v1alpha1" as const;
+  "chartermesh.dev/workflow-feedback-adapter/v1alpha2" as const;
 
 function usage(modelCall: boolean): ModelUsage {
   return {

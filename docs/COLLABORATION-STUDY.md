@@ -221,7 +221,14 @@ produce an identical artifact. The default limits are:
 | Total model calls | 512 |
 | Total tokens | No default cap; an explicit cap reserves a conservative input bound before every candidate call and fails closed if usage becomes unknown |
 | Consecutive identical artifacts | 3 |
+| Consecutive contract-invalid submissions | 3 |
 | Parallel agents | 1 |
+
+The contract-invalid guard counts completed externally visible submissions,
+not internal calls or handoffs. It therefore gives single and team conditions
+the same three failed submission opportunities while stopping changing but
+unevaluable artifacts that an identical-hash guard cannot detect. A
+contract-valid submission resets the counter.
 
 Stopping reasons are preserved as data: feedback-round limit, wall-clock
 limit, model-call limit, token limit, unknown token usage under an explicit
@@ -249,6 +256,15 @@ a fresh temporary working directory, and invokes an ephemeral read-only
 session with user configuration, repository rules, multi-agent features,
 apps, and shell tools disabled. Output is schema-constrained to a recommendation
 and at most three short feedback items; code and patches are rejected.
+
+The proxy uses a versioned environment policy for cross-platform Codex
+authentication. It preserves the inherited environment, resolves a missing
+`HOME` from an absolute `USERPROFILE`, and resolves a missing `CODEX_HOME` as
+`HOME/.codex`. The resolved environment is snapshotted when the provider is
+constructed, before candidate work starts. Missing, relative, and Windows
+drive-ambiguous authentication homes fail closed before the child starts. This
+policy is included in the Codex feedback-protocol hash; a change therefore
+requires a new approved study plan.
 
 This isolation supports repeatable simulated feedback. It does not make Codex
 a real user, remove account or provider cost, or authorize a production
@@ -353,6 +369,7 @@ node bin/chartermesh.mjs evaluate-workflow `
   --checkpoint-feedback-rounds 10 `
   --max-feedback-rounds 50 `
   --max-model-calls 512 `
+  --max-consecutive-contract-invalid-submissions 3 `
   --max-wall-clock-minutes 480 `
   --max-parallel-agents 1 `
   --json
@@ -374,6 +391,7 @@ node bin/chartermesh.mjs evaluate-workflow `
   --checkpoint-feedback-rounds 10 `
   --max-feedback-rounds 50 `
   --max-model-calls 512 `
+  --max-consecutive-contract-invalid-submissions 3 `
   --max-wall-clock-minutes 480 `
   --max-parallel-agents 1 `
   --live `

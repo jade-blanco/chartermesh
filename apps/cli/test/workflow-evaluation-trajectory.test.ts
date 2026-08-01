@@ -493,6 +493,81 @@ test("trajectory right-censors repeated identical artifacts as no progress", asy
   assert.equal(report.outcome.passedByCheckpoint, false);
 });
 
+test("trajectory right-censors three evaluator-equivalent contract-invalid submissions for both architectures", async () => {
+  for (const architecture of ["single", "team"] as const) {
+    const invalid = executor(
+      architecture,
+      (submission) => JSON.stringify({ architecture, submission }),
+    );
+    const execute = invalid.execute.bind(invalid);
+    invalid.execute = async (input) => ({
+      ...(await execute(input)),
+      contractValid: false,
+    });
+    let evaluations = 0;
+    const report = await runWorkflowTrajectory({
+      task,
+      executor: invalid,
+      feedbackProvider: feedbackProvider("fixed_self_review"),
+      evaluator: {
+        id: "must-not-evaluate-contract-invalid-artifacts",
+        async evaluate() {
+          evaluations += 1;
+          return {
+            passed: false,
+            score: 0,
+            criticalFailures: ["must.not.run"],
+            criterionResults: [],
+          };
+        },
+      },
+      trialId: `trial-contract-invalid-${architecture}`,
+    });
+    assert.equal(report.outcome.status, "censored");
+    assert.equal(report.outcome.censorReason, "no_progress");
+    assert.equal(report.rounds.length, 3);
+    assert.equal(report.outcome.feedbackRoundCount, 2);
+    assert.equal(new Set(report.rounds.map(({ artifactHash }) => artifactHash)).size, 3);
+    assert.equal(evaluations, 0);
+  }
+});
+
+test("a contract-valid submission resets the consecutive invalid-submission guard", async () => {
+  const mixed = executor(
+    "single",
+    (submission) => JSON.stringify({ submission, nonce: `artifact-${submission}` }),
+  );
+  const execute = mixed.execute.bind(mixed);
+  mixed.execute = async (input) => ({
+    ...(await execute(input)),
+    contractValid: input.submission === 3,
+  });
+  let evaluations = 0;
+  const report = await runWorkflowTrajectory({
+    task,
+    executor: mixed,
+    feedbackProvider: feedbackProvider("neutral_repeat"),
+    evaluator: {
+      id: "contract-valid-reset-evaluator",
+      async evaluate() {
+        evaluations += 1;
+        return {
+          passed: false,
+          score: 0.25,
+          criticalFailures: ["still.missing"],
+          criterionResults: [],
+        };
+      },
+    },
+    trialId: "trial-contract-invalid-reset",
+  });
+  assert.equal(report.outcome.status, "censored");
+  assert.equal(report.outcome.censorReason, "no_progress");
+  assert.equal(report.rounds.length, 6);
+  assert.equal(report.outcome.feedbackRoundCount, 5);
+  assert.equal(evaluations, 1);
+});
+
 test("team condition fails closed when C-level requests review without a handoff", async () => {
   let evaluations = 0;
   const report = await runWorkflowTrajectory({

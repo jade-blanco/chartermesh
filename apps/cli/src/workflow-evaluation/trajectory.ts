@@ -28,6 +28,7 @@ export const DEFAULT_WORKFLOW_TRAJECTORY_LIMITS: WorkflowTrajectoryLimits = {
   maxModelCalls: 512,
   maxTotalTokens: null,
   identicalArtifactLimit: 3,
+  maxConsecutiveContractInvalidSubmissions: 3,
   maxParallelAgents: 1,
 };
 
@@ -226,6 +227,12 @@ function validateLimits(limits: WorkflowTrajectoryLimits): void {
     ["maxWallClockMs", limits.maxWallClockMs, 1_000, 86_400_000],
     ["maxModelCalls", limits.maxModelCalls, 1, 100_000],
     ["identicalArtifactLimit", limits.identicalArtifactLimit, 2, 100],
+    [
+      "maxConsecutiveContractInvalidSubmissions",
+      limits.maxConsecutiveContractInvalidSubmissions,
+      1,
+      100,
+    ],
     ["maxParallelAgents", limits.maxParallelAgents, 1, 64],
   ];
   for (const [name, value, minimum, maximum] of integers) {
@@ -438,6 +445,7 @@ export async function runWorkflowTrajectory(input: {
   let previousArtifact: { sha256: string; content: string } | null = null;
   let previousArtifactHash: string | null = null;
   let identicalArtifacts = 0;
+  let consecutiveContractInvalidSubmissions = 0;
   let directive = input.task.initialImplementationBrief;
   let directiveHash = sha256(directive);
   const feedbackDirectiveHashes: string[] = [];
@@ -681,6 +689,9 @@ export async function runWorkflowTrajectory(input: {
     identicalArtifacts =
       previousArtifactHash === artifactHash ? identicalArtifacts + 1 : 1;
     previousArtifactHash = artifactHash;
+    consecutiveContractInvalidSubmissions = execution.contractValid
+      ? 0
+      : consecutiveContractInvalidSubmissions + 1;
 
     const protocolViolations = [...execution.protocolViolations];
     if (!execution.cLevelReviewRequested) {
@@ -811,6 +822,13 @@ export async function runWorkflowTrajectory(input: {
       passSubmission = submission;
       finalApprovalCount = 1;
       userDirectiveCount += 1;
+      break;
+    }
+    if (
+      consecutiveContractInvalidSubmissions >=
+      limits.maxConsecutiveContractInvalidSubmissions
+    ) {
+      censorReason = "no_progress";
       break;
     }
     if (identicalArtifacts >= limits.identicalArtifactLimit) {

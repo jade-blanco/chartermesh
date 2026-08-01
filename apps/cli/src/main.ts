@@ -2643,6 +2643,14 @@ function workflowTrajectoryLimits(args: string[]): WorkflowTrajectoryLimits {
       2,
       100,
     ),
+    maxConsecutiveContractInvalidSubmissions: boundedIntegerOption(
+      args,
+      "--max-consecutive-contract-invalid-submissions",
+      DEFAULT_WORKFLOW_TRAJECTORY_LIMITS
+        .maxConsecutiveContractInvalidSubmissions,
+      1,
+      100,
+    ),
     maxParallelAgents: boundedIntegerOption(
       args,
       "--max-parallel-agents",
@@ -3328,6 +3336,7 @@ Commands:
     [--fixture ID | --full | --artifacts-only | --code-only]
     [--checkpoint-feedback-rounds 10] [--max-feedback-rounds 50]
     [--max-model-calls 512] [--max-total-tokens N]
+    [--max-consecutive-contract-invalid-submissions 3]
     [--max-wall-clock-minutes 480] [--max-parallel-agents 1] [--json]
     [--code-runtime-executable ABSOLUTE_PATH] [--wsb-executable ABSOLUTE_PATH]
   chartermesh evaluate-workflow ... --live --engine-id ID \
