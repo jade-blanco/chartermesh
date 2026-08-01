@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   stat,
@@ -12,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   requireSafeSandbox,
@@ -28,6 +29,7 @@ import {
   cleanupSandboxSession,
   compareSandboxCase,
   createWindowsSandboxSessionJournal,
+  executeAttestedWindowsSandboxLauncher,
   inspectSandboxOutputTree,
   parseAuthenticatedCandidateEnvelope,
   parseWindowsSandboxSessionJournal,
@@ -168,6 +170,155 @@ test("Windows Sandbox launcher attestation rejects path and content changes", as
     await assert.rejects(
       attestWindowsSandboxLauncher("wsb.exe", expected),
       /SANDBOX_WSB_PROVENANCE_PATH_NOT_ABSOLUTE/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows Sandbox launcher attestation rejects a leaf symbolic link", async (t) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-wsb-launcher-link-test-"),
+  );
+  try {
+    const launcher = join(root, "wsb.exe");
+    const launcherLink = join(root, "wsb-link.exe");
+    const trusted = "trusted-wsb";
+    const expected = createHash("sha256")
+      .update(trusted)
+      .digest("hex");
+    await writeFile(launcher, trusted, "utf8");
+    try {
+      await symlink(launcher, launcherLink, "file");
+    } catch (error) {
+      if (
+        error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        ["EPERM", "EACCES"].includes(String(error.code))
+      ) {
+        t.skip("Creating a file symlink is not permitted on this host.");
+        return;
+      }
+      throw error;
+    }
+    await assert.rejects(
+      attestWindowsSandboxLauncher(launcherLink, expected),
+      /SANDBOX_PROVENANCE_FILE_INVALID/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows Sandbox rejects an explicitly empty launcher hash", async () => {
+  let executed = false;
+  await assert.rejects(
+    executeAttestedWindowsSandboxLauncher({
+      executable: resolve("wsb.exe"),
+      expectedSha256: "",
+      args: ["list", "--raw"],
+      options: { timeout: 1_000, windowsHide: true },
+      async executeFile() {
+        executed = true;
+        return { stdout: "", stderr: "" };
+      },
+    }),
+    /SANDBOX_WSB_PROVENANCE_HASH_INVALID/u,
+  );
+  assert.equal(executed, false);
+});
+
+test("Windows Sandbox pins canonical targets beneath a redirected ancestor", async (t) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "chartermesh-windows-path-alias-test-"),
+  );
+  const actual = join(root, "actual");
+  const alias = join(root, "alias");
+  try {
+    await mkdir(actual);
+    try {
+      // GitHub's Windows runner workspace uses the same ancestor-junction
+      // shape. A nested parent is a real directory even though an ancestor is
+      // resolved through the junction.
+      await symlink(actual, alias, "junction");
+    } catch (error) {
+      if (
+        error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        ["EPERM", "EACCES"].includes(String(error.code))
+      ) {
+        t.skip("Creating a directory junction is not permitted on this host.");
+        return;
+      }
+      throw error;
+    }
+    const nestedActual = join(actual, "nested");
+    await mkdir(nestedActual);
+    const launcher = join(nestedActual, "wsb.exe");
+    const trusted = "trusted-wsb-through-stable-alias";
+    const expected = createHash("sha256")
+      .update(trusted)
+      .digest("hex");
+    await writeFile(launcher, trusted, "utf8");
+    const aliasedLauncher = join(alias, "nested", "wsb.exe");
+    await attestWindowsSandboxLauncher(aliasedLauncher, expected);
+    const executed: string[] = [];
+    await executeAttestedWindowsSandboxLauncher({
+      executable: aliasedLauncher,
+      expectedSha256: expected,
+      args: ["list", "--raw"],
+      options: { timeout: 1_000, windowsHide: true },
+      async executeFile(executable) {
+        executed.push(executable);
+        return { stdout: "", stderr: "" };
+      },
+    });
+    assert.deepEqual(
+      executed.map((value) => value.toLowerCase()),
+      [(await realpath(launcher)).toLowerCase()],
+    );
+
+    const sandboxId = "12345678-1234-1234-1234-1234567890ab";
+    const record = createWindowsSandboxSessionJournal({
+      sandboxId,
+      ownerPid: 42,
+      ownerNonce: "a".repeat(32),
+      createdAtMs: 1,
+      launcherSha256: null,
+    });
+    await assert.rejects(
+      persistWindowsSandboxSessionJournal(
+        join(alias, "rejected-session.json"),
+        record,
+      ),
+      /SANDBOX_SESSION_JOURNAL_PARENT_INVALID/u,
+    );
+
+    const journal = join(alias, "nested", "session.json");
+    const physicalJournal = join(nestedActual, "session.json");
+    await persistWindowsSandboxSessionJournal(journal, record);
+    assert.equal((await stat(physicalJournal)).isFile(), true);
+    const stopped: string[] = [];
+    assert.equal(
+      await recoverWindowsSandboxSessionJournal({
+        path: journal,
+        currentOwnerNonce: "b".repeat(32),
+        ownerAppearsAlive: () => false,
+        async stopAndAttest(id) {
+          stopped.push(id);
+        },
+      }),
+      sandboxId,
+    );
+    assert.deepEqual(stopped, [sandboxId]);
+    assert.equal(
+      await stat(physicalJournal).then(
+        () => true,
+        () => false,
+      ),
+      false,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

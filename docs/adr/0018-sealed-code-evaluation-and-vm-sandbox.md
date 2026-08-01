@@ -67,6 +67,13 @@ CharterMesh adds an opt-in code-maintenance pilot with these boundaries:
   harness, Node runtime, OS, and canonical guest bundle before inference.
   Every VM stages those files through verified handles and rechecks the staged
   hashes before start and after stop.
+- Windows may expose trusted workspace ancestors through directory junctions,
+  including on GitHub-hosted runners. Launcher and session-journal operations
+  resolve such ancestors once and bind the canonical target by file or
+  directory identity for the ensuing operation. A link at the launcher or
+  journal entry, a redirected immediate journal parent, identity drift, or a
+  digest mismatch still fails closed. Journal removal is always a verified,
+  non-recursive unlink.
 
 ## Consequences
 

@@ -22,7 +22,14 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  resolve,
+  sep,
+} from "node:path";
 import { promisify, isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { CodeCandidate } from "./candidate.ts";
@@ -445,9 +452,11 @@ export async function attestWindowsSandboxLauncher(
   }
   const absolutePath = resolve(path);
   const before = await stableFileIdentity(absolutePath);
-  if (before.resolved.toLowerCase() !== absolutePath.toLowerCase()) {
-    throw new Error("SANDBOX_WSB_PROVENANCE_PATH_REDIRECT");
-  }
+  // GitHub's Windows runners and some managed Windows installations expose
+  // workspace ancestors through directory junctions. Pin the fully resolved
+  // file identity instead of rejecting a stable ancestor alias. A link at the
+  // launcher itself is still rejected by stableFileIdentity, and the
+  // before/open/after identity plus expected digest detect retargeting.
   if (previous && !sameFileIdentity(previous, before)) {
     throw new Error("SANDBOX_WSB_PROVENANCE_IDENTITY_CHANGED");
   }
@@ -472,6 +481,48 @@ export async function attestWindowsSandboxLauncher(
     return before;
   } finally {
     await handle.close();
+  }
+}
+
+interface WindowsSandboxExecutionOptions {
+  timeout: number;
+  windowsHide: boolean;
+  signal?: AbortSignal;
+}
+
+type WindowsSandboxProcessExecutor = (
+  executable: string,
+  args: string[],
+  options: WindowsSandboxExecutionOptions,
+) => Promise<{ stdout: string | Buffer; stderr: string | Buffer }>;
+
+export async function executeAttestedWindowsSandboxLauncher(input: {
+  executable: string;
+  expectedSha256?: string;
+  args: string[];
+  options: WindowsSandboxExecutionOptions;
+  executeFile?: WindowsSandboxProcessExecutor;
+}): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+  const before = input.expectedSha256 !== undefined
+    ? await attestWindowsSandboxLauncher(
+        input.executable,
+        input.expectedSha256,
+      )
+    : undefined;
+  try {
+    return await (input.executeFile ?? execFileAsync)(
+      before?.resolved ?? input.executable,
+      input.args,
+      input.options,
+    );
+  } finally {
+    if (before && input.expectedSha256 !== undefined) {
+      await attestWindowsSandboxLauncher(
+        input.executable,
+        input.expectedSha256,
+        before,
+      );
+    }
   }
 }
 
@@ -621,16 +672,25 @@ async function validatedSessionJournalPath(path: string): Promise<string> {
   }
   const resolvedParent = await realpath(parent);
   const after = await lstat(parent);
+  const resolved = await lstat(resolvedParent);
   if (
-    resolvedParent.toLowerCase() !== parent.toLowerCase() ||
     after.isSymbolicLink() ||
     !after.isDirectory() ||
+    resolved.isSymbolicLink() ||
+    !resolved.isDirectory() ||
     before.dev !== after.dev ||
-    before.ino !== after.ino
+    before.ino !== after.ino ||
+    before.dev !== resolved.dev ||
+    before.ino !== resolved.ino
   ) {
     throw new Error("SANDBOX_SESSION_JOURNAL_PARENT_REDIRECT");
   }
-  return absolutePath;
+  // Continue through the canonical parent. This supports stable Windows
+  // runner junctions while preventing retargeting of the original alias from
+  // changing the ensuing filesystem operation. The journal entry itself is
+  // separately required to be a regular, identity-stable file and is never
+  // removed recursively.
+  return join(resolvedParent, basename(absolutePath));
 }
 
 async function readWindowsSandboxSessionJournal(
@@ -1548,27 +1608,14 @@ export class WindowsSandboxCodeBackend
       signal?: AbortSignal;
     },
   ) {
-    const before = this.wsbExecutableSha256
-      ? await attestWindowsSandboxLauncher(
-          this.wsbExecutable,
-          this.wsbExecutableSha256,
-        )
-      : undefined;
-    try {
-      return await execFileAsync(
-        this.wsbExecutable,
-        args,
-        options,
-      );
-    } finally {
-      if (before && this.wsbExecutableSha256) {
-        await attestWindowsSandboxLauncher(
-          this.wsbExecutable,
-          this.wsbExecutableSha256,
-          before,
-        );
-      }
-    }
+    return executeAttestedWindowsSandboxLauncher({
+      executable: this.wsbExecutable,
+      ...(this.wsbExecutableSha256
+        ? { expectedSha256: this.wsbExecutableSha256 }
+        : {}),
+      args,
+      options,
+    });
   }
 
   private async stopSandbox(sandboxId: string): Promise<void> {
