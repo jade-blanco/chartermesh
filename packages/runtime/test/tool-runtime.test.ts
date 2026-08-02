@@ -16,6 +16,7 @@ import type {
 } from "../../adapter-sdk/src/types.ts";
 import {
   ToolApprovalRequiredError,
+  ToolEvidenceCommitError,
   ToolIterationLimitError,
   createWorkspaceToolRuntime,
   toolCallHash,
@@ -88,6 +89,7 @@ test("tool loop executes an allowed read and records hash-only evidence", async 
       return result(inferenceRequest, { text: "done" });
     },
   };
+  const provenanceEvents: string[] = [];
   const runtime = createWorkspaceToolRuntime({
     workspaceRoot: workspace,
     workItemId: "work-read",
@@ -96,7 +98,20 @@ test("tool loop executes an allowed read and records hash-only evidence", async 
       workspaceRoots: ["."],
       maxIterations: 3,
     },
+    prepareEvidence(intent) {
+      provenanceEvents.push(`prepare:${intent.callHash}:${intent.inputHash}`);
+      return { id: "receipt-read", token: "a".repeat(64) };
+    },
+    onEvidence(evidence, receipt) {
+      assert.equal(receipt?.id, "receipt-read");
+      assert.equal(receipt?.token, "a".repeat(64));
+      assert.equal(evidence.callHash, provenanceEvents[0]?.split(":")[1]);
+      provenanceEvents.push(`record:${evidence.status}`);
+    },
   });
+  assert.equal(Reflect.get(runtime, "record"), undefined);
+  assert.equal(Reflect.get(runtime, "evidence"), undefined);
+  assert.equal(Reflect.get(runtime, "prepare"), undefined);
   const output = await runtime.run(engine, request());
   assert.equal(output.inference.text, "done");
   assert.equal(output.iterations, 2);
@@ -105,6 +120,10 @@ test("tool loop executes an allowed read and records hash-only evidence", async 
   assert.equal(output.evidence[0]?.status, "succeeded");
   assert.match(output.evidence[0]?.inputHash ?? "", /^[a-f0-9]{64}$/u);
   assert.match(output.evidence[0]?.outputHash ?? "", /^[a-f0-9]{64}$/u);
+  assert.deepEqual(
+    provenanceEvents.map((event) => event.split(":")[0]),
+    ["prepare", "record"],
+  );
 });
 
 test("workspace writes require an exact human-approved call hash", async () => {
@@ -186,6 +205,71 @@ test("workspace writes require an exact human-approved call hash", async () => {
     readFileSync(join(workspace, "replayed.txt"), "utf8"),
     "durable replay\n",
   );
+});
+
+test("a post-execution evidence failure is outcome-unknown and never reclassified", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-receipt-"));
+  const call = {
+    id: "call-outcome-unknown",
+    name: "workspace.write_file",
+    arguments: { path: "result.txt", content: "written once\n" },
+  };
+  let evidenceCallbacks = 0;
+  const runtime = createWorkspaceToolRuntime({
+    workspaceRoot: workspace,
+    workItemId: "work-outcome-unknown",
+    policy: {
+      allow: ["workspace.write_file"],
+      approvalRequired: ["workspace.write_file"],
+      workspaceRoots: ["."],
+      maxIterations: 2,
+    },
+    isApproved: () => true,
+    prepareEvidence: () => ({ id: "receipt-unknown", token: "b".repeat(64) }),
+    onEvidence(evidence) {
+      evidenceCallbacks += 1;
+      assert.equal(evidence.status, "succeeded");
+      throw new Error("synthetic evidence sink failure");
+    },
+  });
+
+  await assert.rejects(
+    runtime.executeApprovedCall(call),
+    (error) =>
+      error instanceof ToolEvidenceCommitError &&
+      error.code === "TOOL_OUTCOME_UNKNOWN",
+  );
+  assert.equal(evidenceCallbacks, 1);
+  assert.equal(readFileSync(join(workspace, "result.txt"), "utf8"), "written once\n");
+});
+
+test("runtime policy is an immutable snapshot", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-policy-"));
+  const policy = {
+    allow: ["workspace.read_file"],
+    workspaceRoots: ["."],
+    maxIterations: 2,
+  };
+  const runtime = createWorkspaceToolRuntime({
+    workspaceRoot: workspace,
+    workItemId: "work-policy-snapshot",
+    policy,
+  });
+  policy.allow.push("workspace.write_file");
+  policy.workspaceRoots[0] = "..";
+
+  assert.deepEqual(runtime.modelTools().map(({ name }) => name), [
+    "workspace.read_file",
+  ]);
+  await assert.rejects(
+    runtime.executeApprovedCall({
+      id: "call-policy-drift",
+      name: "workspace.write_file",
+      arguments: { path: "drift.txt", content: "must not be written\n" },
+    }),
+    /TOOL_DENIED/u,
+  );
+  assert.equal(existsSync(join(workspace, "drift.txt")), false);
 });
 
 test("SHA-bound replacement writes are exact, bounded, and race-safe", async () => {

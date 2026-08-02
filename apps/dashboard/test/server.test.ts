@@ -50,10 +50,15 @@ test("dashboard serves one projection and protects mutations", async () => {
     )?.[1];
     assert.ok(token);
     assert.match(html, /class="skip-link" href="#main-content"/u);
-    assert.match(html, /aria-pressed="true">조치 필요/u);
+    assert.match(html, /aria-pressed="true">내 결정/u);
+    assert.match(html, /id="decision-focus"/u);
+    assert.match(html, /id="artifact-verified-evidence"/u);
+    assert.match(html, /id="decision-dialog"/u);
+    assert.match(html, /id="input-dialog"/u);
+    assert.match(html, /id="artifact-packet-hash"/u);
     assert.match(html, /<th scope="col">상태<\/th>/u);
     assert.match(html, /id="tool-approval-block"/u);
-    assert.match(html, /data-summary-filter="approvals"/u);
+    assert.match(html, /data-summary-filter="human"/u);
     assert.match(html, /aria-controls="work-results"/u);
     assert.match(html, /id="tool-impact"/u);
     assert.match(html, /id="tool-safeguards"/u);
@@ -64,6 +69,11 @@ test("dashboard serves one projection and protects mutations", async () => {
       html,
       /id="request-dialog" aria-labelledby="request-dialog-heading"/u,
     );
+    const appScript = await fetch(`${dashboard.url}/app.js`).then((response) =>
+      response.text(),
+    );
+    assert.doesNotMatch(appScript, /자동 검증/u);
+    assert.match(appScript, /작업자가 보고한 수행 근거/u);
 
     const rejectedRead = await fetch(`${dashboard.url}/api/dashboard`);
     assert.equal(rejectedRead.status, 403);
@@ -156,6 +166,12 @@ test("dashboard serves one projection and protects mutations", async () => {
     const artifact = await artifactResponse!.json();
     assert.match(artifact.sha256, /^[a-f0-9]{64}$/u);
     assert.match(artifact.content, /Simulated CharterMesh result/u);
+    const packet = await fetch(
+      `${dashboard.url}/api/work-items/${id}/decision-packet`,
+      { headers: { "x-chartermesh-session": token } },
+    ).then((response) => response.json());
+    assert.equal(packet.kind, "artifact_review");
+    assert.match(packet.binding.packetHash, /^[a-f0-9]{64}$/u);
 
     const approved = await fetch(
       `${dashboard.url}/api/work-items/${id}/decision`,
@@ -165,23 +181,15 @@ test("dashboard serves one projection and protects mutations", async () => {
         body: JSON.stringify({
           decision: "approve",
           artifactHash: artifact.sha256,
+          packetHash: packet.binding.packetHash,
           note: "Exact hash reviewed in dashboard test.",
+          completeOnApprove: true,
         }),
       },
     );
     assert.equal(approved.status, 200);
-
-    const completed = await fetch(
-      `${dashboard.url}/api/work-items/${id}/complete`,
-      {
-        method: "POST",
-        headers: mutationHeaders("dashboard-test-complete"),
-        body: "{}",
-      },
-    );
-    assert.equal(completed.status, 200);
-    const final = await completed.json();
-    assert.equal(final.workItem.status, "done");
+    const final = await approved.json();
+    assert.equal(final.status, "done");
 
     const archived = await fetch(
       `${dashboard.url}/api/work-items/${id}/archive`,
@@ -242,6 +250,35 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
     createdAt: new Date().toISOString(),
     actor: "runner:test",
   });
+  const deniedItem = controlPlane.intake({
+    title: "Reject an exact tool call",
+    summary: "A human can reject the exact call without leaving a deadlock.",
+    actor: "human:test",
+    idempotencyKey: "dashboard-tool-deny-intake",
+  });
+  controlPlane.triage({
+    id: deniedItem.id,
+    ownerRole: "operator",
+    executionTarget: "local",
+    actor: "human:test",
+    idempotencyKey: "dashboard-tool-deny-triage",
+  });
+  const deniedClaim = controlPlane.claim({
+    id: deniedItem.id,
+    actor: "runner:test",
+    idempotencyKey: "dashboard-tool-deny-claim",
+  });
+  const deniedCallHash = "e".repeat(64);
+  controlPlane.recordPendingToolCall({
+    id: deniedItem.id,
+    runId: deniedClaim.runId,
+    attemptId: deniedClaim.attemptId,
+    callHash: deniedCallHash,
+    toolName: "workspace.write_file",
+    arguments: { path: "denied.mjs", content: "export const denied = true;\n" },
+    createdAt: new Date().toISOString(),
+    actor: "runner:test",
+  });
   database.close();
 
   const dashboard = await startDashboard({
@@ -261,7 +298,7 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
     const projection = await fetch(`${dashboard.url}/api/dashboard`, {
       headers: readHeaders,
     }).then((response) => response.json());
-    assert.equal(projection.summary.approvals, 1);
+    assert.equal(projection.summary.approvals, 2);
     assert.equal(projection.userActions[0].category, "human_review");
     const evidence = await fetch(
       `${dashboard.url}/api/work-items/${item.id}/tool-evidence`,
@@ -276,6 +313,11 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
       /visible = true/u,
     );
     assert.equal(evidence.pendingToolCalls[0].approved, false);
+    const packet = await fetch(
+      `${dashboard.url}/api/work-items/${item.id}/decision-packet`,
+      { headers: { "x-chartermesh-session": token } },
+    ).then((response) => response.json());
+    assert.equal(packet.kind, "tool_execution");
 
     const approved = await fetch(
       `${dashboard.url}/api/work-items/${item.id}/approve-tool`,
@@ -290,6 +332,7 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
         body: JSON.stringify({
           callHash,
           toolName: "workspace.write_file",
+          packetHash: packet.binding.packetHash,
           note: "Exact dashboard preview reviewed.",
         }),
       },
@@ -299,12 +342,122 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
       `${dashboard.url}/api/dashboard`,
       { headers: readHeaders },
     ).then((response) => response.json());
-    assert.equal(projectionAfterApproval.summary.approvals, 0);
+    assert.equal(projectionAfterApproval.summary.approvals, 1);
     const after = await fetch(
       `${dashboard.url}/api/work-items/${item.id}/tool-evidence`,
       { headers: readHeaders },
     ).then((response) => response.json());
     assert.equal(after.pendingToolCalls[0].approved, true);
+    const deniedPacket = await fetch(
+      `${dashboard.url}/api/work-items/${deniedItem.id}/decision-packet`,
+      { headers: readHeaders },
+    ).then((response) => response.json());
+    const denied = await fetch(
+      `${dashboard.url}/api/work-items/${deniedItem.id}/deny-tool`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: dashboard.url,
+          "x-chartermesh-session": token,
+          "x-idempotency-key": "dashboard-tool-deny",
+        },
+        body: JSON.stringify({
+          callHash: deniedCallHash,
+          toolName: "workspace.write_file",
+          packetHash: deniedPacket.binding.packetHash,
+          note: "The exact dashboard change is not permitted.",
+        }),
+      },
+    );
+    assert.equal(denied.status, 200, await denied.text());
+    const deniedEvidence = await fetch(
+      `${dashboard.url}/api/work-items/${deniedItem.id}/tool-evidence`,
+      { headers: readHeaders },
+    ).then((response) => response.json());
+    assert.equal(deniedEvidence.pendingToolCalls[0].status, "denied");
+    const projectionAfterDenial = await fetch(
+      `${dashboard.url}/api/dashboard`,
+      { headers: readHeaders },
+    ).then((response) => response.json());
+    assert.equal(projectionAfterDenial.summary.approvals, 0);
+  } finally {
+    await dashboard.close();
+  }
+});
+
+test("dashboard binds user input to the current request packet", async () => {
+  const target = initializedTarget();
+  const database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  const controlPlane = new ControlPlane(
+    database,
+    join(target, ".chartermesh", "artifacts"),
+  );
+  const item = controlPlane.intake({
+    title: "Choose a release region",
+    summary: "A human must choose the bounded release region.",
+    actor: "human:test",
+    idempotencyKey: "dashboard-input:intake",
+  });
+  controlPlane.triage({
+    id: item.id,
+    ownerRole: "operator",
+    executionTarget: "local",
+    actor: "human:test",
+    idempotencyKey: "dashboard-input:triage",
+  });
+  controlPlane.wait({
+    id: item.id,
+    condition: {
+      type: "user_input",
+      reason: "Choose Korea or Japan.",
+      reference: "release-region",
+    },
+    actor: "role:operator",
+    idempotencyKey: "dashboard-input:wait",
+  });
+  database.close();
+
+  const dashboard = await startDashboard({ target, port: 0, quiet: true });
+  try {
+    const html = await fetch(dashboard.url).then((response) => response.text());
+    const token = html.match(
+      /name="chartermesh-session" content="([^"]+)"/u,
+    )?.[1];
+    assert.ok(token);
+    const packet = await fetch(
+      `${dashboard.url}/api/work-items/${item.id}/decision-packet`,
+      { headers: { "x-chartermesh-session": token } },
+    ).then((response) => response.json());
+    assert.equal(packet.kind, "user_input");
+    assert.equal(packet.question, "Choose Korea or Japan.");
+    const provided = await fetch(
+      `${dashboard.url}/api/work-items/${item.id}/provide-input`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: dashboard.url,
+          "x-chartermesh-session": token,
+          "x-idempotency-key": "dashboard-input:provide",
+        },
+        body: JSON.stringify({
+          packetHash: packet.binding.packetHash,
+          response: "Use the Korea region.",
+          activeReviewMs: 450,
+          detailsOpenCount: 1,
+        }),
+      },
+    );
+    const responseText = await provided.text();
+    assert.equal(provided.status, 200, responseText);
+    const result = JSON.parse(responseText);
+    assert.equal(result.workItem.availability, "ready");
+    assert.match(result.input.responseHash, /^[a-f0-9]{64}$/u);
+    assert.equal("response" in result.input, false);
+    assert.doesNotMatch(responseText, /Use the Korea region/u);
   } finally {
     await dashboard.close();
   }

@@ -15,12 +15,18 @@ export {
 } from "./backup.ts";
 export { ControlPlane } from "./service.ts";
 export {
+  buildDecisionPacket,
+  canonicalHash,
+  createDecisionContract,
+} from "./decision-packet.ts";
+export {
   dispatchOutboxBatch,
   type OutboxDispatcherOptions,
   type OutboxDispatchResult,
 } from "./outbox.ts";
 export type {
   AuditRecord,
+  AcceptanceCriterion,
   ArtifactReviewDecision,
   ArtifactEvidence,
   AttemptRecord,
@@ -32,14 +38,25 @@ export type {
   RuntimeBudgets,
   Availability,
   DashboardProjection,
+  DecisionCriterionResult,
+  DecisionException,
+  DecisionKind,
+  DecisionPacket,
+  DecisionPacketEvidence,
+  DecisionSubject,
+  EvidenceRequirement,
+  EvidenceSource,
+  EvidenceStatus,
   RuntimeHealth,
   ScheduleTickRecord,
   ToolCallApproval,
   ToolExecutionEvidenceRecord,
   UserAction,
+  UserInputRecord,
   WaitCondition,
   WaitType,
   WorkItem,
+  WorkItemDecisionContract,
   WorkItemPage,
   WorkStatus,
 } from "./types.ts";

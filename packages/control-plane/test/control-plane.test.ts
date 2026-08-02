@@ -8,14 +8,26 @@ import {
   dispatchOutboxBatch,
   openControlPlaneDatabase,
 } from "../src/index.ts";
+import {
+  createWorkspaceToolRuntime,
+  toolCallHash,
+  type ToolEvidenceReceipt,
+} from "../../runtime/src/index.ts";
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "chartermesh-control-plane-"));
   const database = openControlPlaneDatabase(join(directory, "state.db"));
   return {
+    directory,
     database,
     controlPlane: new ControlPlane(database, join(directory, "artifacts")),
   };
+}
+
+function currentPacketHash(controlPlane: ControlPlane, id: string): string {
+  const packet = controlPlane.decisionPacket(id);
+  assert.ok(packet, `Expected a current decision packet for ${id}.`);
+  return packet.binding.packetHash;
 }
 
 test("intake through approval completes and resurfaces a successor", () => {
@@ -99,6 +111,7 @@ test("intake through approval completes and resurfaces a successor", () => {
       id: first.id,
       decision: "approve",
       artifactHash: submission.sha256,
+      packetHash: currentPacketHash(controlPlane, first.id),
       note: "The synthetic artifact satisfies the acceptance criteria.",
       actor: "human:test",
       idempotencyKey: "approve:first",
@@ -237,13 +250,38 @@ test("wait conditions are explicit and actionable counts exclude blocked work", 
     assert.equal(dashboard.summary.userInput, 1);
     assert.equal(dashboard.userActions[0]?.category, "user_input");
     assert.equal(dashboard.userActions[0]?.actionable, true);
-    const resumed = controlPlane.resume({
+    assert.throws(
+      () =>
+        controlPlane.resume({
+          id: item.id,
+          actor: "human:test",
+          idempotencyKey: "resume:input-without-response",
+        }),
+      /provideUserInput/u,
+    );
+    const provided = controlPlane.provideUserInput({
       id: item.id,
+      packetHash: currentPacketHash(controlPlane, item.id),
+      response: "Use the loopback model endpoint at port 8080.",
       actor: "human:test",
-      idempotencyKey: "resume:input",
+      idempotencyKey: "provide:input",
+      activeReviewMs: 321,
+      detailsOpenCount: 2,
     });
-    assert.equal(resumed.availability, "ready");
-    assert.equal(resumed.wait, null);
+    assert.equal(provided.workItem.availability, "ready");
+    assert.equal(provided.workItem.wait, null);
+    assert.equal("response" in provided.input, false);
+    assert.match(provided.input.responseHash, /^[a-f0-9]{64}$/u);
+    assert.equal(
+      controlPlane.latestUserInput(item.id)?.response,
+      "Use the loopback model endpoint at port 8080.",
+    );
+    const inputEvent = controlPlane
+      .auditRecordsPage({ limit: 100 })
+      .find(({ type }) => type === "user.input.provided");
+    assert.equal(inputEvent?.payload.activeReviewMs, 321);
+    assert.equal(inputEvent?.payload.detailsOpenCount, 2);
+    assert.equal(inputEvent?.payload.reviewMeasurementStatus, "estimated");
   } finally {
     database.close();
   }
@@ -287,17 +325,23 @@ test("dashboard treats an unapproved pending tool call as human review", () => {
     assert.equal(beforeApproval.userActions[0]?.category, "human_review");
     assert.equal(beforeApproval.userActions[0]?.priority, 110);
 
-    controlPlane.approveToolCall({
+    const toolPacket = controlPlane.decisionPacket(item.id);
+    assert.ok(toolPacket);
+    assert.deepEqual(toolPacket.requestedDecision.options, ["approve", "reject"]);
+    controlPlane.denyToolCall({
       id: item.id,
       callHash,
       toolName: "workspace.write_file",
-      note: "Exact arguments reviewed.",
+      packetHash: toolPacket.binding.packetHash,
+      note: "The exact write is not allowed for this work item.",
       actor: "human:test",
-      idempotencyKey: "tool-review:approve",
+      idempotencyKey: "tool-review:deny",
     });
     const afterApproval = controlPlane.dashboard();
     assert.equal(afterApproval.summary.approvals, 0);
     assert.notEqual(afterApproval.userActions[0]?.category, "human_review");
+    assert.equal(controlPlane.get(item.id).status, "canceled");
+    assert.equal(controlPlane.listPendingToolCalls(item.id)[0]?.status, "denied");
 
     const malformedItem = controlPlane.intake({
       title: "Reject malformed tool arguments",
@@ -353,6 +397,64 @@ test("dashboard treats an unapproved pending tool call as human review", () => {
   }
 });
 
+test("dashboard primary human decision is independent of the newest-work page", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const review = controlPlane.intake({
+      title: "Older decision",
+      summary: "This decision must not disappear behind newer work.",
+      actor: "human:test",
+      idempotencyKey: "global-decision:intake",
+    });
+    controlPlane.triage({
+      id: review.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "global-decision:triage",
+    });
+    const claim = controlPlane.claim({
+      id: review.id,
+      actor: "runner:test",
+      idempotencyKey: "global-decision:claim",
+    });
+    controlPlane.submitArtifact({
+      id: review.id,
+      content: JSON.stringify({
+        summary: "Review me even when I am not on the newest page.",
+        deliverable: "Bounded artifact",
+        checks: [],
+        risks: [],
+        nextActions: [],
+        confidence: "medium",
+      }),
+      generation: claim.generation,
+      actor: "runner:test",
+      idempotencyKey: "global-decision:submit",
+    });
+    const newer = controlPlane.intake({
+      title: "Newer agent work",
+      summary: "This item occupies the one-row newest page.",
+      actor: "human:test",
+      idempotencyKey: "global-decision:newer",
+    });
+
+    const projection = controlPlane.dashboard({ limit: 1 });
+    assert.equal(projection.summary.humanDecisions, 1);
+    assert.equal(projection.summary.agentActions, 1);
+    assert.equal(
+      projection.attention.primaryDecision?.workItemId,
+      review.id,
+    );
+    assert.deepEqual(
+      new Set(projection.workItems.map(({ id }) => id)),
+      new Set([review.id, newer.id]),
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("changes requested retain the human review note", () => {
   const { database, controlPlane } = fixture();
   try {
@@ -385,6 +487,7 @@ test("changes requested retain the human review note", () => {
       id: item.id,
       decision: "changes_requested",
       artifactHash: submission.sha256,
+      packetHash: currentPacketHash(controlPlane, item.id),
       note: "검증 결과를 첨부하고 다시 제출하세요.",
       actor: "human:test",
       idempotencyKey: "review-note:decision",
@@ -394,6 +497,145 @@ test("changes requested retain the human review note", () => {
     assert.equal(
       decision?.note,
       "검증 결과를 첨부하고 다시 제출하세요.",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("decision packets keep model claims unverified and reject stale or non-human decisions", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Review a claimed result",
+      summary: "Separate producer claims from executable evidence.",
+      actor: "human:test",
+      idempotencyKey: "packet:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "packet:triage",
+    });
+    const firstClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "packet:claim:1",
+    });
+    const content = JSON.stringify({
+      apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+      summary: "A bounded result was produced.",
+      deliverable: "Synthetic deliverable",
+      checks: ["All tests passed."],
+      risks: ["The check is only producer-reported."],
+      nextActions: ["Review the evidence provenance."],
+      confidence: "high",
+    });
+    const firstArtifact = controlPlane.submitArtifact({
+      id: item.id,
+      content,
+      generation: firstClaim.generation,
+      actor: "runner:test",
+      idempotencyKey: "packet:submit:1",
+    });
+    const firstPacket = controlPlane.decisionPacket(item.id);
+    assert.ok(firstPacket);
+    assert.equal(firstPacket.kind, "artifact_review");
+    assert.equal(firstPacket.producerReport?.summary, "A bounded result was produced.");
+    assert.deepEqual(
+      firstPacket.evidence
+        .filter(({ source }) => source === "model_reported")
+        .map(({ status }) => status),
+      ["claimed"],
+    );
+    assert.equal(
+      firstPacket.evidence.some(
+        ({ source, status }) =>
+          source === "model_reported" && status === "verified",
+      ),
+      false,
+    );
+    assert.equal(
+      firstPacket.exceptions.some(
+        ({ code }) => code === "MODEL_REPORTED_ONLY",
+      ),
+      true,
+    );
+    assert.throws(
+      () =>
+        controlPlane.triage({
+          id: item.id,
+          ownerRole: "operator",
+          executionTarget: "local",
+          actor: "human:test",
+          idempotencyKey: "packet:bypass-triage",
+        }),
+      /Only requested, ready, or change-requested/u,
+    );
+    assert.throws(
+      () =>
+        controlPlane.resume({
+          id: item.id,
+          actor: "human:test",
+          idempotencyKey: "packet:bypass-resume",
+        }),
+      /dedicated command/u,
+    );
+    assert.throws(
+      () =>
+        controlPlane.decide({
+          id: item.id,
+          decision: "approve",
+          artifactHash: firstArtifact.sha256,
+          packetHash: firstPacket.binding.packetHash,
+          note: "A role cannot approve its own report.",
+          actor: "role:operator",
+          idempotencyKey: "packet:role-decision",
+        }),
+      /human actor/u,
+    );
+    controlPlane.decide({
+      id: item.id,
+      decision: "changes_requested",
+      artifactHash: firstArtifact.sha256,
+      packetHash: firstPacket.binding.packetHash,
+      note: "Add executable evidence and resubmit the same bounded report.",
+      actor: "human:test",
+      idempotencyKey: "packet:changes",
+    });
+    const secondClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "packet:claim:2",
+    });
+    const secondArtifact = controlPlane.submitArtifact({
+      id: item.id,
+      content,
+      generation: secondClaim.generation,
+      actor: "runner:test",
+      idempotencyKey: "packet:submit:2",
+    });
+    const secondPacket = controlPlane.decisionPacket(item.id);
+    assert.ok(secondPacket);
+    assert.equal(secondArtifact.sha256, firstArtifact.sha256);
+    assert.notEqual(
+      secondPacket.binding.packetHash,
+      firstPacket.binding.packetHash,
+    );
+    assert.throws(
+      () =>
+        controlPlane.decide({
+          id: item.id,
+          decision: "approve",
+          artifactHash: secondArtifact.sha256,
+          packetHash: firstPacket.binding.packetHash,
+          note: "This packet is stale.",
+          actor: "human:test",
+          idempotencyKey: "packet:stale-decision",
+        }),
+      /packet does not match/u,
     );
   } finally {
     database.close();
@@ -534,6 +776,7 @@ test("artifact evidence is fenced by run generation and exact hash", () => {
           id: item.id,
           decision: "approve",
           artifactHash: "0".repeat(64),
+          packetHash: currentPacketHash(controlPlane, item.id),
           note: "Wrong evidence.",
           actor: "human:test",
           idempotencyKey: "fence:wrong-review",
@@ -544,6 +787,7 @@ test("artifact evidence is fenced by run generation and exact hash", () => {
       id: item.id,
       decision: "approve",
       artifactHash: submitted.sha256,
+      packetHash: currentPacketHash(controlPlane, item.id),
       note: "Exact artifact reviewed.",
       actor: "human:test",
       idempotencyKey: "fence:review",
@@ -607,6 +851,7 @@ test("artifact byte limits are enforced before evidence is written", () => {
       id: item.id,
       decision: "changes_requested",
       artifactHash: first.sha256,
+      packetHash: currentPacketHash(controlPlane, item.id),
       note: "Submit a revision.",
       actor: "human:test",
       idempotencyKey: "artifact-limit:changes",
@@ -679,6 +924,79 @@ test("failed runs are retryable with a new fenced generation", () => {
       idempotencyKey: "retry:claim:2",
     });
     assert.equal(second.generation, 2);
+  } finally {
+    database.close();
+  }
+});
+
+test("unknown tool outcomes require explicit human acknowledgement before retry", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Inspect an uncertain tool outcome",
+      summary: "Do not silently repeat a tool after its evidence sink failed.",
+      actor: "human:test",
+      idempotencyKey: "unknown-tool:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "unknown-tool:triage",
+    });
+    const claim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "unknown-tool:claim",
+    });
+    controlPlane.prepareToolEvidence({
+      id: item.id,
+      runId: claim.runId,
+      attemptId: claim.attemptId,
+      callHash: "a".repeat(64),
+      toolName: "workspace.write_file",
+      inputHash: "b".repeat(64),
+      actor: "runner:test",
+    });
+    const failed = controlPlane.failRun({
+      id: item.id,
+      generation: claim.generation,
+      attemptId: claim.attemptId,
+      errorCode: "TOOL_OUTCOME_UNKNOWN",
+      errorMessage: "The tool returned before evidence was committed.",
+      actor: "runner:test",
+      idempotencyKey: "unknown-tool:fail",
+    });
+    assert.match(failed.nextAction, /explicitly acknowledge/u);
+    assert.throws(
+      () =>
+        controlPlane.retry({
+          id: item.id,
+          actor: "human:test",
+          idempotencyKey: "unknown-tool:retry-without-ack",
+        }),
+      /TOOL_OUTCOME_UNKNOWN/u,
+    );
+    assert.throws(
+      () =>
+        controlPlane.retry({
+          id: item.id,
+          actor: "role:model",
+          acknowledgeUnknownToolOutcome: true,
+          idempotencyKey: "unknown-tool:model-ack",
+        }),
+      /TOOL_OUTCOME_UNKNOWN/u,
+    );
+    assert.equal(
+      controlPlane.retry({
+        id: item.id,
+        actor: "human:test",
+        acknowledgeUnknownToolOutcome: true,
+        idempotencyKey: "unknown-tool:human-ack",
+      }).status,
+      "ready",
+    );
   } finally {
     database.close();
   }
@@ -827,8 +1145,8 @@ test("block cost policy refuses later claims after unknown monthly usage", () =>
   }
 });
 
-test("tool approval and execution evidence stay bound to exact hashes", () => {
-  const { database, controlPlane } = fixture();
+test("tool approval and execution evidence stay bound to exact hashes", async () => {
+  const { directory, database, controlPlane } = fixture();
   try {
     const item = controlPlane.intake({
       title: "Approved tool call",
@@ -852,17 +1170,22 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
       actor: "runner:test",
       idempotencyKey: "tool:claim",
     });
-    const callHash = "a".repeat(64);
+    const call = {
+      id: "call-write-result",
+      name: "workspace.write_file",
+      arguments: {
+        path: "src/result.ts",
+        content: "export const result = true;\n",
+      },
+    };
+    const callHash = toolCallHash(item.id, call);
     controlPlane.recordPendingToolCall({
       id: item.id,
       runId: claim.runId,
       attemptId: claim.attemptId,
       callHash,
       toolName: "workspace.write_file",
-      arguments: {
-        path: "src/result.ts",
-        content: "export const result = true;\n",
-      },
+      arguments: call.arguments,
       createdAt: new Date().toISOString(),
       actor: "runner:test",
     });
@@ -899,6 +1222,7 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
           id: item.id,
           callHash,
           toolName: "workspace.write_file",
+          packetHash: currentPacketHash(controlPlane, item.id),
           actor: "role:model",
           note: "A model cannot approve itself.",
           idempotencyKey: "tool:invalid-approval",
@@ -909,6 +1233,7 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
       id: item.id,
       callHash,
       toolName: "workspace.write_file",
+      packetHash: currentPacketHash(controlPlane, item.id),
       actor: "human:test",
       note: "Exact arguments were reviewed.",
       idempotencyKey: "tool:approval",
@@ -929,6 +1254,89 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
       controlPlane.approvedPendingToolCall(item.id)?.callHash,
       callHash,
     );
+    const evidenceClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "tool:evidence-claim",
+    });
+    const forgedPreparation = controlPlane.prepareToolEvidence({
+      id: item.id,
+      runId: evidenceClaim.runId,
+      attemptId: evidenceClaim.attemptId,
+      callHash,
+      toolName: "workspace.write_file",
+      inputHash: "b".repeat(64),
+      actor: "runner:forged",
+    });
+    assert.throws(
+      () =>
+        controlPlane.recordToolEvidence({
+          receipt: {
+            ...forgedPreparation,
+            runtimeProof: "forged-runtime-proof",
+          },
+          evidenceId: "tool-evidence-forged-active-lineage",
+          id: item.id,
+          runId: evidenceClaim.runId,
+          attemptId: evidenceClaim.attemptId,
+          callHash,
+          toolName: "workspace.write_file",
+          status: "succeeded",
+          inputHash: "b".repeat(64),
+          outputHash: "c".repeat(64),
+          paths: ["src/result.ts"],
+          durationMs: 1,
+          createdAt: new Date().toISOString(),
+          actor: "runner:forged",
+        }),
+      /in-process Tool Runtime/u,
+    );
+    let runtimeReceipt: ToolEvidenceReceipt | undefined;
+    const runtime = createWorkspaceToolRuntime({
+      workspaceRoot: directory,
+      workItemId: item.id,
+      policy: {
+        allow: ["workspace.write_file"],
+        approvalRequired: ["workspace.write_file"],
+        workspaceRoots: ["."],
+        maxIterations: 2,
+      },
+      isApproved: (hash, toolName) =>
+        controlPlane.isToolCallApproved(item.id, hash, toolName),
+      prepareEvidence: (intent) =>
+        controlPlane.prepareToolEvidence({
+          id: item.id,
+          runId: evidenceClaim.runId,
+          attemptId: evidenceClaim.attemptId,
+          callHash: intent.callHash,
+          toolName: intent.toolName,
+          inputHash: intent.inputHash,
+          actor: "runner:test",
+        }),
+      onEvidence: (runtimeEvidence, receipt) => {
+        assert.ok(receipt);
+        runtimeReceipt = receipt;
+        controlPlane.recordToolEvidence({
+          receipt,
+          evidenceId: runtimeEvidence.id,
+          id: item.id,
+          runId: evidenceClaim.runId,
+          attemptId: evidenceClaim.attemptId,
+          callHash: runtimeEvidence.callHash,
+          toolName: runtimeEvidence.toolName,
+          status: runtimeEvidence.status,
+          inputHash: runtimeEvidence.inputHash,
+          outputHash: runtimeEvidence.outputHash,
+          paths: runtimeEvidence.paths,
+          durationMs: runtimeEvidence.durationMs,
+          createdAt: runtimeEvidence.createdAt,
+          actor: "runner:test",
+        });
+      },
+    });
+    const execution = await runtime.executeApprovedCall(call);
+    assert.equal(execution.evidence.status, "succeeded");
+    assert.ok(runtimeReceipt);
     const executed = controlPlane.markPendingToolCallExecuted({
       id: item.id,
       callHash,
@@ -937,25 +1345,83 @@ test("tool approval and execution evidence stay bound to exact hashes", () => {
     });
     assert.equal(executed.status, "executed");
     assert.equal(controlPlane.approvedPendingToolCall(item.id), null);
-    controlPlane.recordToolEvidence({
-      evidenceId: "tool-evidence-test",
-      id: item.id,
-      runId: claim.runId,
-      attemptId: claim.attemptId,
-      callHash,
-      toolName: "workspace.write_file",
-      status: "succeeded",
-      inputHash: "b".repeat(64),
-      outputHash: "c".repeat(64),
-      paths: ["src/result.ts"],
-      durationMs: 12,
-      createdAt: new Date().toISOString(),
-      actor: "runner:test",
-    });
     const evidence = controlPlane.listToolEvidence(item.id);
     assert.equal(evidence.length, 1);
     assert.equal(evidence[0]?.callHash, callHash);
     assert.deepEqual(evidence[0]?.paths, ["src/result.ts"]);
+    assert.equal(evidence[0]?.receiptId, runtimeReceipt.id);
+    assert.equal(evidence[0]?.provenance, "control_plane_receipt");
+    database
+      .prepare(`
+        INSERT INTO tool_evidence(
+          id, work_item_id, run_id, attempt_id, call_hash, tool_name,
+          status, input_hash, output_hash, paths_json, duration_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, '[]', 1, ?)
+      `)
+      .run(
+        "legacy-unreceipted-evidence",
+        item.id,
+        evidenceClaim.runId,
+        evidenceClaim.attemptId,
+        "f".repeat(64),
+        "trusted.check",
+        "d".repeat(64),
+        "e".repeat(64),
+        new Date().toISOString(),
+      );
+    assert.equal(controlPlane.listToolEvidence(item.id).length, 1);
+    assert.throws(
+      () =>
+        controlPlane.recordToolEvidence({
+          receipt: runtimeReceipt!,
+          evidenceId: "tool-evidence-replayed-receipt",
+          id: item.id,
+          runId: evidenceClaim.runId,
+          attemptId: evidenceClaim.attemptId,
+          callHash,
+          toolName: "workspace.write_file",
+          status: "succeeded",
+          inputHash: execution.evidence.inputHash,
+          outputHash: execution.evidence.outputHash,
+          paths: ["src/result.ts"],
+          durationMs: 1,
+          createdAt: new Date().toISOString(),
+          actor: "runner:test",
+        }),
+      /Tool Runtime receipt/u,
+    );
+    const stalePreparation = controlPlane.prepareToolEvidence({
+      id: item.id,
+      runId: evidenceClaim.runId,
+      attemptId: evidenceClaim.attemptId,
+      callHash,
+      toolName: "workspace.write_file",
+      inputHash: "d".repeat(64),
+      actor: "runner:test",
+    });
+    assert.throws(
+      () =>
+        controlPlane.recordToolEvidence({
+          receipt: {
+            ...stalePreparation,
+            runtimeProof: "forged-stale-runtime-proof",
+          },
+          evidenceId: "tool-evidence-forged-lineage",
+          id: item.id,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
+          callHash,
+          toolName: "workspace.write_file",
+          status: "succeeded",
+          inputHash: "d".repeat(64),
+          outputHash: "e".repeat(64),
+          paths: ["src/forged.ts"],
+          durationMs: 1,
+          createdAt: new Date().toISOString(),
+          actor: "runner:test",
+        }),
+      /active lineage/u,
+    );
   } finally {
     database.close();
   }

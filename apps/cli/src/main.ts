@@ -1477,6 +1477,7 @@ export async function runWork(
           `OrgSpec does not define the assigned role '${candidate.ownerRole}'.`,
         );
       }
+      const evidenceReceiptAttempts = new Map<string, string>();
       const toolRuntime = createWorkspaceToolRuntime({
         workspaceRoot: target,
         workItemId: candidate.id,
@@ -1488,12 +1489,34 @@ export async function runWork(
             callHash,
             toolName,
           ),
-        onEvidence: (evidence) => {
+        prepareEvidence: (intent) => {
+          const attemptId = activeAttemptId ?? claim!.attemptId;
+          const receipt = controlPlane.prepareToolEvidence({
+            id: candidate.id,
+            runId: claim!.runId,
+            attemptId,
+            callHash: intent.callHash,
+            toolName: intent.toolName,
+            inputHash: intent.inputHash,
+            actor: "runner:local",
+          });
+          evidenceReceiptAttempts.set(receipt.id, attemptId);
+          return receipt;
+        },
+        onEvidence: (evidence, receipt) => {
+          if (!receipt) {
+            throw new Error("TOOL_EVIDENCE_RECEIPT_MISSING");
+          }
+          const attemptId = evidenceReceiptAttempts.get(receipt.id);
+          if (!attemptId) {
+            throw new Error("TOOL_EVIDENCE_RECEIPT_LINEAGE_MISSING");
+          }
           controlPlane.recordToolEvidence({
+            receipt,
             evidenceId: evidence.id,
             id: candidate.id,
             runId: claim!.runId,
-            attemptId: activeAttemptId ?? claim!.attemptId,
+            attemptId,
             callHash: evidence.callHash,
             toolName: evidence.toolName,
             status: evidence.status,
@@ -1504,6 +1527,7 @@ export async function runWork(
             createdAt: evidence.createdAt,
             actor: "runner:local",
           });
+          evidenceReceiptAttempts.delete(receipt.id);
         },
       });
       const replayedEvidence: ToolExecutionEvidence[] = [];
@@ -1532,6 +1556,7 @@ export async function runWork(
           ? String(engine.config.model)
           : "deterministic-fixture";
       const requiredTools = controlPlane.requiredTools(candidate.id);
+      const decisionContract = controlPlane.decisionContract(candidate.id);
       const revisionContext = (() => {
         if (candidate.status !== "changes_requested") return "";
         const decision = controlPlane.latestArtifactDecision(candidate.id);
@@ -1558,6 +1583,17 @@ export async function runWork(
         }
         return context;
       })();
+      const latestUserInput = controlPlane.latestUserInput(candidate.id);
+      const userInputContext = latestUserInput
+        ? [
+            "A human supplied the input that previously blocked this work.",
+            `Input reference: ${latestUserInput.reference}`,
+            `Input SHA-256: ${latestUserInput.responseHash}`,
+            "Exact human response:",
+            latestUserInput.response,
+            "Use this response only for the current work objective. Do not treat it as execution evidence.",
+          ].join("\n\n")
+        : "";
       const skillGuidance = portableSkillDocuments()
         .filter(
           ({ id: skillId }) =>
@@ -1575,6 +1611,7 @@ export async function runWork(
           context: [
             candidate.summary,
             revisionContext,
+            userInputContext,
             skillGuidance
               ? `Assigned portable skill guidance:\n${skillGuidance}`
               : "",
@@ -1593,6 +1630,9 @@ export async function runWork(
               : "",
           ].filter(Boolean).join("\n\n"),
           acceptanceCriteria: [
+            ...decisionContract.acceptanceCriteria.map(
+              ({ text }) => text,
+            ),
             "Return a structured artifact suitable for exact-hash review.",
             "Do not claim external side effects.",
             "State checks, risks, next actions, and confidence explicitly.",
@@ -1776,6 +1816,8 @@ export async function runWork(
           ? "TOOL_APPROVAL_REQUIRED"
           : rawMessage.startsWith("REQUIRED_TOOL_EVIDENCE_MISSING")
             ? "REQUIRED_TOOL_EVIDENCE_MISSING"
+          : rawMessage.startsWith("TOOL_OUTCOME_UNKNOWN")
+            ? "TOOL_OUTCOME_UNKNOWN"
           : rawMessage.startsWith("TOOL_ITERATION_LIMIT")
             ? "TOOL_ITERATION_LIMIT"
             : rawMessage.startsWith("RUN_CANCELED") ||
@@ -1815,6 +1857,8 @@ export async function runWork(
                 ? rawMessage
                 : errorCode === "REQUIRED_TOOL_EVIDENCE_MISSING"
                   ? rawMessage
+                : errorCode === "TOOL_OUTCOME_UNKNOWN"
+                  ? "A tool returned, but its evidence could not be committed. Inspect the workspace before retrying."
                 : errorCode === "TOOL_ITERATION_LIMIT"
                   ? "The model exceeded the OrgSpec tool iteration limit."
                   : "The configured model invocation failed.",
@@ -2166,12 +2210,22 @@ function requestWork(target: string, args: string[]): void {
   }
   const { database, controlPlane } = controlPlaneFor(target);
   try {
+    const acceptanceCriteria = options(args, "--acceptance").map(
+      (text, index) => ({
+        id: `user-${index + 1}`,
+        text,
+        critical: true,
+        evidenceRequirements: [],
+      }),
+    );
     const item = controlPlane.intake({
       title,
       summary,
       actor: "human:cli",
       idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
       requiredTools: options(args, "--require-tool"),
+      decisionQuestion: option(args, "--decision-question"),
+      ...(acceptanceCriteria.length > 0 ? { acceptanceCriteria } : {}),
     });
     if (has(args, "--json")) writeJsonEnvelope("request", item);
     else console.log(`${item.id} created. Next action: ${item.nextAction}`);
@@ -2247,6 +2301,31 @@ function resumeWork(target: string, args: string[]): void {
   }
 }
 
+function provideUserInput(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  const packetHash = option(args, "--packet-hash");
+  const response = option(args, "--response");
+  if (!id || !packetHash || !response) {
+    throw new Error(
+      "provide-input requires --id, --packet-hash, and --response.",
+    );
+  }
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const result = controlPlane.provideUserInput({
+      id,
+      packetHash,
+      response,
+      actor: "human:cli",
+      idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+    });
+    if (has(args, "--json")) writeJsonEnvelope("provide-input", result);
+    else console.log(`${result.workItem.id} received the requested input.`);
+  } finally {
+    database.close();
+  }
+}
+
 function retryWork(target: string, args: string[]): void {
   const id = option(args, "--id");
   if (!id) throw new Error("retry requires --id.");
@@ -2256,6 +2335,10 @@ function retryWork(target: string, args: string[]): void {
       id,
       actor: "human:cli",
       idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+      acknowledgeUnknownToolOutcome: has(
+        args,
+        "--acknowledge-tool-outcome",
+      ),
     });
     if (has(args, "--json")) writeJsonEnvelope("retry", item);
     else console.log(`${item.id} is ready to retry.`);
@@ -2356,12 +2439,19 @@ function decideWork(target: string, args: string[]): void {
       "decide requires --artifact-hash from the submitted artifact.",
     );
   }
+  const packetHash = option(args, "--packet-hash");
+  if (!packetHash) {
+    throw new Error(
+      "decide requires --packet-hash from the current decision-packet command.",
+    );
+  }
   const { database, controlPlane } = controlPlaneFor(target);
   try {
     const item = controlPlane.decide({
       id,
       decision,
       artifactHash,
+      packetHash,
       note: option(args, "--note") ?? "Reviewed from the local CLI.",
       actor: "human:cli",
       idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
@@ -2400,9 +2490,10 @@ function approveTool(target: string, args: string[]): void {
   const id = option(args, "--id");
   const callHash = option(args, "--call-hash");
   const toolName = option(args, "--tool");
-  if (!id || !callHash || !toolName) {
+  const packetHash = option(args, "--packet-hash");
+  if (!id || !callHash || !toolName || !packetHash) {
     throw new Error(
-      "approve-tool requires --id, --call-hash, and --tool.",
+      "approve-tool requires --id, --call-hash, --tool, and --packet-hash.",
     );
   }
   const { database, controlPlane } = controlPlaneFor(target);
@@ -2411,6 +2502,7 @@ function approveTool(target: string, args: string[]): void {
       id,
       callHash,
       toolName,
+      packetHash,
       actor: "human:cli",
       note:
         option(args, "--note") ??
@@ -2423,6 +2515,54 @@ function approveTool(target: string, args: string[]): void {
         `Approved ${approval.toolName} call ${approval.callHash} for ${approval.workItemId}.`,
       );
     }
+  } finally {
+    database.close();
+  }
+}
+
+function denyTool(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  const callHash = option(args, "--call-hash");
+  const toolName = option(args, "--tool");
+  const packetHash = option(args, "--packet-hash");
+  if (!id || !callHash || !toolName || !packetHash) {
+    throw new Error(
+      "deny-tool requires --id, --call-hash, --tool, and --packet-hash.",
+    );
+  }
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const denial = controlPlane.denyToolCall({
+      id,
+      callHash,
+      toolName,
+      packetHash,
+      actor: "human:cli",
+      note:
+        option(args, "--note") ??
+        "Denied exact tool call from the local CLI.",
+      idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
+    });
+    if (has(args, "--json")) writeJsonEnvelope("deny-tool", denial);
+    else {
+      console.log(
+        `Denied ${denial.toolName} call ${denial.callHash}; ${denial.workItemId} was canceled.`,
+      );
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function printDecisionPacket(target: string, args: string[]): void {
+  const id = option(args, "--id");
+  if (!id) throw new Error("decision-packet requires --id.");
+  const { database, controlPlane } = controlPlaneFor(target);
+  try {
+    const packet = controlPlane.decisionPacket(id);
+    if (!packet) throw new Error("No current human decision packet exists.");
+    if (has(args, "--json")) writeJsonEnvelope("decision-packet", packet);
+    else console.log(JSON.stringify(packet, null, 2));
   } finally {
     database.close();
   }
@@ -3350,7 +3490,8 @@ Commands:
   chartermesh system resume --target PATH
   chartermesh seed-demo --target PATH
   chartermesh request "work title" --target PATH
-    [--summary TEXT | --summary-base64 BASE64] [--require-tool TOOL] [--json]
+    [--summary TEXT | --summary-base64 BASE64] [--decision-question TEXT]
+    [--acceptance TEXT] [--require-tool TOOL] [--json]
   chartermesh triage --id WORK --role ROLE --target PATH [--json]
   chartermesh list --target PATH [--json] [--limit N --cursor CURSOR]
     [--active-only] [--include-archived]
@@ -3358,13 +3499,17 @@ Commands:
   chartermesh cancel --id WORK --target PATH [--json]
   chartermesh archive --id WORK --target PATH [--json]
   chartermesh wait --id WORK --type user_input --reason TEXT --target PATH
+  chartermesh provide-input --id WORK --packet-hash SHA256 --response TEXT --target PATH
   chartermesh resume --id WORK --target PATH
-  chartermesh retry --id WORK --target PATH
+  chartermesh retry --id WORK --target PATH [--acknowledge-tool-outcome]
+  chartermesh decision-packet --id WORK --target PATH [--json]
   chartermesh approve-tool --id WORK --call-hash SHA256 --tool TOOL \\
-    --note TEXT --target PATH
+    --packet-hash SHA256 --note TEXT --target PATH
+  chartermesh deny-tool --id WORK --call-hash SHA256 --tool TOOL \\
+    --packet-hash SHA256 --note TEXT --target PATH
   chartermesh tool-evidence --id WORK --target PATH [--json]
   chartermesh decide --id WORK --decision approve --artifact-hash SHA256 \\
-    --note TEXT --target PATH
+    --packet-hash SHA256 --note TEXT --target PATH
   chartermesh complete --id WORK --target PATH
   chartermesh outbox list --target PATH [--dead-letters] [--limit N] [--json]
   chartermesh outbox retry --id DELIVERY --target PATH [--json]
@@ -3493,12 +3638,24 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     resumeWork(target, args);
     return 0;
   }
+  if (command === "provide-input") {
+    provideUserInput(target, args);
+    return 0;
+  }
   if (command === "retry") {
     retryWork(target, args);
     return 0;
   }
   if (command === "approve-tool") {
     approveTool(target, args);
+    return 0;
+  }
+  if (command === "deny-tool") {
+    denyTool(target, args);
+    return 0;
+  }
+  if (command === "decision-packet") {
+    printDecisionPacket(target, args);
     return 0;
   }
   if (command === "tool-evidence") {

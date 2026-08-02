@@ -175,16 +175,16 @@ loopback에만 바인딩됩니다. 명령을 실행한 터미널을 종료하면
 
 | 카드 | 의미 |
 |---|---|
-| 지금 필요한 조치 | 지금 실행하거나 결정할 수 있는 활성 작업 |
-| 사람 검토 | 사람의 산출물 결정 또는 정확한 도구 승인을 기다리는 작업 |
-| 사용자 입력 | 질문에 대한 사용자의 응답을 기다리는 작업 |
-| 실패 이력 | 이미 실패가 확정되어 이력으로 남은 작업 |
+| 내 결정 | 산출물·정확한 도구 호출·사용자 입력처럼 사람만 처리할 수 있는 항목 |
+| 에이전트 작업 | role/runner가 실행·수정·인계할 항목 |
+| 대기 | 현재 누구도 실행할 수 없는 항목과 해소 조건 |
+| 이력 | 완료·취소·실패가 확정되어 보존된 기록 |
 
-첫 화면은 `조치 필요` 필터로 시작합니다. 카드를 누르면 해당 항목만
+첫 화면은 `내 결정` 필터로 시작합니다. 카드를 누르면 해당 항목만
 표시됩니다.
 
 실패 이력은 사람 검토나 현재 조치 건수에 포함되지 않습니다. 사용자가
-명시적으로 다시 시도하기로 결정했을 때만 `재시도 준비`를 선택합니다.
+명시적으로 다시 시도하기로 결정했을 때만 CLI 또는 운영 흐름에서 복구합니다.
 
 ### 4.2 주요 상태
 
@@ -195,7 +195,7 @@ loopback에만 바인딩됩니다. 명령을 실행한 터미널을 종료하면
 | 진행 중 | 모델 또는 러너가 실행 중 | 기다리거나 취소 |
 | 승인 대기 | 산출물 또는 정확한 도구 호출을 사람이 검토해야 함 | 내용 검토 후 결정 |
 | 수정 요청됨 | 사람 검토가 끝났고 담당 역할이 피드백을 반영해야 함 | 표시된 사유를 확인하고 모델 실행 |
-| 승인됨 | 산출물 승인이 끝남 | 완료 확정 |
+| 승인됨 | CLI 등에서 산출물 승인이 끝났지만 아직 닫히지 않음 | 완료 확정 |
 | 완료 | 정상적으로 닫힌 작업 | 필요하면 보관 |
 | 실패 | 종료된 실패 이력 | 원인 검사 후 선택적으로 재시도 |
 | 취소 | 사람이 중단한 작업 | 필요하면 새 요청 생성 |
@@ -212,12 +212,17 @@ loopback에만 바인딩됩니다. 명령을 실행한 터미널을 종료하면
 - 담당 역할과 실행 대상
 - 대기 이유
 - 검토자가 남긴 수정 요청 사유
-- 산출물 요약, 검증 결과, 위험과 후속 조치
-- 원문 산출물과 정확한 SHA-256
+- 제작자가 보고한 산출물 요약·확인·위험·자체 신뢰도
+- 현재 Tool Runtime이 같은 실행에서 실제 확인한 근거와 미확인 완료 기준
+- 원문 산출물, 정확한 SHA-256과 Decision Packet SHA-256
 - 도구 변경 대상, 영향, 안전장치와 정확한 호출 해시
 
-사람은 제목이나 모델의 자신감만 보고 승인하지 말고, 실제 내용과 검증
-근거를 확인해야 합니다.
+모델이 적은 `checks`는 작업자의 주장으로 표시됩니다. 현재 버전에서는 같은
+실행의 Tool Runtime이 남긴 hash-bound evidence만 `검증됨`으로 표시됩니다.
+`host_validator`는 증거 계약에 예약된 출처이며, 호스트 검증 결과를 수집하는
+경로는 후속 구현 대상입니다. 사람은
+제목이나 모델의 자체 신뢰도만 보고 승인하지 말고, 근거 출처와 미확인
+예외를 확인해야 합니다.
 
 ## 5. 첫 작업 실행
 
@@ -268,7 +273,16 @@ npx --yes github:jade-blanco/chartermesh run `
 ### 5.5 산출물 결정
 
 대시보드에서 내용을 검토하는 것이 가장 쉽습니다. CLI에서는 실행 결과의
-정확한 artifact SHA-256을 사용합니다.
+정확한 artifact SHA-256과 현재 Decision Packet SHA-256을 함께 사용합니다.
+
+먼저 현재 결정 패킷을 확인합니다.
+
+```powershell
+npx --yes github:jade-blanco/chartermesh decision-packet `
+  --id work-000001 `
+  --target $Target `
+  --json
+```
 
 승인:
 
@@ -277,6 +291,7 @@ npx --yes github:jade-blanco/chartermesh decide `
   --id work-000001 `
   --decision approve `
   --artifact-hash ARTIFACT_SHA256 `
+  --packet-hash PACKET_SHA256 `
   --note "내용과 근거를 검토했습니다." `
   --target $Target
 ```
@@ -288,6 +303,7 @@ npx --yes github:jade-blanco/chartermesh decide `
   --id work-000001 `
   --decision changes_requested `
   --artifact-hash ARTIFACT_SHA256 `
+  --packet-hash PACKET_SHA256 `
   --note "호환성 범위와 검증 근거를 보완하세요." `
   --target $Target
 ```
@@ -307,6 +323,7 @@ npx --yes github:jade-blanco/chartermesh decide `
   --id work-000001 `
   --decision reject `
   --artifact-hash ARTIFACT_SHA256 `
+  --packet-hash PACKET_SHA256 `
   --note "요청 목적과 맞지 않아 종료합니다." `
   --target $Target
 ```
@@ -332,6 +349,7 @@ npx --yes github:jade-blanco/chartermesh complete `
 - 변경 크기와 내용
 - 경로 제한과 실패 시 동작
 - 정확한 call hash
+- 현재 Decision Packet hash
 
 CLI 승인:
 
@@ -340,12 +358,27 @@ npx --yes github:jade-blanco/chartermesh approve-tool `
   --id work-000001 `
   --call-hash CALL_SHA256 `
   --tool workspace.write_file `
+  --packet-hash PACKET_SHA256 `
   --note "경로와 변경 내용을 검토했습니다." `
   --target $Target
 ```
 
 승인하면 WorkItem이 `준비`로 돌아갑니다. 다음 실행에서 그 정확한 호출만
 재생합니다.
+
+허용하지 않을 경우 대시보드에서 `거부하고 작업 종료`를 선택하거나 CLI에서
+현재 패킷 해시에 결박해 거부합니다. 이때 도구는 실행되지 않고 WorkItem은
+감사 이력을 보존한 채 `취소`로 종료됩니다.
+
+```powershell
+npx --yes github:jade-blanco/chartermesh deny-tool `
+  --id work-000001 `
+  --call-hash CALL_SHA256 `
+  --tool workspace.write_file `
+  --packet-hash PACKET_SHA256 `
+  --note "이 변경은 허용하지 않습니다." `
+  --target $Target
+```
 
 ```powershell
 npx --yes github:jade-blanco/chartermesh run `
@@ -551,6 +584,11 @@ npx --yes github:jade-blanco/chartermesh run `
 재시도는 새 generation을 만들므로 이전 worker가 새 실행에 결과를 제출할
 수 없습니다.
 
+도구 실행은 끝났지만 증거 저장이 실패한 `TOOL_OUTCOME_UNKNOWN` 상태에서는
+일반 재시도를 거부합니다. 작업공간에 변경이 실제로 생겼는지 먼저 확인한 뒤
+CLI에서는 `--acknowledge-tool-outcome`을 추가하거나, 대시보드의 재시도 확인창에
+동의해야 합니다. 이는 쓰기 작업의 중복 실행을 막기 위한 사람 확인 절차입니다.
+
 ### 실행 취소
 
 ```powershell
@@ -572,11 +610,28 @@ npx --yes github:jade-blanco/chartermesh wait `
   --target $Target
 ```
 
-입력을 받은 뒤:
+입력을 받은 뒤에는 일반 `resume`으로 우회하지 않고 현재 입력 요청 패킷에
+응답을 결박합니다. 대시보드의 `요청된 입력 제공`을 사용하거나 CLI에서:
+
+입력 원문은 로컬 Control Plane에 저장되고 다음 모델 실행 컨텍스트로 전달됩니다.
+비밀번호, API 키, 토큰, 인증서 같은 비밀정보는 이 경로에 입력하지 말고 환경
+변수나 별도 secret 관리 경로를 사용하세요. CLI의 `--response` 값은 셸 기록이나
+프로세스 인자 목록에 남을 수 있습니다. 비밀이 아닌 민감한 일반 응답도 가능하면
+로컬 대시보드 입력 폼을 사용하고, 비밀정보 자체는 대시보드에도 입력하지 마세요.
+active review time과 상세 열람 횟수는
+완료된 결정의 로컬 UX 추정치로만 기록되며 정확도나 전체 검토 시간을 뜻하지
+않습니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh resume `
+npx --yes github:jade-blanco/chartermesh decision-packet `
   --id work-000001 `
+  --target $Target `
+  --json
+
+npx --yes github:jade-blanco/chartermesh provide-input `
+  --id work-000001 `
+  --packet-hash PACKET_SHA256 `
+  --response "대한민국 리전으로 진행하세요." `
   --target $Target
 ```
 

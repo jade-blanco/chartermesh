@@ -6,7 +6,7 @@
 
 상태: **신규 독립 프로젝트용 제품·아키텍처 설계 기준**
 
-개정 상태: **2026-07-29 범용 부트스트랩·액션 투영 실행 슬라이스 반영**
+개정 상태: **2026-08-02 검증 가능한 Decision Packet 운영 계층 반영**
 
 > 이 문서의 최초안 이후 Codex와 Claude Code의 네이티브 협업 기능이
 > 확장되었고, 제품은 특정 LLM이나 agent host에 의존하지 않는 방향으로
@@ -18,6 +18,70 @@
 승인이 아니다. 구현은 레거시 시스템과 경로·저장소·데이터·배포 단위를
 분리한 신규 프로젝트에서만 수행한다. 실제 작업 DB, 검수자료, 로그,
 프롬프트와 비공개 운영 규칙은 이 프로젝트에 복사하지 않는다.
+
+## 제품 정의 — 의사결정 압축 운영 계층
+
+CharterMesh의 우선 제품 목적은 “AI가 회사를 사람 없이 자율 운영한다”는
+주장이 아니다. 여러 모델·에이전트·도구가 만든 복잡한 작업 상태를 사람이
+짧게 이해하고 안전하게 결정할 수 있는 **검증 가능한 의사결정 패킷**으로
+압축하는 운영 계층이다. 에이전트 수나 호출 횟수 증가는 제품 성과가 아니다.
+사람이 확인해야 할 결정 수, 결정 시간, 오승인 위험과 재작업을 줄이면서도
+책임 경계를 보존하는 것이 성과다.
+
+첫 화면은 다음 네 영역을 섞지 않는다.
+
+1. 사람이 지금 내려야 하는 결정
+2. role/runner가 실행·수정·인계할 작업
+3. 현재 누구도 실행할 수 없는 대기
+4. 완료·취소·실패 이력
+
+실패는 보존된 진단 이력이지 사람의 현재 의무가 아니다.
+`changes_requested`는 사람이 이미 결정을 끝낸 뒤 실행팀이 보완할 작업이다.
+사람 대기열의 첫 항목은 cursor-bounded 최신 작업 페이지와 독립적으로
+전역 투영한다.
+
+### Decision Packet v1alpha1
+
+Control Plane은 사람의 artifact 결정, 정확한 tool-call 승인·거부, 사용자 입력
+요청마다 `chartermesh.dev/decision-packet/v1alpha1`을 모델 호출 없이 만든다.
+패킷에는 다음이 들어간다.
+
+- 사람이 답해야 할 한 문장 질문
+- 정확한 artifact/call/input subject hash
+- 제작자가 보고한 요약·확인·위험·자체 신뢰도
+- Control Plane과 Tool Runtime이 확인한 근거. `host_validator`는 계약에
+  예약되어 있지만 v1alpha1 수집 경로는 아직 구현되지 않았다.
+- 완료 기준별 `satisfied | failed | unverified` 판정
+- 차단 예외와 경고, 해소 방법
+- 결정을 내리면 발생하는 다음 상태
+
+`model_reported` 근거는 항상 `claimed`다. 모델이 “테스트 통과”라고 썼다는
+사실만으로 `verified`가 될 수 없다. `verified`는 Tool Runtime 또는 명시적
+validator가 남긴 hash-bound evidence에만 사용한다. 현재 구현에서는 실행 전에
+Control Plane이 exact call/tool/input과 run/attempt를 등록해 발급한 1회용
+준비 영수증과, 실제 Tool Runtime이 실행 뒤 같은 프로세스에서 봉인한
+비직렬화 capability를 모두 확인한 evidence만 자동 판정에 사용한다. 단순
+`runner:*` actor 문자열, 직접 만든 성공 레코드, 소비된 영수증 재사용, v11 이전의
+영수증 없는 evidence는 `verified`가 될 수 없다. 주관적 완료 기준이나
+근거 요구가 없는 기준은 자동 성공시키지 않고 `unverified`로 유지한다.
+
+결정은 subject hash뿐 아니라 contract hash, evidence-set hash, criterion
+results, exception codes/severity/owner를 canonical하게 결박한 `packetHash`도
+정확히 일치해야 한다. 새 artifact 또는 새 결정 경계가 생기면 이전 packet과
+approval은 superseded된다. 브라우저는 raw artifact를 파싱해 검증 상태나
+요약을 발명하지 않고 서버가 만든 packet을 표시한다.
+
+모든 artifact 결정과 tool 승인·거부는 `human:*` actor만 내릴 수 있다. artifact
+승인은 외부 쓰기·배포·네트워크 실행 승인을 대신하지 않는다. 사용자 입력
+대기는 일반 resume으로 우회할 수 없고, exact packet hash에 결박된 입력을
+Control Plane에 기록한 뒤에만 재개된다.
+
+운영 화면에서 기록하는 active review time과 상세 열람 횟수는 로컬 UX 개선용
+추정치이며 완료된 결정에만 남는 값이다. 로컬 audit export에 포함될 수 있으므로
+일반 운영 시간이나 판단 정확도로 해석하지 않는다. 정답이 없는 운영 기록으로
+결정 정확도나 품질 향상을 만들지 않는다.
+그 주장은 raw view와 Decision Packet을 블라인드 비교하고 sealed oracle을
+사후 결합하는 별도 인간 이해도 실험에서만 평가한다.
 
 ## 범용 적용·팀 콘솔 갱신 — 2026-07-29
 
@@ -38,11 +102,11 @@ read-only inspect → deterministic plan → exact human hash approval
 보여준 뒤 사람에게 그 hash의 승인을 받아야 한다. CLI 사용자는 같은 명령과
 같은 승인 절차를 직접 수행한다.
 
-### 액션 중심 운영 투영
+### 결정 중심 운영 투영
 
-Team Console의 첫 화면은 status 통계보다 `누가 지금 무엇을 해야 하는가`를
-우선한다. 서버가 하나의 `DashboardProjection`을 계산하고 CLI와 UI가 이를
-공유한다.
+Team Console의 첫 화면은 status 통계보다 `사람이 지금 무엇을 결정해야
+하는가`를 우선하고, 그 다음 role/runner 실행을 분리한다. 서버가 하나의
+`DashboardProjection`을 계산하고 CLI와 UI가 이를 공유한다.
 
 `UserAction`은 최소한 category, reason, actor, CTA, actionable,
 blockedBy, priority와 선택적 expiresAt을 가진다. 우선순위는 사람 검토,
@@ -50,7 +114,8 @@ blockedBy, priority와 선택적 expiresAt을 가진다. 우선순위는 사람 
 순이다. 실패한 WorkItem은 검사와 명시적 수동 재시도를 위한 이력으로
 보존하지만 actionable 또는 사람 검토 수에 포함하지 않는다. 일반 대기도
 화면에는 남지만 actionable count에는 들어가지 않는다. 첫 화면의 기본
-필터는 실제 actionable 작업이다.
+필터는 `actor=human && actionable`인 사람 결정이다. role action은 별도
+에이전트 작업 필터에서 본다.
 
 사람 검토에는 현재 진행을 막고 있는 최신 artifact 결정과 정확한 tool-call
 승인만 들어간다. `changes_requested`는 검토가 끝난 뒤 담당 role/runner가
@@ -77,13 +142,15 @@ parent/child 계보는 유지하며, 잘못된 dependency는 history를 지우�
 - 모든 mutation은 actor와 idempotency key를 가진 명령이다.
 - claim은 Run, Attempt, Lease, generation을 한 transaction에서 만든다.
 - runner artifact는 active generation fencing을 통과해야 한다.
-- 사람 검토는 최신 immutable artifact SHA-256과 정확히 결박한다.
+- 사람 검토는 최신 immutable subject SHA-256과 현재 Decision Packet
+  SHA-256에 함께 결박한다.
 - 결과 검토 승인과 외부 side-effect 실행 승인은 별개다.
 - API는 credential, 환경변수 값, DB·artifact·project 절대경로를 반환하지
   않는다.
 
 UI 세부 계약은 `docs/DASHBOARD-DESIGN.md`, 결정 근거는
-`docs/adr/0009-universal-bootstrap-action-projection.md`에서 추적한다.
+`docs/adr/0009-universal-bootstrap-action-projection.md`와
+`docs/adr/0020-decision-packet-operating-layer.md`에서 추적한다.
 
 ## 엔진·호스트 중립성 갱신 — 2026-07-27
 

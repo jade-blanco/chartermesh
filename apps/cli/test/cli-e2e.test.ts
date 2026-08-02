@@ -122,6 +122,16 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   assert.match(run.stdout, /submitted for review/u);
   const artifactHash = run.stdout.match(/\(([a-f0-9]{64})\)/u)?.[1];
   assert.ok(artifactHash, run.stdout);
+  const packet = cli([
+    "decision-packet",
+    "--id",
+    workId,
+    "--target",
+    target,
+    "--json",
+  ]);
+  assert.equal(packet.status, 0, packet.stderr);
+  const packetHash = JSON.parse(packet.stdout).data.binding.packetHash;
 
   const decided = cli([
     "decide",
@@ -131,6 +141,8 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
     "approve",
     "--artifact-hash",
     artifactHash,
+    "--packet-hash",
+    packetHash,
     "--note",
     "Verified by the offline end-to-end test.",
     "--target",
@@ -282,6 +294,16 @@ test("changes-requested feedback and the exact prior artifact reach the next gen
   assert.equal(firstRun.status, 0, firstRun.stderr);
   const firstHash = firstRun.stdout.match(/\(([a-f0-9]{64})\)/u)?.[1];
   assert.ok(firstHash, firstRun.stdout);
+  const firstPacketHash = JSON.parse(
+    cli([
+      "decision-packet",
+      "--id",
+      workId,
+      "--target",
+      target,
+      "--json",
+    ]).stdout,
+  ).data.binding.packetHash;
   const reviewNote = "Please make the status explanation understandable to a first-time user.";
   const changes = cli([
     "decide",
@@ -291,6 +313,8 @@ test("changes-requested feedback and the exact prior artifact reach the next gen
     "changes_requested",
     "--artifact-hash",
     firstHash,
+    "--packet-hash",
+    firstPacketHash,
     "--note",
     reviewNote,
     "--target",
@@ -680,6 +704,17 @@ test("an approval-gated tool call waits without failing and resumes on a new run
   );
   database.close();
 
+  const toolPacketHash = JSON.parse(
+    cli([
+      "decision-packet",
+      "--id",
+      workId,
+      "--target",
+      target,
+      "--json",
+    ]).stdout,
+  ).data.binding.packetHash;
+
   const approved = cli([
     "approve-tool",
     "--id",
@@ -688,6 +723,8 @@ test("an approval-gated tool call waits without failing and resumes on a new run
     pending.callHash,
     "--tool",
     pending.toolName,
+    "--packet-hash",
+    toolPacketHash,
     "--target",
     target,
   ]);

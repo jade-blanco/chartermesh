@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -7,12 +7,19 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import {
+  verifyToolRuntimeReceipt,
+  type ToolEvidenceReceipt,
+  type ToolExecutionEvidence,
+} from "../../runtime/src/tool-runtime.ts";
 import type {
   AuditRecord,
+  AcceptanceCriterion,
   ArtifactReviewDecision,
   ArtifactEvidence,
   AttemptRecord,
   DashboardProjection,
+  DecisionPacket,
   ModelInvocationRecord,
   OperationalState,
   OutboxDelivery,
@@ -21,14 +28,21 @@ import type {
   RuntimeBudgets,
   ScheduleTickRecord,
   ToolCallApproval,
+  ToolCallDenial,
   ToolExecutionEvidenceRecord,
   UserAction,
+  UserInputRecord,
   WaitCondition,
   WorkItem,
+  WorkItemDecisionContract,
   WorkItemPage,
   WorkStatus,
 } from "./types.ts";
 import { assertMaintenanceInactive } from "./maintenance.ts";
+import {
+  buildDecisionPacket,
+  createDecisionContract,
+} from "./decision-packet.ts";
 
 type Row = Record<string, unknown>;
 const DEFAULT_MAX_ARTIFACT_BYTES = 1_048_576;
@@ -79,6 +93,107 @@ function assertText(value: string, label: string): string {
   return clean;
 }
 
+function optionalBoundedInteger(
+  value: number | undefined,
+  label: string,
+  maximum: number,
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative finite number.`);
+  }
+  return Math.min(maximum, Math.floor(value));
+}
+
+function parseStoredDecisionContract(
+  value: unknown,
+  storedHash: string,
+): WorkItemDecisionContract {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Stored decision contract is invalid.");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.apiVersion !== "chartermesh.dev/work-decision-contract/v1alpha1" ||
+    typeof record.objective !== "string" ||
+    typeof record.decisionQuestion !== "string" ||
+    record.reviewPolicy !== "human_required" ||
+    !["user", "workflow_stage", "legacy_derived"].includes(
+      String(record.source),
+    ) ||
+    !Array.isArray(record.acceptanceCriteria) ||
+    record.acceptanceCriteria.length > 100
+  ) {
+    throw new Error("Stored decision contract is invalid.");
+  }
+  const acceptanceCriteria = record.acceptanceCriteria.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Stored decision contract criterion is invalid.");
+    }
+    const criterion = value as Record<string, unknown>;
+    if (
+      typeof criterion.id !== "string" ||
+      !/^[A-Za-z0-9._-]{1,96}$/u.test(criterion.id) ||
+      typeof criterion.text !== "string" ||
+      !criterion.text.trim() ||
+      criterion.text.length > 4_000 ||
+      typeof criterion.critical !== "boolean" ||
+      !Array.isArray(criterion.evidenceRequirements) ||
+      criterion.evidenceRequirements.length > 20
+    ) {
+      throw new Error("Stored decision contract criterion is invalid.");
+    }
+    const evidenceRequirements = criterion.evidenceRequirements.map(
+      (value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          throw new Error("Stored decision evidence requirement is invalid.");
+        }
+        const requirement = value as Record<string, unknown>;
+        if (
+          requirement.kind === "tool" &&
+          typeof requirement.toolName === "string" &&
+          requirement.toolName.trim().length > 0 &&
+          requirement.toolName.length <= 256
+        ) {
+          return { kind: "tool" as const, toolName: requirement.toolName };
+        }
+        if (
+          requirement.kind === "validator" &&
+          typeof requirement.validatorId === "string" &&
+          requirement.validatorId.trim().length > 0 &&
+          requirement.validatorId.length <= 256
+        ) {
+          return {
+            kind: "validator" as const,
+            validatorId: requirement.validatorId,
+          };
+        }
+        throw new Error("Stored decision evidence requirement is invalid.");
+      },
+    );
+    return {
+      id: criterion.id,
+      text: criterion.text,
+      critical: criterion.critical,
+      evidenceRequirements,
+    };
+  });
+  const rebuilt = createDecisionContract({
+    objective: record.objective,
+    decisionQuestion: record.decisionQuestion,
+    acceptanceCriteria,
+    source: record.source as WorkItemDecisionContract["source"],
+  });
+  if (
+    typeof record.contractHash !== "string" ||
+    record.contractHash !== storedHash ||
+    rebuilt.contractHash !== storedHash
+  ) {
+    throw new Error("Stored decision contract hash does not match its content.");
+  }
+  return rebuilt;
+}
+
 function transaction<T>(database: DatabaseSync, operation: () => T): T {
   database.exec("BEGIN IMMEDIATE");
   try {
@@ -106,6 +221,7 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "artifactId",
   "sha256",
   "approvalId",
+  "denialId",
   "decision",
   "artifactHash",
   "completedPredecessor",
@@ -129,6 +245,11 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "stageIndex",
   "cycle",
   "stageKind",
+  "packetHash",
+  "activeReviewMs",
+  "detailsOpenCount",
+  "reviewMeasurementStatus",
+  "responseHash",
 ]);
 
 function allowlistedAuditPayload(
@@ -934,6 +1055,8 @@ export class ControlPlane {
     parentId?: string;
     rootId?: string;
     requiredTools?: string[];
+    decisionQuestion?: string;
+    acceptanceCriteria?: AcceptanceCriterion[];
   }): WorkItem {
     return this.command(input.idempotencyKey, "intake", () => {
       const id = this.nextId("work");
@@ -979,6 +1102,93 @@ export class ControlPlane {
           `)
           .run(id, toolName, stamp);
       }
+      const suppliedCriteria = (input.acceptanceCriteria ?? []).map(
+        (criterion, index): AcceptanceCriterion => ({
+          id: /^[A-Za-z0-9._-]{1,96}$/u.test(criterion.id)
+            ? criterion.id
+            : `criterion-${index + 1}`,
+          text: assertText(criterion.text, "acceptance criterion"),
+          critical: Boolean(criterion.critical),
+          evidenceRequirements: (criterion.evidenceRequirements ?? [])
+            .slice(0, 20)
+            .map((requirement) =>
+              requirement.kind === "tool"
+                ? {
+                    kind: "tool" as const,
+                    toolName: assertText(requirement.toolName, "required tool"),
+                  }
+                : {
+                    kind: "validator" as const,
+                    validatorId: assertText(
+                      requirement.validatorId,
+                      "validatorId",
+                    ),
+                  },
+            ),
+        }),
+      );
+      if (suppliedCriteria.length > 100) {
+        throw new Error("A work item can define at most 100 acceptance criteria.");
+      }
+      const criterionToolNames = new Set(
+        suppliedCriteria.flatMap(({ evidenceRequirements }) =>
+          evidenceRequirements.flatMap((requirement) =>
+            requirement.kind === "tool" ? [requirement.toolName] : [],
+          ),
+        ),
+      );
+      const acceptanceCriteria: AcceptanceCriterion[] = [
+        ...(suppliedCriteria.length > 0
+          ? suppliedCriteria
+          : [
+              {
+                id: "objective",
+                text: assertText(input.summary, "summary"),
+                critical: true,
+                evidenceRequirements: [],
+              },
+            ]),
+        ...requiredTools
+          .filter((toolName) => !criterionToolNames.has(toolName))
+          .map((toolName, index) => ({
+            id: `required-tool-${index + 1}`,
+            text: `Required tool ${toolName} succeeds.`,
+            critical: true,
+            evidenceRequirements: [{ kind: "tool" as const, toolName }],
+          })),
+      ];
+      if (acceptanceCriteria.length > 100) {
+        throw new Error("A work item can define at most 100 acceptance criteria.");
+      }
+      if (
+        new Set(acceptanceCriteria.map(({ id: criterionId }) => criterionId))
+          .size !== acceptanceCriteria.length
+      ) {
+        throw new Error("Acceptance criterion ids must be unique.");
+      }
+      const contract = createDecisionContract({
+        objective: input.summary,
+        decisionQuestion: input.decisionQuestion,
+        acceptanceCriteria,
+        source:
+          input.decisionQuestion || suppliedCriteria.length > 0
+            ? "user"
+            : "legacy_derived",
+      });
+      this.database
+        .prepare(`
+          INSERT INTO work_item_decision_contracts(
+            work_item_id, schema_version, contract_json, contract_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `)
+        .run(
+          id,
+          contract.apiVersion,
+          JSON.stringify(contract),
+          contract.contractHash,
+          stamp,
+        );
       this.event("work.intake.created", id, input.actor, { rootId });
       return this.get(id);
     });
@@ -997,6 +1207,303 @@ export class ControlPlane {
     return rows.map((row) => String(row.tool_name));
   }
 
+  decisionContract(id: string): WorkItemDecisionContract {
+    const item = this.get(id);
+    const row = this.database
+      .prepare(`
+        SELECT contract_json, contract_hash
+        FROM work_item_decision_contracts
+        WHERE work_item_id = ?
+      `)
+      .get(id) as Row | undefined;
+    if (row) {
+      return parseStoredDecisionContract(
+        JSON.parse(String(row.contract_json)) as unknown,
+        String(row.contract_hash),
+      );
+    }
+    const requiredTools = this.requiredTools(id);
+    return createDecisionContract({
+      objective: item.summary,
+      acceptanceCriteria: [
+        {
+          id: "objective",
+          text: item.summary,
+          critical: true,
+          evidenceRequirements: [],
+        },
+        ...requiredTools.map((toolName, index) => ({
+          id: `required-tool-${index + 1}`,
+          text: `Required tool ${toolName} succeeds.`,
+          critical: true,
+          evidenceRequirements: [{ kind: "tool" as const, toolName }],
+        })),
+      ],
+      source: "legacy_derived",
+    });
+  }
+
+  decisionPacket(id: string): DecisionPacket | null {
+    const item = this.get(id);
+    const projected = this.projectCurrentDecisionPacket(item);
+    if (!projected) return null;
+    const stored = this.database
+      .prepare(`
+        SELECT packet_json
+        FROM decision_packets
+        WHERE work_item_id = ? AND superseded_at IS NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(id) as Row | undefined;
+    if (stored) {
+      const packet = JSON.parse(String(stored.packet_json)) as DecisionPacket;
+      if (
+        packet.kind === projected.kind &&
+        packet.binding.subjectHash === projected.binding.subjectHash &&
+        packet.binding.contractHash === projected.binding.contractHash &&
+        packet.binding.evidenceSetHash === projected.binding.evidenceSetHash &&
+        packet.binding.workItemVersion === item.version &&
+        packet.binding.packetHash === projected.binding.packetHash
+      ) {
+        return projected;
+      }
+    }
+    return projected;
+  }
+
+  private projectCurrentDecisionPacket(item: WorkItem): DecisionPacket | null {
+    const contract = this.decisionContract(item.id);
+    const toolEvidence = this.listToolEvidence(item.id);
+    if (item.status === "review_pending") {
+      const artifact = this.latestArtifact(item.id);
+      if (!artifact) return null;
+      return buildDecisionPacket({
+        workItem: item,
+        contract,
+        subject: {
+          kind: "artifact",
+          artifactId: artifact.id,
+          artifactHash: artifact.sha256,
+          mediaType: artifact.mediaType,
+        },
+        artifactContent: artifact.content,
+        toolEvidence: toolEvidence.filter(
+          ({ runId }) => runId === artifact.runId,
+        ),
+        createdAt: artifact.createdAt,
+      });
+    }
+    if (
+      item.status === "in_progress" &&
+      item.availability === "approval_waiting" &&
+      item.wait?.type === "approval" &&
+      item.wait.reference
+    ) {
+      const pending = this.listPendingToolCalls(item.id).find(
+        ({ callHash, status }) =>
+          callHash === item.wait?.reference && status === "approval_required",
+      );
+      if (!pending) return null;
+      return buildDecisionPacket({
+        workItem: item,
+        contract,
+        subject: {
+          kind: "tool_call",
+          callHash: pending.callHash,
+          toolName: pending.toolName,
+        },
+        toolEvidence: toolEvidence.filter(
+          ({ runId }) => runId === pending.runId,
+        ),
+        createdAt: pending.createdAt,
+      });
+    }
+    if (item.availability === "user_input_waiting" && item.wait) {
+      return buildDecisionPacket({
+        workItem: item,
+        contract,
+        subject: {
+          kind: "user_input",
+          reference: item.wait.reference ?? item.wait.reason,
+        },
+        toolEvidence: [],
+        createdAt: item.updatedAt,
+        question: item.wait.reason,
+      });
+    }
+    return null;
+  }
+
+  private replaceDecisionPacket(packet: DecisionPacket, createdAt: string): void {
+    this.database
+      .prepare(`
+        UPDATE decision_packets
+        SET superseded_at = ?
+        WHERE work_item_id = ? AND superseded_at IS NULL
+      `)
+      .run(createdAt, packet.workItemId);
+    this.database
+      .prepare(`
+        UPDATE approvals
+        SET superseded_at = ?
+        WHERE work_item_id = ? AND superseded_at IS NULL
+      `)
+      .run(createdAt, packet.workItemId);
+    this.database
+      .prepare(`
+        INSERT INTO decision_packets(
+          id, work_item_id, kind, subject_hash, contract_hash,
+          evidence_set_hash, packet_hash, packet_json, created_at,
+          superseded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      `)
+      .run(
+        this.nextId("decision-packet"),
+        packet.workItemId,
+        packet.kind,
+        packet.binding.subjectHash,
+        packet.binding.contractHash,
+        packet.binding.evidenceSetHash,
+        packet.binding.packetHash,
+        JSON.stringify(packet),
+        createdAt,
+      );
+  }
+
+  latestUserInput(id: string): UserInputRecord | null {
+    this.get(id);
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM work_item_user_inputs
+        WHERE work_item_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(id) as Row | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      workItemId: String(row.work_item_id),
+      reference: String(row.wait_reference),
+      response: String(row.response),
+      responseHash: String(row.response_hash),
+      actor: String(row.actor),
+      createdAt: String(row.created_at),
+    };
+  }
+
+  provideUserInput(input: {
+    id: string;
+    packetHash: string;
+    response: string;
+    actor: string;
+    idempotencyKey: string;
+    activeReviewMs?: number;
+    detailsOpenCount?: number;
+  }): { input: Omit<UserInputRecord, "response">; workItem: WorkItem } {
+    return this.command(input.idempotencyKey, "user.input.provide", () => {
+      const current = this.get(input.id);
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("User input authority must be a human actor.");
+      }
+      if (
+        current.availability !== "user_input_waiting" ||
+        current.wait?.type !== "user_input"
+      ) {
+        throw new Error("Work is not waiting for user input.");
+      }
+      const packet = this.decisionPacket(input.id);
+      if (
+        !packet ||
+        packet.kind !== "user_input" ||
+        packet.binding.packetHash !== input.packetHash
+      ) {
+        throw new Error("User input packet does not match the current request.");
+      }
+      const response = assertText(input.response, "user input response");
+      const responseHash = createHash("sha256").update(response).digest("hex");
+      const createdAt = now();
+      const record: UserInputRecord = {
+        id: this.nextId("user-input"),
+        workItemId: input.id,
+        reference: current.wait.reference ?? current.wait.reason,
+        response,
+        responseHash,
+        actor: input.actor,
+        createdAt,
+      };
+      this.database
+        .prepare(`
+          INSERT INTO work_item_user_inputs(
+            id, work_item_id, wait_reference, response, response_hash,
+            actor, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          record.id,
+          record.workItemId,
+          record.reference,
+          record.response,
+          record.responseHash,
+          record.actor,
+          record.createdAt,
+        );
+      const nextStatus: WorkStatus =
+        current.status === "requested" ? "requested" : "ready";
+      this.database
+        .prepare(`
+          UPDATE work_items
+          SET status = ?, availability = 'ready',
+              wait_type = NULL, wait_reason = NULL, wait_reference = NULL,
+              resume_at = NULL, wait_created_by = NULL,
+              next_action = ?, version = version + 1, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(
+          nextStatus,
+          nextStatus === "requested"
+            ? "Assign a role and execution target."
+            : "Claim and continue with the supplied user input.",
+          createdAt,
+          input.id,
+        );
+      this.database
+        .prepare(`
+          UPDATE decision_packets
+          SET superseded_at = ?
+          WHERE work_item_id = ? AND superseded_at IS NULL
+        `)
+        .run(createdAt, input.id);
+      const activeReviewMs = optionalBoundedInteger(
+        input.activeReviewMs,
+        "activeReviewMs",
+        86_400_000,
+      );
+      const detailsOpenCount = optionalBoundedInteger(
+        input.detailsOpenCount,
+        "detailsOpenCount",
+        10_000,
+      );
+      this.event("user.input.provided", input.id, input.actor, {
+        packetHash: input.packetHash,
+        responseHash,
+        ...(activeReviewMs === undefined
+          ? {}
+          : {
+              activeReviewMs,
+              reviewMeasurementStatus: "estimated",
+            }),
+        ...(detailsOpenCount === undefined
+          ? {}
+          : { detailsOpenCount }),
+      });
+      const { response: _response, ...receipt } = record;
+      return { input: receipt, workItem: this.get(input.id) };
+    });
+  }
+
   triage(input: {
     id: string;
     ownerRole: string;
@@ -1008,8 +1515,8 @@ export class ControlPlane {
     return this.command(input.idempotencyKey, "triage", () => {
       const current = this.get(input.id);
       this.assertVersion(current, input.expectedVersion);
-      if (["done", "canceled"].includes(current.status)) {
-        throw new Error("Terminal work cannot be triaged.");
+      if (!["requested", "ready", "changes_requested"].includes(current.status)) {
+        throw new Error("Only requested, ready, or change-requested work can be triaged.");
       }
       const stamp = now();
       this.database
@@ -1610,20 +2117,34 @@ export class ControlPlane {
           WHERE run_id = ? AND released_at IS NULL
         `)
         .run(stamp, String(run.id));
+      const unknownOutcomes = this.database
+        .prepare(`
+          UPDATE tool_evidence_receipts
+          SET status = 'outcome_unknown', consumed_at = ?
+          WHERE run_id = ? AND status = 'issued'
+        `)
+        .run(stamp, String(run.id));
       this.database
         .prepare(`
           UPDATE work_items
           SET status = 'failed', availability = 'ready',
-              next_action = 'Inspect the failure and retry.',
+              next_action = ?,
               version = version + 1, updated_at = ?
           WHERE id = ?
         `)
-        .run(stamp, input.id);
+        .run(
+          Number(unknownOutcomes.changes) > 0
+            ? "A tool outcome is unknown. Inspect the workspace and explicitly acknowledge it before retrying."
+            : "Inspect the failure and retry.",
+          stamp,
+          input.id,
+        );
       this.event("run.failed", input.id, input.actor, {
         runId: String(run.id),
         attemptId: input.attemptId,
         generation: input.generation,
         errorCode: code,
+        unknownToolOutcomes: Number(unknownOutcomes.changes),
       });
       return this.get(input.id);
     });
@@ -1633,11 +2154,40 @@ export class ControlPlane {
     id: string;
     actor: string;
     idempotencyKey: string;
+    acknowledgeUnknownToolOutcome?: boolean;
   }): WorkItem {
     return this.command(input.idempotencyKey, "run.retry", () => {
       const current = this.get(input.id);
       if (current.status !== "failed") {
         throw new Error("Only failed work can be retried.");
+      }
+      const unknownOutcomes = Number(
+        (
+          this.database
+            .prepare(`
+              SELECT COUNT(*) AS count
+              FROM tool_evidence_receipts
+              WHERE work_item_id = ? AND status = 'outcome_unknown'
+            `)
+            .get(input.id) as Row
+        ).count,
+      );
+      if (unknownOutcomes > 0) {
+        if (
+          !input.actor.startsWith("human:") ||
+          input.acknowledgeUnknownToolOutcome !== true
+        ) {
+          throw new Error(
+            "TOOL_OUTCOME_UNKNOWN: inspect the workspace and retry with explicit human acknowledgement.",
+          );
+        }
+        this.database
+          .prepare(`
+            UPDATE tool_evidence_receipts
+            SET status = 'outcome_acknowledged'
+            WHERE work_item_id = ? AND status = 'outcome_unknown'
+          `)
+          .run(input.id);
       }
       const stamp = now();
       this.database
@@ -1651,7 +2201,9 @@ export class ControlPlane {
           WHERE id = ?
         `)
         .run(stamp, input.id);
-      this.event("run.retry.requested", input.id, input.actor);
+      this.event("run.retry.requested", input.id, input.actor, {
+        acknowledgedUnknownToolOutcomes: unknownOutcomes,
+      });
       return this.get(input.id);
     });
   }
@@ -1714,19 +2266,33 @@ export class ControlPlane {
             WHERE id = ? AND released_at IS NULL
           `)
           .run(stamp, String(row.lease_id));
+        const unknownOutcomes = this.database
+          .prepare(`
+            UPDATE tool_evidence_receipts
+            SET status = 'outcome_unknown', consumed_at = ?
+            WHERE run_id = ? AND status = 'issued'
+          `)
+          .run(stamp, String(row.run_id));
         this.database
           .prepare(`
             UPDATE work_items
             SET status = 'failed', availability = 'ready',
-                next_action = 'The previous lease expired. Inspect and retry.',
+                next_action = ?,
                 version = version + 1, updated_at = ?
             WHERE id = ? AND status = 'in_progress'
           `)
-          .run(stamp, workItemId);
+          .run(
+            Number(unknownOutcomes.changes) > 0
+              ? "The lease expired with an unknown tool outcome. Inspect and explicitly acknowledge it before retrying."
+              : "The previous lease expired. Inspect and retry.",
+            stamp,
+            workItemId,
+          );
         this.event("lease.expired", workItemId, actor, {
           leaseId: String(row.lease_id),
           runId: String(row.run_id),
           generation: Number(row.generation),
+          unknownToolOutcomes: Number(unknownOutcomes.changes),
         });
         for (const invocation of runningInvocations) {
           this.event("model.invocation.abandoned", workItemId, actor, {
@@ -1840,6 +2406,19 @@ export class ControlPlane {
   }): WorkItem {
     return this.command(input.idempotencyKey, "work.resume", () => {
       const current = this.get(input.id);
+      if (current.wait?.type === "user_input") {
+        throw new Error(
+          "User-input waits require a hash-bound provideUserInput command.",
+        );
+      }
+      if (
+        current.wait?.type === "approval" ||
+        ["review_pending", "approved", "done", "canceled", "failed"].includes(
+          current.status,
+        )
+      ) {
+        throw new Error("Approval and terminal states require their dedicated command.");
+      }
       if (current.availability === "dependency_waiting") {
         const blocked = this.blockingPredecessors(input.id);
         if (blocked.length > 0) {
@@ -1979,9 +2558,27 @@ export class ControlPlane {
           WHERE id = ?
         `)
         .run(digest, input.actor, completedAt, input.id);
+      const reviewItem = this.get(input.id);
+      const packet = buildDecisionPacket({
+        workItem: reviewItem,
+        contract: this.decisionContract(input.id),
+        subject: {
+          kind: "artifact",
+          artifactId,
+          artifactHash: digest,
+          mediaType: input.mediaType ?? "text/plain",
+        },
+        artifactContent: content,
+        toolEvidence: this.listToolEvidence(input.id).filter(
+          ({ runId }) => runId === String(run.id),
+        ),
+        createdAt: completedAt,
+      });
+      this.replaceDecisionPacket(packet, completedAt);
       this.event("artifact.submitted", input.id, input.actor, {
         artifactId,
         sha256: digest,
+        packetHash: packet.binding.packetHash,
       });
       return { workItem: this.get(input.id), artifactId, sha256: digest };
     });
@@ -1991,14 +2588,24 @@ export class ControlPlane {
     id: string;
     decision: "approve" | "changes_requested" | "reject";
     artifactHash: string;
+    packetHash: string;
     note: string;
     actor: string;
     idempotencyKey: string;
+    activeReviewMs?: number;
+    detailsOpenCount?: number;
+    completeOnApprove?: boolean;
   }): WorkItem {
     return this.command(input.idempotencyKey, "approval.decide", () => {
       const current = this.get(input.id);
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("Artifact approval authority must be a human actor.");
+      }
       if (current.status !== "review_pending") {
         throw new Error("Work is not waiting for review.");
+      }
+      if (input.completeOnApprove && input.decision !== "approve") {
+        throw new Error("completeOnApprove is valid only for approval.");
       }
       const artifact = this.database
         .prepare(`
@@ -2011,12 +2618,34 @@ export class ControlPlane {
       if (String(artifact.sha256) !== input.artifactHash) {
         throw new Error("Review hash does not match the current artifact.");
       }
+      const packet = this.decisionPacket(input.id);
+      if (
+        !packet ||
+        packet.kind !== "artifact_review" ||
+        packet.subject.kind !== "artifact" ||
+        packet.subject.artifactHash !== input.artifactHash ||
+        packet.binding.packetHash !== input.packetHash
+      ) {
+        throw new Error("Review packet does not match the current decision context.");
+      }
+      const activeReviewMs = optionalBoundedInteger(
+        input.activeReviewMs,
+        "activeReviewMs",
+        86_400_000,
+      );
+      const detailsOpenCount = optionalBoundedInteger(
+        input.detailsOpenCount,
+        "detailsOpenCount",
+        10_000,
+      );
       const approvalId = this.nextId("approval");
+      const decidedAt = now();
       this.database
         .prepare(`
           INSERT INTO approvals(
-            id, work_item_id, artifact_hash, decision, note, actor, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, work_item_id, artifact_hash, decision, note, actor, created_at,
+            packet_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           approvalId,
@@ -2025,7 +2654,8 @@ export class ControlPlane {
           input.decision,
           assertText(input.note, "decision note"),
           input.actor,
-          now(),
+          decidedAt,
+          input.packetHash,
         );
       const nextStatus =
         input.decision === "approve"
@@ -2050,7 +2680,7 @@ export class ControlPlane {
               version = version + 1, updated_at = ?
           WHERE id = ?
         `)
-        .run(nextStatus, availability, nextAction, now(), input.id);
+        .run(nextStatus, availability, nextAction, decidedAt, input.id);
       this.database
         .prepare(`
           UPDATE runs SET status = ?, finished_at = ?
@@ -2058,7 +2688,7 @@ export class ControlPlane {
         `)
         .run(
           input.decision === "approve" ? "succeeded" : nextStatus,
-          now(),
+          decidedAt,
           input.id,
         );
       this.database
@@ -2067,12 +2697,23 @@ export class ControlPlane {
           WHERE run_id IN (SELECT id FROM runs WHERE work_item_id = ?)
             AND released_at IS NULL
         `)
-        .run(now(), input.id);
+        .run(decidedAt, input.id);
       this.event("approval.decided", input.id, input.actor, {
         approvalId,
         decision: input.decision,
         artifactHash: artifact.sha256,
+        packetHash: input.packetHash,
+        ...(activeReviewMs === undefined
+          ? {}
+          : {
+              activeReviewMs,
+              reviewMeasurementStatus: "estimated",
+            }),
+        ...(detailsOpenCount === undefined ? {} : { detailsOpenCount }),
       });
+      if (input.completeOnApprove) {
+        this.completeApprovedWork(input.id, input.actor, decidedAt);
+      }
       return this.get(input.id);
     });
   }
@@ -2082,7 +2723,7 @@ export class ControlPlane {
     const row = this.database
       .prepare(`
         SELECT id, work_item_id, artifact_hash, decision, note, actor,
-               created_at
+               created_at, packet_hash
         FROM approvals
         WHERE work_item_id = ?
         ORDER BY created_at DESC, id DESC
@@ -2096,9 +2737,62 @@ export class ControlPlane {
       artifactHash: String(row.artifact_hash),
       decision: String(row.decision) as ArtifactReviewDecision["decision"],
       note: String(row.note),
+      packetHash: row.packet_hash ? String(row.packet_hash) : null,
       actor: String(row.actor),
       createdAt: String(row.created_at),
     };
+  }
+
+  private completeApprovedWork(
+    id: string,
+    actor: string,
+    completedAt: string,
+  ): string[] {
+    const current = this.get(id);
+    if (current.status !== "approved") {
+      throw new Error("Only approved work can complete.");
+    }
+    this.database
+      .prepare(`
+        UPDATE work_items
+        SET status = 'done', availability = 'completed',
+            next_action = 'Completed.', version = version + 1, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(completedAt, id);
+    this.event("work.completed", id, actor);
+
+    const successorRows = this.database
+      .prepare(`
+        SELECT work_item_id
+        FROM dependencies
+        WHERE predecessor_id = ? AND active = 1
+      `)
+      .all(id) as Row[];
+    const resurfaced: string[] = [];
+    for (const row of successorRows) {
+      const successorId = String(row.work_item_id);
+      if (this.blockingPredecessors(successorId).length === 0) {
+        const update = this.database
+          .prepare(`
+            UPDATE work_items
+            SET availability = 'ready',
+                wait_type = NULL, wait_reason = NULL, wait_reference = NULL,
+                wait_created_by = NULL,
+                next_action = 'Predecessors complete. Claim work.',
+                version = version + 1, updated_at = ?
+            WHERE id = ? AND availability = 'dependency_waiting'
+          `)
+          .run(completedAt, successorId);
+        if (Number(update.changes) > 0) {
+          resurfaced.push(successorId);
+          this.event("work.resurfaced", successorId, actor, {
+            completedPredecessor: id,
+          });
+        }
+      }
+    }
+    return resurfaced;
   }
 
   complete(input: {
@@ -2107,50 +2801,11 @@ export class ControlPlane {
     idempotencyKey: string;
   }): { workItem: WorkItem; resurfaced: string[] } {
     return this.command(input.idempotencyKey, "work.complete", () => {
-      const current = this.get(input.id);
-      if (current.status !== "approved") {
-        throw new Error("Only approved work can complete.");
-      }
-      this.database
-        .prepare(`
-          UPDATE work_items
-          SET status = 'done', availability = 'completed',
-              next_action = 'Completed.', version = version + 1, updated_at = ?
-          WHERE id = ?
-        `)
-        .run(now(), input.id);
-      this.event("work.completed", input.id, input.actor);
-
-      const successorRows = this.database
-        .prepare(`
-          SELECT work_item_id
-          FROM dependencies
-          WHERE predecessor_id = ? AND active = 1
-        `)
-        .all(input.id) as Row[];
-      const resurfaced: string[] = [];
-      for (const row of successorRows) {
-        const successorId = String(row.work_item_id);
-        if (this.blockingPredecessors(successorId).length === 0) {
-          const update = this.database
-            .prepare(`
-              UPDATE work_items
-              SET availability = 'ready',
-                  wait_type = NULL, wait_reason = NULL, wait_reference = NULL,
-                  wait_created_by = NULL,
-                  next_action = 'Predecessors complete. Claim work.',
-                  version = version + 1, updated_at = ?
-              WHERE id = ? AND availability = 'dependency_waiting'
-            `)
-            .run(now(), successorId);
-          if (Number(update.changes) > 0) {
-            resurfaced.push(successorId);
-            this.event("work.resurfaced", successorId, input.actor, {
-              completedPredecessor: input.id,
-            });
-          }
-        }
-      }
+      const resurfaced = this.completeApprovedWork(
+        input.id,
+        input.actor,
+        now(),
+      );
       return { workItem: this.get(input.id), resurfaced };
     });
   }
@@ -2498,9 +3153,25 @@ export class ControlPlane {
             WHERE id = ?
           `)
           .run(input.callHash, input.actor, stamp, input.id);
+        const approvalItem = this.get(input.id);
+        const packet = buildDecisionPacket({
+          workItem: approvalItem,
+          contract: this.decisionContract(input.id),
+          subject: {
+            kind: "tool_call",
+            callHash: pending.callHash,
+            toolName: pending.toolName,
+          },
+          toolEvidence: this.listToolEvidence(input.id).filter(
+            ({ runId }) => runId === input.runId,
+          ),
+          createdAt: stamp,
+        });
+        this.replaceDecisionPacket(packet, stamp);
         this.event("tool.approval.required", input.id, input.actor, {
           callHash: pending.callHash,
           toolName: pending.toolName,
+          packetHash: packet.binding.packetHash,
         });
         return pending;
       },
@@ -2600,9 +3271,12 @@ export class ControlPlane {
     id: string;
     callHash: string;
     toolName: string;
+    packetHash: string;
     actor: string;
     note: string;
     idempotencyKey: string;
+    activeReviewMs?: number;
+    detailsOpenCount?: number;
   }): ToolCallApproval {
     return this.command(input.idempotencyKey, "tool.approve", () => {
       const current = this.get(input.id);
@@ -2632,13 +3306,35 @@ export class ControlPlane {
       if (!pending) {
         throw new Error("Pending tool call does not exist.");
       }
+      const packet = this.decisionPacket(input.id);
+      if (
+        !packet ||
+        packet.kind !== "tool_execution" ||
+        packet.subject.kind !== "tool_call" ||
+        packet.subject.callHash !== input.callHash ||
+        packet.subject.toolName !== toolName ||
+        packet.binding.packetHash !== input.packetHash
+      ) {
+        throw new Error("Tool approval packet does not match the current decision context.");
+      }
+      const activeReviewMs = optionalBoundedInteger(
+        input.activeReviewMs,
+        "activeReviewMs",
+        86_400_000,
+      );
+      const detailsOpenCount = optionalBoundedInteger(
+        input.detailsOpenCount,
+        "detailsOpenCount",
+        10_000,
+      );
       const approvalId = this.nextId("tool-approval");
       const createdAt = now();
       this.database
         .prepare(`
           INSERT INTO tool_approvals(
-            id, work_item_id, call_hash, tool_name, actor, note, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, work_item_id, call_hash, tool_name, actor, note, created_at,
+            packet_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           approvalId,
@@ -2648,6 +3344,7 @@ export class ControlPlane {
           input.actor,
           assertText(input.note, "note"),
           createdAt,
+          input.packetHash,
         );
       this.database
         .prepare(`
@@ -2686,6 +3383,14 @@ export class ControlPlane {
         approvalId,
         callHash: input.callHash,
         toolName,
+        packetHash: input.packetHash,
+        ...(activeReviewMs === undefined
+          ? {}
+          : {
+              activeReviewMs,
+              reviewMeasurementStatus: "estimated",
+            }),
+        ...(detailsOpenCount === undefined ? {} : { detailsOpenCount }),
       });
       return {
         id: approvalId,
@@ -2694,7 +3399,155 @@ export class ControlPlane {
         toolName,
         actor: input.actor,
         note: input.note.trim(),
+        packetHash: input.packetHash,
         createdAt,
+      };
+    });
+  }
+
+  denyToolCall(input: {
+    id: string;
+    callHash: string;
+    toolName: string;
+    packetHash: string;
+    actor: string;
+    note: string;
+    idempotencyKey: string;
+    activeReviewMs?: number;
+    detailsOpenCount?: number;
+  }): ToolCallDenial {
+    return this.command(input.idempotencyKey, "tool.deny", () => {
+      const current = this.get(input.id);
+      if (!input.actor.startsWith("human:")) {
+        throw new Error("Tool denial authority must be a human actor.");
+      }
+      if (!/^[a-f0-9]{64}$/u.test(input.callHash)) {
+        throw new Error("callHash must be a SHA-256 digest.");
+      }
+      const toolName = assertText(input.toolName, "toolName");
+      if (
+        current.status !== "in_progress" ||
+        current.availability !== "approval_waiting" ||
+        current.wait?.type !== "approval" ||
+        current.wait.reference !== input.callHash
+      ) {
+        throw new Error("Work is not actively waiting for this tool decision.");
+      }
+      const pending = this.database
+        .prepare(`
+          SELECT id, run_id, attempt_id
+          FROM pending_tool_calls
+          WHERE work_item_id = ? AND call_hash = ? AND tool_name = ?
+            AND status = 'approval_required'
+        `)
+        .get(input.id, input.callHash, toolName) as Row | undefined;
+      if (!pending) {
+        throw new Error("Pending tool call does not exist.");
+      }
+      const packet = this.decisionPacket(input.id);
+      if (
+        !packet ||
+        packet.kind !== "tool_execution" ||
+        packet.subject.kind !== "tool_call" ||
+        packet.subject.callHash !== input.callHash ||
+        packet.subject.toolName !== toolName ||
+        packet.binding.packetHash !== input.packetHash
+      ) {
+        throw new Error("Tool denial packet does not match the current decision context.");
+      }
+      const activeReviewMs = optionalBoundedInteger(
+        input.activeReviewMs,
+        "activeReviewMs",
+        86_400_000,
+      );
+      const detailsOpenCount = optionalBoundedInteger(
+        input.detailsOpenCount,
+        "detailsOpenCount",
+        10_000,
+      );
+      const denialId = this.nextId("tool-denial");
+      const deniedAt = now();
+      const note = assertText(input.note, "note");
+      this.database
+        .prepare(`
+          INSERT INTO tool_denials(
+            id, work_item_id, call_hash, tool_name, actor, note,
+            packet_hash, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          denialId,
+          input.id,
+          input.callHash,
+          toolName,
+          input.actor,
+          note,
+          input.packetHash,
+          deniedAt,
+        );
+      this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'denied', executed_at = ?
+          WHERE id = ?
+        `)
+        .run(deniedAt, String(pending.id));
+      this.database
+        .prepare(`
+          UPDATE attempts
+          SET status = 'canceled', finished_at = ?,
+              error_code = 'TOOL_CALL_DENIED',
+              error_message = 'A human denied the exact pending tool call.'
+          WHERE id = ? AND status = 'waiting'
+        `)
+        .run(deniedAt, String(pending.attempt_id));
+      this.database
+        .prepare(`
+          UPDATE runs
+          SET status = 'canceled', finished_at = ?
+          WHERE id = ? AND status = 'waiting'
+        `)
+        .run(deniedAt, String(pending.run_id));
+      this.database
+        .prepare(`
+          UPDATE work_items
+          SET status = 'canceled', availability = 'completed',
+              wait_type = NULL, wait_reason = NULL, wait_reference = NULL,
+              resume_at = NULL, wait_created_by = NULL,
+              next_action = 'No further action.',
+              version = version + 1, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(deniedAt, input.id);
+      this.database
+        .prepare(`
+          UPDATE decision_packets
+          SET superseded_at = ?
+          WHERE work_item_id = ? AND superseded_at IS NULL
+        `)
+        .run(deniedAt, input.id);
+      this.event("tool.denied", input.id, input.actor, {
+        denialId,
+        callHash: input.callHash,
+        toolName,
+        packetHash: input.packetHash,
+        ...(activeReviewMs === undefined
+          ? {}
+          : {
+              activeReviewMs,
+              reviewMeasurementStatus: "estimated",
+            }),
+        ...(detailsOpenCount === undefined ? {} : { detailsOpenCount }),
+      });
+      return {
+        id: denialId,
+        workItemId: input.id,
+        callHash: input.callHash,
+        toolName,
+        actor: input.actor,
+        note,
+        packetHash: input.packetHash,
+        createdAt: deniedAt,
       };
     });
   }
@@ -2714,7 +3567,86 @@ export class ControlPlane {
     return Boolean(row);
   }
 
+  prepareToolEvidence(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    callHash: string;
+    toolName: string;
+    inputHash: string;
+    actor: string;
+  }): { id: string; token: string } {
+    return this.transact(() => {
+      const current = this.get(input.id);
+      if (current.status !== "in_progress") {
+        throw new Error(
+          "Tool evidence preparation requires an active in-progress work item.",
+        );
+      }
+      for (const hash of [input.callHash, input.inputHash]) {
+        if (!/^[a-f0-9]{64}$/u.test(hash)) {
+          throw new Error(
+            "Tool evidence preparation contains an invalid SHA-256 digest.",
+          );
+        }
+      }
+      const toolName = assertText(input.toolName, "toolName");
+      const actor = assertText(input.actor, "actor");
+      const lineage = this.database
+        .prepare(`
+          SELECT runs.work_item_id, runs.status AS run_status,
+                 attempts.status AS attempt_status
+          FROM runs
+          JOIN attempts ON attempts.run_id = runs.id
+          WHERE runs.id = ? AND attempts.id = ?
+        `)
+        .get(input.runId, input.attemptId) as Row | undefined;
+      if (
+        !lineage ||
+        String(lineage.work_item_id) !== input.id ||
+        String(lineage.run_status) !== "running" ||
+        String(lineage.attempt_status) !== "running"
+      ) {
+        throw new Error(
+          "Tool evidence preparation must use the active run and attempt lineage.",
+        );
+      }
+      const id = `tool-receipt-${randomUUID()}`;
+      const token = randomBytes(32).toString("hex");
+      const tokenHash = createHash("sha256").update(token).digest("hex");
+      const issuedAt = now();
+      this.database
+        .prepare(`
+          INSERT INTO tool_evidence_receipts(
+            id, work_item_id, run_id, attempt_id, call_hash, tool_name,
+            input_hash, token_hash, status, issued_at, consumed_at,
+            evidence_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?, NULL, NULL)
+        `)
+        .run(
+          id,
+          input.id,
+          input.runId,
+          input.attemptId,
+          input.callHash,
+          toolName,
+          input.inputHash,
+          tokenHash,
+          issuedAt,
+        );
+      this.event("tool.evidence.prepared", input.id, actor, {
+        receiptId: id,
+        runId: input.runId,
+        attemptId: input.attemptId,
+        callHash: input.callHash,
+        toolName,
+      });
+      return { id, token };
+    });
+  }
+
   recordToolEvidence(input: {
+    receipt: ToolEvidenceReceipt;
     evidenceId: string;
     id: string;
     runId: string;
@@ -2733,7 +3665,30 @@ export class ControlPlane {
       `tool-evidence:${input.evidenceId}`,
       "tool.evidence.record",
       () => {
-        this.get(input.id);
+        const current = this.get(input.id);
+        if (current.status !== "in_progress") {
+          throw new Error("Tool evidence requires an active in-progress work item.");
+        }
+        const actor = assertText(input.actor, "actor");
+        const lineage = this.database
+          .prepare(`
+            SELECT runs.work_item_id, runs.status AS run_status,
+                   attempts.status AS attempt_status
+            FROM runs
+            JOIN attempts ON attempts.run_id = runs.id
+            WHERE runs.id = ? AND attempts.id = ?
+          `)
+          .get(input.runId, input.attemptId) as Row | undefined;
+        if (
+          !lineage ||
+          String(lineage.work_item_id) !== input.id ||
+          String(lineage.run_status) !== "running" ||
+          String(lineage.attempt_status) !== "running"
+        ) {
+          throw new Error(
+            "Tool evidence run and attempt must be the active lineage of this work item.",
+          );
+        }
         for (const hash of [
           input.callHash,
           input.inputHash,
@@ -2750,11 +3705,40 @@ export class ControlPlane {
         ) {
           throw new Error("Tool evidence status is invalid.");
         }
+        if (!/^[a-f0-9]{64}$/u.test(input.receipt.token)) {
+          throw new Error("Tool evidence receipt token is invalid.");
+        }
+        const receipt = this.database
+          .prepare(`
+            SELECT *
+            FROM tool_evidence_receipts
+            WHERE id = ? AND status = 'issued'
+          `)
+          .get(input.receipt.id) as Row | undefined;
+        const receiptTokenHash = createHash("sha256")
+          .update(input.receipt.token)
+          .digest("hex");
+        if (
+          !receipt ||
+          String(receipt.work_item_id) !== input.id ||
+          String(receipt.run_id) !== input.runId ||
+          String(receipt.attempt_id) !== input.attemptId ||
+          String(receipt.call_hash) !== input.callHash ||
+          String(receipt.tool_name) !== input.toolName ||
+          String(receipt.input_hash) !== input.inputHash ||
+          String(receipt.token_hash) !== receiptTokenHash
+        ) {
+          throw new Error(
+            "Tool evidence does not match an unconsumed Tool Runtime receipt.",
+          );
+        }
         const record: ToolExecutionEvidenceRecord = {
           id: input.evidenceId,
           workItemId: input.id,
           runId: input.runId,
           attemptId: input.attemptId,
+          receiptId: input.receipt.id,
+          provenance: "control_plane_receipt",
           callHash: input.callHash,
           toolName: assertText(input.toolName, "toolName"),
           status: input.status,
@@ -2766,6 +3750,22 @@ export class ControlPlane {
           durationMs: Math.max(0, Math.floor(input.durationMs)),
           createdAt: input.createdAt,
         };
+        const runtimeEvidence: ToolExecutionEvidence = {
+          id: record.id,
+          callHash: record.callHash,
+          toolName: record.toolName,
+          status: record.status,
+          inputHash: record.inputHash,
+          outputHash: record.outputHash,
+          paths: record.paths,
+          durationMs: record.durationMs,
+          createdAt: record.createdAt,
+        };
+        if (!verifyToolRuntimeReceipt(input.id, runtimeEvidence, input.receipt)) {
+          throw new Error(
+            "Tool evidence was not issued by the in-process Tool Runtime.",
+          );
+        }
         this.database
           .prepare(`
             INSERT INTO tool_evidence(
@@ -2788,8 +3788,19 @@ export class ControlPlane {
             record.durationMs,
             record.createdAt,
           );
-        this.event("tool.executed", input.id, input.actor, {
+        const consumed = this.database
+          .prepare(`
+            UPDATE tool_evidence_receipts
+            SET status = 'consumed', consumed_at = ?, evidence_id = ?
+            WHERE id = ? AND status = 'issued'
+          `)
+          .run(now(), record.id, input.receipt.id);
+        if (Number(consumed.changes) !== 1) {
+          throw new Error("Tool evidence receipt was already consumed.");
+        }
+        this.event("tool.executed", input.id, actor, {
           evidenceId: record.id,
+          receiptId: input.receipt.id,
           callHash: record.callHash,
           toolName: record.toolName,
           status: record.status,
@@ -2805,10 +3816,13 @@ export class ControlPlane {
     this.get(id);
     const rows = this.database
       .prepare(`
-        SELECT *
-        FROM tool_evidence
-        WHERE work_item_id = ?
-        ORDER BY created_at, id
+        SELECT evidence.*, receipt.id AS receipt_id
+        FROM tool_evidence evidence
+        JOIN tool_evidence_receipts receipt
+          ON receipt.evidence_id = evidence.id
+         AND receipt.status = 'consumed'
+        WHERE evidence.work_item_id = ?
+        ORDER BY evidence.created_at, evidence.id
       `)
       .all(id) as Row[];
     return rows.map((row) => ({
@@ -2816,6 +3830,8 @@ export class ControlPlane {
       workItemId: String(row.work_item_id),
       runId: String(row.run_id),
       attemptId: String(row.attempt_id),
+      receiptId: String(row.receipt_id),
+      provenance: "control_plane_receipt",
       callHash: String(row.call_hash),
       toolName: String(row.tool_name),
       status: String(row.status) as ToolExecutionEvidenceRecord["status"],
@@ -2947,7 +3963,6 @@ export class ControlPlane {
       limit: options.limit ?? 200,
       includeCompleted: true,
     });
-    const workItems = page.items;
     const pendingToolApprovalIds = new Set(
       (
         this.database
@@ -2981,6 +3996,49 @@ export class ControlPlane {
         }
       }),
     );
+    const humanCandidateItems = (
+      this.database
+        .prepare(`
+          SELECT *
+          FROM work_items
+          WHERE archived_at IS NULL
+            AND status NOT IN ('done', 'canceled', 'failed')
+            AND (
+              status = 'review_pending'
+              OR availability = 'user_input_waiting'
+              OR (
+                status = 'in_progress'
+                AND availability = 'approval_waiting'
+              )
+            )
+        `)
+        .all() as Row[]
+    ).map(asWorkItem);
+    const humanDecisionPairs = humanCandidateItems
+      .map((item) => ({
+        item,
+        action: this.projectAction(
+          item,
+          pendingToolApprovalIds.has(item.id),
+        ),
+      }))
+      .filter(
+        ({ action }) => action.actor === "human" && action.actionable,
+      )
+      .sort(
+        (left, right) =>
+          right.action.priority - left.action.priority ||
+          left.item.updatedAt.localeCompare(right.item.updatedAt) ||
+          left.item.id.localeCompare(right.item.id),
+      );
+    const visibleDecisionItems = humanDecisionPairs
+      .slice(0, 100)
+      .map(({ item }) => item);
+    const workItems = [
+      ...new Map(
+        [...visibleDecisionItems, ...page.items].map((item) => [item.id, item]),
+      ).values(),
+    ];
     const userActions = workItems
       .filter(({ status }) => !["done", "canceled"].includes(status))
       .map((item) =>
@@ -2991,6 +4049,42 @@ export class ControlPlane {
           right.priority - left.priority ||
           left.workItemId.localeCompare(right.workItemId),
       );
+    const agentActionRow = this.database
+      .prepare(`
+        SELECT COUNT(*) AS count
+        FROM work_items
+        WHERE archived_at IS NULL
+          AND (
+            (status = 'requested' AND availability NOT IN ('user_input_waiting', 'approval_waiting'))
+            OR (availability = 'ready' AND status IN ('ready', 'changes_requested'))
+            OR (status = 'in_progress' AND availability = 'ready')
+            OR status = 'approved'
+          )
+      `)
+      .get() as Row;
+    const historyRow = this.database
+      .prepare(`
+        SELECT COUNT(*) AS count,
+               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM work_items
+        WHERE archived_at IS NULL
+          AND status IN ('done', 'canceled', 'failed')
+      `)
+      .get() as Row;
+    const activeRow = this.database
+      .prepare(`
+        SELECT COUNT(*) AS count
+        FROM work_items
+        WHERE archived_at IS NULL
+          AND status NOT IN ('done', 'canceled', 'failed')
+      `)
+      .get() as Row;
+    const humanDecisions = humanDecisionPairs.length;
+    const agentActions = Number(agentActionRow.count ?? 0);
+    const waiting = Math.max(
+      0,
+      Number(activeRow.count ?? 0) - humanDecisions - agentActions,
+    );
     const events = this.database
       .prepare(`
         SELECT id, event_type, work_item_id, actor, created_at
@@ -2999,14 +4093,22 @@ export class ControlPlane {
       .all() as Row[];
     return {
       summary: {
-        actionable: userActions.filter(({ actionable }) => actionable).length,
-        approvals: userActions.filter(
-          ({ category }) => category === "human_review",
+        actionable: humanDecisions + agentActions,
+        approvals: humanDecisionPairs.filter(
+          ({ action }) => action.category === "human_review",
         ).length,
-        userInput: userActions.filter(
-          ({ category }) => category === "user_input",
+        userInput: humanDecisionPairs.filter(
+          ({ action }) => action.category === "user_input",
         ).length,
-        failed: workItems.filter(({ status }) => status === "failed").length,
+        failed: Number(historyRow.failed ?? 0),
+        humanDecisions,
+        agentActions,
+        waiting,
+        history: Number(historyRow.count ?? 0),
+      },
+      attention: {
+        primaryDecision: humanDecisionPairs[0]?.action ?? null,
+        queueTruncated: humanDecisionPairs.length > 100,
       },
       workItems,
       userActions,
@@ -3051,6 +4153,15 @@ export class ControlPlane {
         "Failure is retained for inspection.",
         false,
         5,
+      );
+    }
+    if (item.status === "approved") {
+      return this.action(
+        item,
+        "complete",
+        "Finalize the already approved work.",
+        true,
+        50,
       );
     }
     if (item.status === "requested") {

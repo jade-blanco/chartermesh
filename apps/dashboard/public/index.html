@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="chartermesh-session" content="__SESSION_TOKEN__" />
-    <title>CharterMesh · 오늘의 운영</title>
+    <title>CharterMesh · 결정 데스크</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="/app.js" defer></script>
   </head>
@@ -45,49 +45,84 @@
       <main id="main-content" tabindex="-1">
         <header class="page-header">
           <div>
-            <p class="eyebrow">CONTROL PLANE</p>
-            <h1>오늘의 운영</h1>
-            <p>사람의 결정과 다음 실행이 필요한 작업을 한눈에 확인합니다.</p>
+            <p class="eyebrow">DECISION DESK</p>
+            <h1>결정 데스크</h1>
+            <p>여러 에이전트의 작업을 근거가 결박된 한 번의 결정으로 압축합니다.</p>
           </div>
           <button class="primary-button" id="new-request-button" type="button" aria-haspopup="dialog" aria-controls="request-dialog">
             <span aria-hidden="true">＋</span> 새 요청
           </button>
         </header>
 
+        <section class="decision-focus" id="decision-focus" aria-labelledby="decision-focus-heading">
+          <div class="focus-heading">
+            <div>
+              <p class="eyebrow">NEXT HUMAN DECISION</p>
+              <h2 id="decision-focus-heading">지금 내가 결정할 것</h2>
+            </div>
+            <span class="focus-position" id="focus-position">확인 중…</span>
+          </div>
+          <div id="decision-focus-content" hidden>
+            <span class="decision-kind" id="focus-kind"></span>
+            <h3 id="focus-question"></h3>
+            <p class="focus-result" id="focus-result"></p>
+            <div class="focus-evidence-grid">
+              <section>
+                <span>근거 강도</span>
+                <strong id="focus-evidence"></strong>
+              </section>
+              <section>
+                <span>위험·미확인</span>
+                <strong id="focus-risk"></strong>
+              </section>
+              <section>
+                <span>결정의 결과</span>
+                <strong id="focus-consequence"></strong>
+              </section>
+            </div>
+            <button class="primary-button" id="focus-open-button" type="button">결정 패킷 열기</button>
+          </div>
+          <div class="focus-empty" id="decision-focus-empty">
+            <strong>현재 사람의 결정을 기다리는 작업이 없습니다.</strong>
+            <p>에이전트가 수행할 작업과 대기·이력은 아래에서 분리해 볼 수 있습니다.</p>
+          </div>
+        </section>
+
         <section class="summary-grid" aria-label="운영 요약">
-          <button class="summary-card blue" type="button" data-summary-filter="actionable" aria-pressed="true" aria-controls="work-results">
-            <div><span class="summary-icon" aria-hidden="true">→</span><span>지금 필요한 조치</span></div>
-            <strong id="summary-actionable">–</strong>
-            <small>실행 또는 결정 가능</small>
+          <button class="summary-card blue" type="button" data-summary-filter="human" aria-pressed="true" aria-controls="work-results">
+            <div><span class="summary-icon" aria-hidden="true">✓</span><span>내 결정</span></div>
+            <strong id="summary-human">–</strong>
+            <small>사람만 내릴 수 있는 결정</small>
           </button>
-          <button class="summary-card violet" type="button" data-summary-filter="approvals" aria-pressed="false" aria-controls="work-results">
-            <div><span class="summary-icon" aria-hidden="true">✓</span><span>사람 검토</span></div>
-            <strong id="summary-approvals">–</strong>
-            <small>불변 산출물·도구 변경 검토</small>
+          <button class="summary-card violet" type="button" data-summary-filter="agents" aria-pressed="false" aria-controls="work-results">
+            <div><span class="summary-icon" aria-hidden="true">→</span><span>에이전트 작업</span></div>
+            <strong id="summary-agents">–</strong>
+            <small>실행·수정·인계할 작업</small>
           </button>
-          <button class="summary-card amber" type="button" data-summary-filter="user-input" aria-pressed="false" aria-controls="work-results">
-            <div><span class="summary-icon" aria-hidden="true">?</span><span>사용자 입력</span></div>
-            <strong id="summary-input">–</strong>
-            <small>응답을 기다리는 작업</small>
+          <button class="summary-card amber" type="button" data-summary-filter="waiting" aria-pressed="false" aria-controls="work-results">
+            <div><span class="summary-icon" aria-hidden="true">…</span><span>대기</span></div>
+            <strong id="summary-waiting">–</strong>
+            <small>현재 누구도 실행할 수 없음</small>
           </button>
-          <button class="summary-card red" type="button" data-summary-filter="failed" aria-pressed="false" aria-controls="work-results">
-            <div><span class="summary-icon" aria-hidden="true">!</span><span>실패 이력</span></div>
-            <strong id="summary-failed">—</strong>
-            <small>자동 조치 없이 보존</small>
+          <button class="summary-card red" type="button" data-summary-filter="history" aria-pressed="false" aria-controls="work-results">
+            <div><span class="summary-icon" aria-hidden="true">◇</span><span>이력</span></div>
+            <strong id="summary-history">—</strong>
+            <small>완료·취소·실패 기록</small>
           </button>
         </section>
 
         <section class="workspace-card" id="work-results" aria-labelledby="work-heading">
           <div class="section-heading">
             <div>
-              <h2 id="work-heading">작업 흐름</h2>
-              <p>상태보다 다음 조치를 기준으로 정렬합니다.</p>
+              <h2 id="work-heading">운영 흐름</h2>
+              <p>사람의 결정, 에이전트 실행, 대기와 이력을 섞지 않습니다.</p>
             </div>
             <div class="filters" role="group" aria-label="작업 필터">
-              <button class="filter" data-filter="all" type="button" aria-pressed="false">전체</button>
-              <button class="filter active" data-filter="actionable" type="button" aria-pressed="true">조치 필요</button>
+              <button class="filter active" data-filter="human" type="button" aria-pressed="true">내 결정</button>
+              <button class="filter" data-filter="agents" type="button" aria-pressed="false">에이전트 작업</button>
               <button class="filter" data-filter="waiting" type="button" aria-pressed="false">대기 중</button>
-              <button class="filter" data-filter="completed" type="button" aria-pressed="false">완료</button>
+              <button class="filter" data-filter="history" type="button" aria-pressed="false">이력</button>
+              <button class="filter" data-filter="all" type="button" aria-pressed="false">전체</button>
             </div>
           </div>
 
@@ -128,7 +163,7 @@
 
       <aside class="inspector" id="inspector" aria-labelledby="inspector-heading" role="region">
         <button class="inspector-close" id="inspector-close" type="button" aria-label="상세 닫기">×</button>
-        <p class="eyebrow">WORK INSPECTOR</p>
+        <p class="eyebrow">DECISION PACKET</p>
         <h2 id="inspector-heading" tabindex="-1">작업을 선택하세요</h2>
         <p class="inspector-summary" id="inspector-summary">
           표에서 작업을 선택하면 현재 상태, 다음 조치, 승인 대기 변경과 계보를 볼 수 있습니다.
@@ -184,13 +219,18 @@
                 <div><dt>도구</dt><dd id="tool-name"></dd></div>
                 <div><dt>변경량</dt><dd id="tool-size"></dd></div>
               </dl>
-              <p class="hash-label">정확한 호출 해시</p>
-              <p class="mono hash-value" id="tool-call-hash"></p>
+               <p class="hash-label">정확한 호출 해시</p>
+               <p class="mono hash-value" id="tool-call-hash"></p>
+               <p class="hash-label">결정 패킷 SHA-256</p>
+               <p class="mono hash-value" id="tool-packet-hash"></p>
               <pre class="artifact-preview code-preview" id="tool-content"></pre>
             </details>
             <p class="tool-warning" id="tool-warning" hidden></p>
             <button class="primary-button approval-button" id="tool-approve-button" type="button" data-tool-approve>
               위 내용을 확인하고 변경 승인
+            </button>
+            <button class="secondary-button danger" id="tool-deny-button" type="button" data-tool-deny>
+              거부하고 작업 종료
             </button>
           </div>
           <div class="inspector-block artifact-review-block" id="artifact-block" hidden>
@@ -199,15 +239,23 @@
                 <label>산출물 결재</label>
                 <strong id="artifact-deliverable"></strong>
               </div>
-              <span class="review-badge" id="artifact-confidence"></span>
+              <span class="review-badge neutral" id="artifact-confidence"></span>
             </div>
             <p class="review-lead" id="artifact-summary"></p>
             <section class="review-section">
-              <h3>검증 결과</h3>
+              <h3>완료 기준 판정</h3>
+              <ul class="review-list criteria" id="artifact-criteria"></ul>
+            </section>
+            <section class="review-section">
+              <h3>제어면이 확인한 실행 증거</h3>
+              <ul class="review-list verified" id="artifact-verified-evidence"></ul>
+            </section>
+            <section class="review-section">
+              <h3>작업자가 보고한 수행 근거</h3>
               <ul class="review-list" id="artifact-checks"></ul>
             </section>
             <section class="review-section review-alert">
-              <h3>확인된 위험</h3>
+              <h3>보고된 위험·미확인 사항</h3>
               <ul class="review-list" id="artifact-risks"></ul>
             </section>
             <section class="review-section">
@@ -218,6 +266,8 @@
               <summary>기술 상세 보기 <span>원문·정확한 해시</span></summary>
               <p class="hash-label">산출물 SHA-256</p>
               <p class="mono hash-value" id="artifact-hash"></p>
+              <p class="hash-label">결정 패킷 SHA-256</p>
+              <p class="mono hash-value" id="artifact-packet-hash"></p>
               <pre class="artifact-preview" id="artifact-content"></pre>
             </details>
           </div>
@@ -250,6 +300,39 @@
         <div class="dialog-actions">
           <button class="secondary-button" value="cancel" type="button" id="dialog-cancel">취소</button>
           <button class="primary-button" value="default" type="submit">요청 만들기</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="decision-dialog" aria-labelledby="decision-dialog-heading">
+      <form id="decision-form">
+        <div class="dialog-header">
+          <div><p class="eyebrow">HUMAN DECISION</p><h2 id="decision-dialog-heading">결정 기록</h2></div>
+          <button class="icon-button" value="cancel" type="button" id="decision-dialog-close" aria-label="닫기">×</button>
+        </div>
+        <p class="decision-dialog-copy" id="decision-dialog-copy"></p>
+        <label for="decision-note">결정 사유 <span id="decision-note-requirement"></span></label>
+        <textarea id="decision-note" name="note" maxlength="4000" rows="5" placeholder="수정 요청과 거절은 다음 에이전트가 바로 실행할 수 있도록 구체적으로 적어주세요."></textarea>
+        <p class="form-error" id="decision-form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="secondary-button" value="cancel" type="button" id="decision-dialog-cancel">취소</button>
+          <button class="primary-button" value="default" type="submit" id="decision-submit-button">결정 제출</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="input-dialog" aria-labelledby="input-dialog-heading">
+      <form id="input-form">
+        <div class="dialog-header">
+          <div><p class="eyebrow">REQUESTED INPUT</p><h2 id="input-dialog-heading">사용자 입력 제공</h2></div>
+          <button class="icon-button" value="cancel" type="button" id="input-dialog-close" aria-label="닫기">×</button>
+        </div>
+        <p class="decision-dialog-copy" id="input-dialog-question"></p>
+        <p class="history-note">비밀번호, API 키, 토큰 같은 비밀정보는 입력하지 마세요. 이 응답은 로컬 Control Plane에 저장되어 다음 실행 컨텍스트로 전달됩니다.</p>
+        <label for="input-response">응답</label>
+        <textarea id="input-response" name="response" maxlength="4000" rows="6" required placeholder="에이전트가 작업을 계속하는 데 필요한 결정을 구체적으로 적어주세요."></textarea>
+        <p class="form-error" id="input-form-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="secondary-button" value="cancel" type="button" id="input-dialog-cancel">취소</button>
+          <button class="primary-button" value="default" type="submit">입력 전달하고 재개</button>
         </div>
       </form>
     </dialog>

@@ -34,7 +34,7 @@ export function openControlPlaneDatabase(
         )
         .get() as { version: number };
       const priorVersion = Number(row.version);
-      if (priorVersion > 0 && priorVersion < 9) {
+      if (priorVersion > 0 && priorVersion < 11) {
         createControlPlaneBackup(
           database,
           join(dirname(path), "backups"),
@@ -357,6 +357,19 @@ export function openControlPlaneDatabase(
       FOREIGN KEY(work_item_id) REFERENCES work_items(id)
     );
 
+    CREATE TABLE IF NOT EXISTS tool_denials (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      call_hash TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      note TEXT NOT NULL,
+      packet_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(work_item_id, call_hash),
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
+    );
+
     CREATE TABLE IF NOT EXISTS tool_evidence (
       id TEXT PRIMARY KEY,
       work_item_id TEXT NOT NULL,
@@ -377,6 +390,27 @@ export function openControlPlaneDatabase(
 
     CREATE INDEX IF NOT EXISTS tool_evidence_work_idx
       ON tool_evidence(work_item_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS tool_evidence_receipts (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      call_hash TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      status TEXT NOT NULL,
+      issued_at TEXT NOT NULL,
+      consumed_at TEXT,
+      evidence_id TEXT UNIQUE,
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id),
+      FOREIGN KEY(run_id) REFERENCES runs(id),
+      FOREIGN KEY(attempt_id) REFERENCES attempts(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS tool_evidence_receipts_lineage_idx
+      ON tool_evidence_receipts(work_item_id, run_id, attempt_id, status);
 
     CREATE TABLE IF NOT EXISTS pending_tool_calls (
       id TEXT PRIMARY KEY,
@@ -405,6 +439,45 @@ export function openControlPlaneDatabase(
       PRIMARY KEY(work_item_id, tool_name),
       FOREIGN KEY(work_item_id) REFERENCES work_items(id)
     );
+
+    CREATE TABLE IF NOT EXISTS work_item_decision_contracts (
+      work_item_id TEXT PRIMARY KEY,
+      schema_version TEXT NOT NULL,
+      contract_json TEXT NOT NULL,
+      contract_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS decision_packets (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      subject_hash TEXT NOT NULL,
+      contract_hash TEXT NOT NULL,
+      evidence_set_hash TEXT NOT NULL,
+      packet_hash TEXT NOT NULL UNIQUE,
+      packet_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      superseded_at TEXT,
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS work_item_user_inputs (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      wait_reference TEXT NOT NULL,
+      response TEXT NOT NULL,
+      response_hash TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS decision_packets_work_idx
+      ON decision_packets(work_item_id, superseded_at, created_at DESC);
+    CREATE INDEX IF NOT EXISTS work_item_user_inputs_work_idx
+      ON work_item_user_inputs(work_item_id, created_at DESC);
   `);
   database
     .prepare(`
@@ -440,6 +513,30 @@ export function openControlPlaneDatabase(
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (9, ?)
+    `)
+    .run(new Date().toISOString());
+  const approvalColumns = database
+    .prepare("PRAGMA table_info(approvals)")
+    .all() as Array<{ name: string }>;
+  if (!approvalColumns.some(({ name }) => name === "packet_hash")) {
+    database.exec("ALTER TABLE approvals ADD COLUMN packet_hash TEXT");
+  }
+  const toolApprovalColumns = database
+    .prepare("PRAGMA table_info(tool_approvals)")
+    .all() as Array<{ name: string }>;
+  if (!toolApprovalColumns.some(({ name }) => name === "packet_hash")) {
+    database.exec("ALTER TABLE tool_approvals ADD COLUMN packet_hash TEXT");
+  }
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (10, ?)
+    `)
+    .run(new Date().toISOString());
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (11, ?)
     `)
     .run(new Date().toISOString());
   return database;

@@ -4,17 +4,24 @@ const sessionToken = document
 
 const state = {
   projection: null,
-  filter: "actionable",
+  filter: "human",
   selectedId: null,
   artifact: null,
   toolEvidence: null,
+  decisionPacket: null,
+  primaryDecisionPacket: null,
   reviewDecision: null,
   busy: false,
   inspectorReturnFocus: null,
+  reviewSession: null,
+  pendingDecision: null,
+  selectionVersion: 0,
 };
 
 const inspector = document.querySelector("#inspector");
 const compactInspector = window.matchMedia("(max-width: 1100px)");
+let dashboardLoadEpoch = 0;
+let dashboardLoadInFlight = null;
 
 function syncInspectorAccessibility() {
   const hidden =
@@ -131,6 +138,7 @@ function nextActionFor(item) {
         ? "요청된 수정 사항 반영"
         : "진행 중인 작업 계속",
     start: "준비된 작업 실행",
+    complete: "승인된 작업 완료 확정",
     waiting: item.wait?.reason ?? "대기 조건 해소",
   };
   return labels[action.category] ?? action.reason ?? item.nextAction;
@@ -138,30 +146,30 @@ function nextActionFor(item) {
 
 function filteredItems() {
   const items = state.projection?.workItems ?? [];
-  if (state.filter === "actionable") {
-    return items.filter((item) => actionFor(item.id)?.actionable);
-  }
-  if (state.filter === "approvals") {
+  if (state.filter === "human") {
     return items.filter(
-      (item) => actionFor(item.id)?.category === "human_review",
+      (item) =>
+        actionFor(item.id)?.actor === "human" &&
+        actionFor(item.id)?.actionable,
     );
   }
-  if (state.filter === "user-input") {
+  if (state.filter === "agents") {
     return items.filter(
-      (item) => actionFor(item.id)?.category === "user_input",
+      (item) =>
+        actionFor(item.id)?.actor === "role" &&
+        actionFor(item.id)?.actionable,
     );
-  }
-  if (state.filter === "failed") {
-    return items.filter((item) => item.status === "failed");
   }
   if (state.filter === "waiting") {
     return items.filter(
-      (item) => item.wait && !["done", "canceled"].includes(item.status),
+      (item) =>
+        !["done", "canceled", "failed"].includes(item.status) &&
+        !actionFor(item.id)?.actionable,
     );
   }
-  if (state.filter === "completed") {
+  if (state.filter === "history") {
     return items.filter((item) =>
-      ["done", "canceled"].includes(item.status),
+      ["done", "canceled", "failed"].includes(item.status),
     );
   }
   return items;
@@ -199,12 +207,71 @@ async function setFilter(filter, scroll = false) {
 function renderSummary() {
   const summary = state.projection?.summary;
   if (!summary) return;
-  document.querySelector("#summary-actionable").textContent =
-    summary.actionable;
-  document.querySelector("#summary-approvals").textContent =
-    summary.approvals;
-  document.querySelector("#summary-input").textContent = summary.userInput;
-  document.querySelector("#summary-failed").textContent = summary.failed;
+  document.querySelector("#summary-human").textContent =
+    summary.humanDecisions;
+  document.querySelector("#summary-agents").textContent =
+    summary.agentActions;
+  document.querySelector("#summary-waiting").textContent = summary.waiting;
+  document.querySelector("#summary-history").textContent = summary.history;
+}
+
+function renderDecisionFocus() {
+  const action = state.projection?.attention?.primaryDecision;
+  const item = action
+    ? state.projection.workItems.find(({ id }) => id === action.workItemId)
+    : null;
+  const content = document.querySelector("#decision-focus-content");
+  const empty = document.querySelector("#decision-focus-empty");
+  content.hidden = !item;
+  empty.hidden = Boolean(item);
+  const total = state.projection?.summary?.humanDecisions ?? 0;
+  document.querySelector("#focus-position").textContent = item
+    ? `1 / ${total.toLocaleString("ko-KR")}`
+    : "0건";
+  if (!item) return;
+
+  const packet = state.primaryDecisionPacket;
+  const kindLabels = {
+    artifact_review: "산출물 결정",
+    tool_execution: "도구 실행 결정",
+    user_input: "사용자 입력",
+  };
+  document.querySelector("#focus-kind").textContent =
+    kindLabels[packet?.kind] ??
+    (action.category === "user_input" ? "사용자 입력" : "사람 결정");
+  document.querySelector("#focus-question").textContent =
+    packet?.question ?? `${item.title}에 대해 결정이 필요합니다.`;
+  document.querySelector("#focus-result").textContent =
+    packet?.producerReport?.summary ?? item.summary;
+  const verified = (packet?.evidence ?? []).filter(
+    ({ source, status }) =>
+      ["tool_runtime", "host_validator"].includes(source) &&
+      status === "verified",
+  ).length;
+  const claimed = (packet?.evidence ?? []).filter(
+    ({ source, status }) => source === "model_reported" && status === "claimed",
+  ).length;
+  document.querySelector("#focus-evidence").textContent = packet
+    ? `검증된 실행 ${verified}건 · 작업자 주장 ${claimed}건`
+    : "패킷을 불러오는 중";
+  const blocking = (packet?.exceptions ?? []).filter(
+    ({ severity }) => severity === "blocking",
+  ).length;
+  const warnings = (packet?.exceptions ?? []).filter(
+    ({ severity }) => severity === "warning",
+  ).length;
+  document.querySelector("#focus-risk").textContent = packet
+    ? `차단 예외 ${blocking}건 · 경고 ${warnings}건`
+    : "미확인";
+  document.querySelector("#focus-consequence").textContent =
+    packet?.kind === "tool_execution"
+      ? "승인하면 이 정확한 호출만 실행 가능, 거부하면 실행 없이 작업 종료"
+      : packet?.kind === "user_input"
+        ? "입력하면 대기 중인 작업을 재개"
+        : "승인하면 산출물을 완료, 수정 요청하면 근거와 함께 실행팀으로 반환";
+  const button = document.querySelector("#focus-open-button");
+  button.dataset.selectId = item.id;
+  button.setAttribute("aria-controls", "inspector");
 }
 
 function renderWork() {
@@ -274,18 +341,6 @@ function objectValue(value) {
     : {};
 }
 
-function structuredArtifact() {
-  if (!state.artifact?.content) return null;
-  try {
-    const value = JSON.parse(state.artifact.content);
-    return value && typeof value === "object" && !Array.isArray(value)
-      ? value
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 function humanReviewText(value) {
   const exact = {
     "Missing evidence of file inspection or test execution":
@@ -315,6 +370,39 @@ function humanReviewText(value) {
   return value;
 }
 
+function criterionText(result) {
+  const status = {
+    satisfied: "충족",
+    failed: "실패",
+    unverified: "미확인",
+  }[result.status] ?? "미확인";
+  const explanation = {
+    satisfied: "선언된 결정적 근거 요구사항을 모두 확인했습니다.",
+    failed: "필수 실행 또는 검증 중 하나 이상이 실패했습니다.",
+    unverified: "결정적 근거로 확인되지 않았으므로 사람이 근거와 원문을 확인해야 합니다.",
+  }[result.status] ?? "사람의 확인이 필요합니다.";
+  return `${status} · ${result.criterionId} — ${explanation}`;
+}
+
+function exceptionText(exception) {
+  const subject = String(exception.message ?? "").split(":")[0].trim();
+  const messages = {
+    CONTRACT_INCOMPLETE: "명시적인 완료 기준이 없어 원래 목표를 직접 판단해야 합니다.",
+    ARTIFACT_UNSTRUCTURED: "산출물이 정해진 구조화 형식을 충족하지 않아 요약을 신뢰할 수 없습니다.",
+    EVIDENCE_MISSING: subject
+      ? `${subject}: 확인 가능한 근거가 부족합니다.`
+      : "필수 완료 기준의 확인 가능한 근거가 부족합니다.",
+    EVIDENCE_FAILED: subject
+      ? `${subject}: 필수 실행 또는 검증이 실패했습니다.`
+      : "필수 실행 또는 검증이 실패했습니다.",
+    MODEL_REPORTED_ONLY: "작업자가 보고한 확인 사항은 개별 실행 근거와 연결되지 않은 주장입니다.",
+    LOW_CONFIDENCE: "작업자가 자신의 결과 신뢰도를 낮음으로 평가했습니다.",
+    UNRESOLVED_RISK: "작업자가 보고한 위험이 남아 있습니다.",
+  };
+  const label = exception.severity === "blocking" ? "차단" : "주의";
+  return `[${label}] ${messages[exception.code] ?? humanReviewText(exception.message)}`;
+}
+
 function renderReviewList(selector, values, emptyText) {
   const list = document.querySelector(selector);
   const entries = Array.isArray(values)
@@ -338,19 +426,16 @@ function reviewSummary(item) {
       ? `"${path}" 변경을 실행해도 되는지 묻는 결재 요청입니다. 영향과 미확인 항목을 먼저 확인하세요.`
       : `"${path}" 한 파일의 코드 ${replacements.toLocaleString("ko-KR")}곳을 바꿔도 되는지 묻는 결재 요청입니다. 영향과 안전장치를 먼저 확인하세요.`;
   }
-  if (state.artifact) {
-    const artifact = structuredArtifact();
-    const deliverable =
-      typeof artifact?.deliverable === "string"
-        ? artifact.deliverable
-        : "제출된 산출물";
-    const checkCount = Array.isArray(artifact?.checks)
-      ? artifact.checks.length
-      : 0;
-    const riskCount = Array.isArray(artifact?.risks)
-      ? artifact.risks.length
-      : 0;
-    return `"${deliverable}" 산출물 결재 요청입니다. 보고된 검증 ${checkCount.toLocaleString("ko-KR")}건과 위험 ${riskCount.toLocaleString("ko-KR")}건을 확인한 뒤 결정하세요.`;
+  if (state.decisionPacket) {
+    const verified = state.decisionPacket.evidence.filter(
+      ({ source, status }) =>
+        ["tool_runtime", "host_validator"].includes(source) &&
+        status === "verified",
+    ).length;
+    const blocking = state.decisionPacket.exceptions.filter(
+      ({ severity }) => severity === "blocking",
+    ).length;
+    return `${state.decisionPacket.producerReport?.summary ?? item.summary} 검증된 근거 ${verified.toLocaleString("ko-KR")}건, 차단 예외 ${blocking.toLocaleString("ko-KR")}건을 바탕으로 결정하세요.`;
   }
   return item.summary;
 }
@@ -362,15 +447,9 @@ function inspectorTitle(item) {
     const path = typeof args.path === "string" ? args.path : "도구 변경";
     return `${path} 변경 결재`;
   }
-  if (state.artifact) {
-    const artifact = structuredArtifact();
-    const deliverable =
-      typeof artifact?.deliverable === "string"
-        ? artifact.deliverable
-        : "제출된 산출물";
-    return `${deliverable} 산출물 결재`;
-  }
-  return item.title;
+  return state.decisionPacket?.kind === "artifact_review"
+    ? `${item.title} · 산출물 결정`
+    : item.title;
 }
 
 function renderActions(item) {
@@ -386,14 +465,18 @@ function renderActions(item) {
     actions.innerHTML = "";
     return;
   }
-  if (item.status === "requested") {
+  if (actionFor(item.id)?.category === "user_input") {
+    actions.innerHTML = `<button class="primary-button" data-user-input ${disabled}>요청된 입력 제공</button>`;
+  } else if (item.status === "requested") {
     actions.innerHTML = `<button class="primary-button" data-action="triage" ${disabled}>담당 지정</button>`;
   } else if (["ready", "changes_requested"].includes(item.status)) {
     actions.innerHTML = `<button class="primary-button" data-action="run" ${disabled}>모델 실행</button>`;
   } else if (item.status === "in_progress") {
     actions.innerHTML = `<button class="secondary-button danger" data-action="cancel" ${disabled}>실행 취소</button>`;
   } else if (item.status === "failed") {
-    actions.innerHTML = `<button class="secondary-button" data-action="retry" ${disabled}>재시도 준비</button>`;
+    actions.innerHTML = `
+      <p class="history-note">실패는 현재 사람의 의무가 아닌 보존 이력입니다. 원인을 확인한 뒤에만 선택적으로 다시 준비할 수 있습니다.</p>
+      <button class="secondary-button" data-action="retry" ${disabled}>원인 확인 후 재시도 준비</button>`;
   } else if (item.status === "review_pending") {
     actions.innerHTML = `
       <button class="primary-button" data-action="approve" ${disabled}>산출물 승인</button>
@@ -410,55 +493,62 @@ function renderActions(item) {
 
 function renderArtifact() {
   const block = document.querySelector("#artifact-block");
-  block.hidden = !state.artifact;
-  if (!state.artifact) return;
-  const artifact = structuredArtifact();
-  const deliverable =
-    typeof artifact?.deliverable === "string"
-      ? artifact.deliverable
-      : "구조화되지 않은 산출물";
+  const packet = state.decisionPacket;
+  const producer = packet?.producerReport;
+  block.hidden = !state.artifact || packet?.kind !== "artifact_review";
+  if (block.hidden) return;
+  const summary =
+    producer?.summary ?? "제작자 요약이 없어 원문을 직접 확인해야 합니다.";
   const confidence = {
-    high: "신뢰도 높음",
-    medium: "신뢰도 보통",
-    low: "신뢰도 낮음",
-  }[artifact?.confidence] ?? "직접 확인 필요";
-  const checkCount = Array.isArray(artifact?.checks)
-    ? artifact.checks.length
-    : 0;
-  const riskCount = Array.isArray(artifact?.risks)
-    ? artifact.risks.length
-    : 0;
+    high: "모델 자체평가: 높음",
+    medium: "모델 자체평가: 보통",
+    low: "모델 자체평가: 낮음",
+  }[producer?.confidence] ?? "모델 자체평가: 알 수 없음";
 
-  document.querySelector("#artifact-deliverable").textContent = deliverable;
+  document.querySelector("#artifact-deliverable").textContent =
+    summary.length > 120 ? `${summary.slice(0, 117)}…` : summary;
   const confidenceBadge = document.querySelector("#artifact-confidence");
   confidenceBadge.textContent = confidence;
-  confidenceBadge.className = `review-badge ${
-    artifact?.confidence === "high"
-      ? "approved"
-      : artifact?.confidence === "low"
-        ? "invalid"
-        : ""
-  }`;
-  document.querySelector("#artifact-summary").textContent = artifact
-    ? `"${deliverable}"이 제출되었습니다. 자동 검증 ${checkCount.toLocaleString("ko-KR")}건, 확인된 위험 ${riskCount.toLocaleString("ko-KR")}건입니다.`
-    : "구조화된 결재 요약이 없어 원문을 직접 확인해야 합니다.";
+  confidenceBadge.className = "review-badge neutral";
+  document.querySelector("#artifact-summary").textContent = summary;
+  renderReviewList(
+    "#artifact-criteria",
+    (packet?.criteria ?? []).map(criterionText),
+    "명시적으로 투영된 완료 기준이 없습니다.",
+  );
+  renderReviewList(
+    "#artifact-verified-evidence",
+    (packet?.evidence ?? [])
+      .filter(
+        ({ source, status }) =>
+          ["tool_runtime", "host_validator"].includes(source) &&
+          status === "verified",
+      )
+      .map(({ description }) => description),
+    "제어면이 확인한 실행 또는 검증 증거가 없습니다.",
+  );
   renderReviewList(
     "#artifact-checks",
-    artifact?.checks,
-    "보고된 자동 검증이 없습니다.",
+    producer?.reportedChecks,
+    "작업자가 보고한 수행 근거가 없습니다.",
   );
   renderReviewList(
     "#artifact-risks",
-    artifact?.risks,
-    "보고된 위험이 없습니다.",
+    [
+      ...(producer?.reportedRisks ?? []),
+      ...(packet?.exceptions ?? []).map(exceptionText),
+    ],
+    "보고된 위험은 없지만 위험이 없다는 뜻은 아닙니다.",
   );
   renderReviewList(
     "#artifact-next-actions",
-    artifact?.nextActions,
+    producer?.nextActions,
     "보고된 후속 조치가 없습니다.",
   );
   document.querySelector("#artifact-hash").textContent =
     state.artifact.sha256;
+  document.querySelector("#artifact-packet-hash").textContent =
+    packet?.binding?.packetHash ?? "패킷 없음";
   document.querySelector("#artifact-content").textContent =
     state.artifact.content;
 }
@@ -514,6 +604,8 @@ function renderToolApproval(item) {
       ? `${replacements.length.toLocaleString("ko-KR")}개 정확한 치환 · SHA 고정`
       : `${byteSize.toLocaleString("ko-KR")}바이트 · ${content.split(/\r?\n/).length.toLocaleString("ko-KR")}줄`;
   document.querySelector("#tool-call-hash").textContent = pending.callHash;
+  document.querySelector("#tool-packet-hash").textContent =
+    state.decisionPacket?.binding?.packetHash ?? "패킷 없음";
   document.querySelector("#tool-content").textContent = content;
   document.querySelector("#tool-impact").textContent = replacements
     ? `프로젝트 내부의 "${path}" 파일에서 기존 코드 ${replacements.length.toLocaleString("ko-KR")}곳만 정확히 찾아 교체합니다. 파일 전체를 덮어쓰지 않으며 다른 파일은 변경하지 않습니다.`
@@ -556,6 +648,9 @@ function renderToolApproval(item) {
   button.textContent = pending.approved
     ? "정확한 변경 승인됨"
     : "위 내용을 확인하고 변경 승인";
+  const denyButton = document.querySelector("#tool-deny-button");
+  denyButton.disabled = pending.approved || state.busy;
+  denyButton.hidden = pending.approved;
 }
 
 function renderReviewFeedback(item) {
@@ -598,7 +693,7 @@ function renderInspector() {
   document.querySelector("#inspector-summary").textContent =
     reviewSummary(item);
   const reviewSource = document.querySelector("#task-instructions-block");
-  const isReview = Boolean(activePendingTool(item) || state.artifact);
+  const isReview = Boolean(state.decisionPacket);
   reviewSource.hidden = !isReview;
   document.querySelector("#task-instructions").textContent = item.summary;
   document.querySelector("#inspector-status").innerHTML = statusPill(item);
@@ -629,18 +724,98 @@ function renderInspector() {
   content.hidden = false;
 }
 
-async function selectWork(id, focusInspector = true) {
+function reviewIsActive() {
+  const action = actionFor(state.selectedId);
+  return (
+    document.visibilityState === "visible" &&
+    document.hasFocus() &&
+    inspector.classList.contains("open") &&
+    state.reviewSession?.workItemId === state.selectedId &&
+    action?.actor === "human" &&
+    action.actionable
+  );
+}
+
+function flushReviewClock() {
+  const session = state.reviewSession;
+  if (!session?.activeStartedAt) return;
+  session.activeMs += Math.max(0, performance.now() - session.activeStartedAt);
+  session.activeStartedAt = null;
+}
+
+function syncReviewClock() {
+  flushReviewClock();
+  if (state.reviewSession && reviewIsActive()) {
+    state.reviewSession.activeStartedAt = performance.now();
+  }
+}
+
+function beginReviewSession(id) {
+  const action = actionFor(id);
+  if (action?.actor !== "human" || !action.actionable) {
+    flushReviewClock();
+    state.reviewSession = null;
+    return;
+  }
+  if (state.reviewSession?.workItemId === id) {
+    syncReviewClock();
+    return;
+  }
+  flushReviewClock();
+  state.reviewSession = {
+    workItemId: id,
+    activeMs: 0,
+    activeStartedAt: reviewIsActive() ? performance.now() : null,
+    detailsOpenCount: 0,
+  };
+}
+
+function reviewMetrics() {
+  flushReviewClock();
+  const session = state.reviewSession;
+  const metrics =
+    session?.workItemId === state.selectedId
+      ? {
+          activeReviewMs: Math.round(session.activeMs),
+          detailsOpenCount: session.detailsOpenCount,
+        }
+      : {};
+  syncReviewClock();
+  return metrics;
+}
+
+async function selectWork(
+  id,
+  focusInspector = true,
+  preserveDetails = false,
+  preserveInspectorState = false,
+) {
+  const selectionVersion = ++state.selectionVersion;
+  const inspectorWasOpen = inspector.classList.contains("open");
   const source = document.activeElement?.closest?.("[data-select-id]");
   const sourceSelector = source?.classList.contains("mobile-card")
     ? `.mobile-card[data-select-id="${CSS.escape(id)}"]`
     : `.work-title[data-select-id="${CSS.escape(id)}"]`;
+  flushReviewClock();
   state.selectedId = id;
+  const action = actionFor(id);
+  if (
+    !id ||
+    action?.actor !== "human" ||
+    !action.actionable ||
+    state.reviewSession?.workItemId !== id
+  ) {
+    state.reviewSession = null;
+  }
   state.artifact = null;
   state.toolEvidence = null;
+  state.decisionPacket = null;
   state.reviewDecision = null;
-  document.querySelectorAll(".technical-details").forEach((details) => {
-    details.open = false;
-  });
+  if (!preserveDetails) {
+    document.querySelectorAll(".technical-details").forEach((details) => {
+      details.open = false;
+    });
+  }
   if (!id) {
     renderWork();
     renderInspector();
@@ -650,23 +825,36 @@ async function selectWork(id, focusInspector = true) {
   const requests = [
     api(`/api/work-items/${encodeURIComponent(id)}/tool-evidence`)
       .then((result) => {
+        if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
         state.toolEvidence = result;
       })
       .catch((error) => {
+        if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
         toast(
           error instanceof Error
             ? error.message
             : "도구 증거를 읽지 못했습니다.",
         );
       }),
+    api(`/api/work-items/${encodeURIComponent(id)}/decision-packet`)
+      .then((result) => {
+        if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
+        state.decisionPacket = result;
+      })
+      .catch(() => {
+        if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
+        state.decisionPacket = null;
+      }),
   ];
   if (item?.status === "review_pending") {
     requests.push(
       api(`/api/work-items/${encodeURIComponent(id)}/artifact`)
         .then((result) => {
+          if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
           state.artifact = result;
         })
         .catch((error) => {
+          if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
           toast(
             error instanceof Error
               ? error.message
@@ -679,9 +867,11 @@ async function selectWork(id, focusInspector = true) {
     requests.push(
       api(`/api/work-items/${encodeURIComponent(id)}/review-decision`)
         .then((result) => {
+          if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
           state.reviewDecision = result;
         })
         .catch((error) => {
+          if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
           toast(
             error instanceof Error
               ? error.message
@@ -691,31 +881,80 @@ async function selectWork(id, focusInspector = true) {
     );
   }
   await Promise.all(requests);
+  if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
   renderWork();
   state.inspectorReturnFocus = document.querySelector(sourceSelector);
   renderInspector();
-  inspector.classList.add("open");
+  if (!preserveInspectorState || inspectorWasOpen) {
+    inspector.classList.add("open");
+  }
   syncInspectorAccessibility();
+  beginReviewSession(id);
   if (focusInspector) {
     document.querySelector("#inspector-heading").focus();
   }
 }
 
-async function loadDashboard() {
-  state.projection = await api("/api/dashboard");
-  if (
-    !state.selectedId ||
-    !state.projection.workItems.some(({ id }) => id === state.selectedId)
-  ) {
-    state.selectedId =
-      state.projection.userActions.find(({ actionable }) => actionable)
-        ?.workItemId ??
-      state.projection.workItems[0]?.id ??
-      null;
+async function loadDashboard({ skipIfInFlight = false } = {}) {
+  if (skipIfInFlight && dashboardLoadInFlight) return false;
+
+  const epoch = ++dashboardLoadEpoch;
+  const operation = (async () => {
+    let projection;
+    try {
+      projection = await api("/api/dashboard");
+    } catch (error) {
+      if (epoch !== dashboardLoadEpoch) return false;
+      throw error;
+    }
+
+    const primaryId =
+      projection.attention?.primaryDecision?.workItemId ?? null;
+    const primaryVersion = projection.workItems.find(
+      ({ id }) => id === primaryId,
+    )?.version;
+    let primaryDecisionPacket = null;
+    if (primaryId) {
+      await api(`/api/work-items/${encodeURIComponent(primaryId)}/decision-packet`)
+        .then((result) => {
+          if (
+            result?.workItemId === primaryId &&
+            result.binding?.workItemVersion === primaryVersion
+          ) {
+            primaryDecisionPacket = result;
+          }
+        })
+        .catch(() => {});
+    }
+    if (epoch !== dashboardLoadEpoch) return false;
+
+    state.projection = projection;
+    state.primaryDecisionPacket = primaryDecisionPacket;
+    if (
+      !state.selectedId ||
+      !projection.workItems.some(({ id }) => id === state.selectedId)
+    ) {
+      state.selectedId =
+        state.filter === "human"
+          ? primaryId
+          : filteredItems()[0]?.id ?? null;
+    }
+    syncReviewClock();
+    renderSummary();
+    renderDecisionFocus();
+    renderWork();
+    renderInspector();
+    return true;
+  })();
+
+  dashboardLoadInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (dashboardLoadInFlight === operation) {
+      dashboardLoadInFlight = null;
+    }
   }
-  renderSummary();
-  renderWork();
-  renderInspector();
 }
 
 async function loadRuntime() {
@@ -742,22 +981,19 @@ function toast(message) {
 
 async function mutateSelected(action) {
   if (!state.selectedId || state.busy) return;
+  const body = {};
+  if (action === "retry") {
+    const acknowledged = window.confirm(
+      "재시도 전에 작업공간을 확인했나요? 이전 실행의 도구 결과가 불명확한 경우, 재시도하면 변경이 중복될 수 있습니다.",
+    );
+    if (!acknowledged) return;
+    body.acknowledgeUnknownToolOutcome = true;
+  }
   state.busy = true;
   renderInspector();
   try {
     let path =
       `/api/work-items/${encodeURIComponent(state.selectedId)}/${action}`;
-    let body = {};
-    if (["approve", "changes_requested", "reject"].includes(action)) {
-      path =
-        `/api/work-items/${encodeURIComponent(state.selectedId)}/decision`;
-      if (!state.artifact) throw new Error("검토할 산출물이 없습니다.");
-      body = {
-        decision: action,
-        artifactHash: state.artifact.sha256,
-        note: "로컬 대시보드에서 정확한 해시를 확인하고 결정했습니다.",
-      };
-    }
     await api(path, { method: "POST", body: JSON.stringify(body) });
     const messages = {
       retry: "작업을 다시 실행할 수 있도록 준비했습니다.",
@@ -767,7 +1003,7 @@ async function mutateSelected(action) {
     };
     toast(messages[action] ?? "작업 상태를 업데이트했습니다.");
     await loadDashboard();
-    if (state.selectedId) await selectWork(state.selectedId, false);
+    if (state.selectedId) await selectWork(state.selectedId, false, true);
   } catch (error) {
     toast(
       error instanceof Error
@@ -781,6 +1017,143 @@ async function mutateSelected(action) {
   }
 }
 
+function openDecisionDialog(action) {
+  if (!state.artifact || state.decisionPacket?.kind !== "artifact_review") {
+    toast("현재 결정 패킷과 산출물을 먼저 불러와야 합니다.");
+    return;
+  }
+  state.pendingDecision = action;
+  const labels = {
+    approve: [
+      "산출물 승인하고 완료",
+      "표시된 결과·근거 강도·위험과 정확한 패킷 해시를 검토했다는 결정이 기록됩니다.",
+    ],
+    changes_requested: [
+      "수정 요청",
+      "입력한 사유가 정확한 이전 산출물 해시와 함께 다음 실행팀에 전달됩니다.",
+    ],
+    reject: [
+      "산출물 거절",
+      "작업을 종료하되 산출물·근거·결정 기록은 감사 이력으로 보존됩니다.",
+    ],
+  };
+  const [title, copy] = labels[action];
+  document.querySelector("#decision-dialog-heading").textContent = title;
+  document.querySelector("#decision-dialog-copy").textContent = copy;
+  document.querySelector("#decision-submit-button").textContent = title;
+  document.querySelector("#decision-note-requirement").textContent =
+    action === "approve" ? "(선택)" : "(필수)";
+  document.querySelector("#decision-note").value = "";
+  document.querySelector("#decision-form-error").textContent = "";
+  document.querySelector("#decision-dialog").showModal();
+  document.querySelector("#decision-note").focus();
+}
+
+async function submitArtifactDecision(event) {
+  event.preventDefault();
+  if (!state.pendingDecision || !state.selectedId || state.busy) return;
+  const noteElement = document.querySelector("#decision-note");
+  const errorElement = document.querySelector("#decision-form-error");
+  const note = noteElement.value.trim();
+  if (state.pendingDecision !== "approve" && note.length < 12) {
+    errorElement.textContent =
+      "다음 실행자가 바로 행동할 수 있도록 12자 이상의 구체적인 사유를 적어주세요.";
+    noteElement.focus();
+    return;
+  }
+  if (!state.artifact || state.decisionPacket?.kind !== "artifact_review") {
+    errorElement.textContent = "결정 패킷이 바뀌었습니다. 화면을 새로 불러오세요.";
+    return;
+  }
+  state.busy = true;
+  const decision = state.pendingDecision;
+  try {
+    await api(`/api/work-items/${encodeURIComponent(state.selectedId)}/decision`, {
+      method: "POST",
+      body: JSON.stringify({
+        decision,
+        artifactHash: state.artifact.sha256,
+        packetHash: state.decisionPacket.binding.packetHash,
+        note:
+          note ||
+          "결과 요약, 근거의 출처와 강도, 위험, 정확한 산출물 및 결정 패킷 해시를 검토했습니다.",
+        completeOnApprove: decision === "approve",
+        ...reviewMetrics(),
+      }),
+    });
+    document.querySelector("#decision-dialog").close();
+    state.reviewSession = null;
+    state.selectedId = null;
+    await loadDashboard();
+    if (state.selectedId) await selectWork(state.selectedId, false);
+    toast(
+      decision === "approve"
+        ? "산출물을 승인하고 작업을 완료했습니다."
+        : decision === "changes_requested"
+          ? "구체적인 사유와 함께 수정 요청을 전달했습니다."
+          : "산출물을 거절하고 기록을 보존했습니다.",
+    );
+  } catch (error) {
+    errorElement.textContent =
+      error instanceof Error ? error.message : "결정을 기록하지 못했습니다.";
+    await loadDashboard().catch(() => {});
+  } finally {
+    state.busy = false;
+    renderInspector();
+  }
+}
+
+function openUserInputDialog() {
+  if (state.decisionPacket?.kind !== "user_input") {
+    toast("현재 사용자 입력 패킷을 먼저 불러와야 합니다.");
+    return;
+  }
+  document.querySelector("#input-dialog-question").textContent =
+    state.decisionPacket.question;
+  document.querySelector("#input-response").value = "";
+  document.querySelector("#input-form-error").textContent = "";
+  document.querySelector("#input-dialog").showModal();
+  document.querySelector("#input-response").focus();
+}
+
+async function submitUserInput(event) {
+  event.preventDefault();
+  if (!state.selectedId || state.busy) return;
+  const response = document.querySelector("#input-response").value.trim();
+  const errorElement = document.querySelector("#input-form-error");
+  if (!response) {
+    errorElement.textContent = "작업을 재개할 수 있도록 응답을 입력하세요.";
+    return;
+  }
+  if (state.decisionPacket?.kind !== "user_input") {
+    errorElement.textContent = "입력 요청 패킷이 바뀌었습니다. 다시 불러오세요.";
+    return;
+  }
+  state.busy = true;
+  try {
+    await api(`/api/work-items/${encodeURIComponent(state.selectedId)}/provide-input`, {
+      method: "POST",
+      body: JSON.stringify({
+        response,
+        packetHash: state.decisionPacket.binding.packetHash,
+        ...reviewMetrics(),
+      }),
+    });
+    document.querySelector("#input-dialog").close();
+    state.reviewSession = null;
+    state.selectedId = null;
+    await loadDashboard();
+    if (state.selectedId) await selectWork(state.selectedId, false);
+    toast("입력을 정확한 요청 패킷에 결박해 전달했습니다.");
+  } catch (error) {
+    errorElement.textContent =
+      error instanceof Error ? error.message : "입력을 전달하지 못했습니다.";
+  } finally {
+    state.busy = false;
+    renderInspector();
+  }
+}
+
 async function approvePendingTool() {
   if (!state.selectedId || state.busy) return;
   const item = state.projection?.workItems.find(
@@ -788,6 +1161,13 @@ async function approvePendingTool() {
   );
   const pending = activePendingTool(item);
   if (!pending || pending.approved) return;
+  if (
+    state.decisionPacket?.kind !== "tool_execution" ||
+    state.decisionPacket.subject?.callHash !== pending.callHash
+  ) {
+    toast("도구 결정 패킷이 바뀌었습니다. 작업을 다시 선택하세요.");
+    return;
+  }
   state.busy = true;
   renderToolApproval(item);
   try {
@@ -798,20 +1178,72 @@ async function approvePendingTool() {
         body: JSON.stringify({
           callHash: pending.callHash,
           toolName: pending.toolName,
+          packetHash: state.decisionPacket?.binding?.packetHash ?? "",
           note: "로컬 대시보드 코드 미리보기에서 정확한 변경을 검토했습니다.",
+          ...reviewMetrics(),
         }),
       },
     );
-    state.toolEvidence = await api(
-      `/api/work-items/${encodeURIComponent(state.selectedId)}/tool-evidence`,
-    );
+    state.reviewSession = null;
+    state.selectedId = null;
     await loadDashboard();
+    if (state.selectedId) await selectWork(state.selectedId, false);
     toast("정확한 도구 변경을 승인했습니다.");
   } catch (error) {
     toast(
       error instanceof Error
         ? error.message
         : "도구 변경을 승인하지 못했습니다.",
+    );
+  } finally {
+    state.busy = false;
+    renderInspector();
+  }
+}
+
+async function denyPendingTool() {
+  if (!state.selectedId || state.busy) return;
+  const item = state.projection?.workItems.find(
+    ({ id }) => id === state.selectedId,
+  );
+  const pending = activePendingTool(item);
+  if (!pending || pending.approved) return;
+  if (
+    state.decisionPacket?.kind !== "tool_execution" ||
+    state.decisionPacket.subject?.callHash !== pending.callHash
+  ) {
+    toast("도구 결정 패킷이 바뀌었습니다. 작업을 다시 선택하세요.");
+    return;
+  }
+  if (!window.confirm("이 도구 호출을 거부하고 현재 작업을 종료할까요? 실행은 일어나지 않습니다.")) {
+    return;
+  }
+  state.busy = true;
+  renderToolApproval(item);
+  try {
+    await api(
+      `/api/work-items/${encodeURIComponent(state.selectedId)}/deny-tool`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          callHash: pending.callHash,
+          toolName: pending.toolName,
+          packetHash: state.decisionPacket.binding.packetHash,
+          note: "사람이 로컬 대시보드에서 정확한 도구 호출을 거부했습니다.",
+          ...reviewMetrics(),
+        }),
+      },
+    );
+    state.reviewSession = null;
+    state.selectedId = null;
+    await loadDashboard();
+    if (state.selectedId) await selectWork(state.selectedId, false);
+    toast("도구 호출을 거부했고 작업을 안전하게 종료했습니다.");
+  } catch (error) {
+    toast(
+      error instanceof Error
+        ? error.message
+        : "도구 호출을 거부하지 못했습니다.",
     );
   } finally {
     state.busy = false;
@@ -833,9 +1265,21 @@ document.addEventListener("click", (event) => {
     void setFilter(filterNavigation.dataset.filterNav, true);
   }
   const action = event.target.closest("[data-action]");
-  if (action) void mutateSelected(action.dataset.action);
+  if (action) {
+    if (["approve", "changes_requested", "reject"].includes(action.dataset.action)) {
+      openDecisionDialog(action.dataset.action);
+    } else {
+      void mutateSelected(action.dataset.action);
+    }
+  }
   if (event.target.closest("[data-tool-approve]")) {
     void approvePendingTool();
+  }
+  if (event.target.closest("[data-tool-deny]")) {
+    void denyPendingTool();
+  }
+  if (event.target.closest("[data-user-input]")) {
+    openUserInputDialog();
   }
 });
 
@@ -857,7 +1301,24 @@ dialog.addEventListener("keydown", (event) => {
   }
 });
 
+const decisionDialog = document.querySelector("#decision-dialog");
+for (const id of ["#decision-dialog-close", "#decision-dialog-cancel"]) {
+  document.querySelector(id).addEventListener("click", () => decisionDialog.close());
+}
+document
+  .querySelector("#decision-form")
+  .addEventListener("submit", submitArtifactDecision);
+decisionDialog.addEventListener("close", () => {
+  state.pendingDecision = null;
+});
+const inputDialog = document.querySelector("#input-dialog");
+for (const id of ["#input-dialog-close", "#input-dialog-cancel"]) {
+  document.querySelector(id).addEventListener("click", () => inputDialog.close());
+}
+document.querySelector("#input-form").addEventListener("submit", submitUserInput);
+
 function closeInspector() {
+  flushReviewClock();
   inspector.classList.remove("open");
   syncInspectorAccessibility();
   if (state.inspectorReturnFocus?.isConnected) {
@@ -874,6 +1335,24 @@ inspector.addEventListener("keydown", (event) => {
     closeInspector();
   }
 });
+
+window.addEventListener("focus", syncReviewClock);
+window.addEventListener("blur", flushReviewClock);
+document.addEventListener("visibilitychange", syncReviewClock);
+document.addEventListener(
+  "toggle",
+  (event) => {
+    if (
+      event.target instanceof HTMLDetailsElement &&
+      event.target.open &&
+      event.target.closest("#inspector") &&
+      state.reviewSession?.workItemId === state.selectedId
+    ) {
+      state.reviewSession.detailsOpenCount += 1;
+    }
+  },
+  true,
+);
 
 document
   .querySelector("#request-form")
@@ -914,3 +1393,28 @@ Promise.all([loadDashboard(), loadRuntime()])
     document.querySelector("#work-table-body").innerHTML =
       `<tr><td class="loading-cell" colspan="5">${escapeHtml(error.message)}</td></tr>`;
   });
+
+window.setInterval(async () => {
+  if (state.busy || document.visibilityState !== "visible") return;
+  if (dialog.open || decisionDialog.open || inputDialog.open) return;
+  if (dashboardLoadInFlight) return;
+  const previousPrimary =
+    state.projection?.attention?.primaryDecision?.workItemId ?? null;
+  const selectedWasPrimary =
+    Boolean(previousPrimary) && state.selectedId === previousPrimary;
+  try {
+    const loaded = await loadDashboard({ skipIfInFlight: true });
+    if (!loaded) return;
+    const nextPrimary =
+      state.projection?.attention?.primaryDecision?.workItemId ?? null;
+    if (selectedWasPrimary && nextPrimary !== previousPrimary) {
+      await selectWork(nextPrimary, false, true, true);
+      return;
+    }
+    if (state.selectedId) {
+      await selectWork(state.selectedId, false, true, true);
+    }
+  } catch {
+    // The visible UI keeps its last known safe projection; the next poll retries.
+  }
+}, 5_000);

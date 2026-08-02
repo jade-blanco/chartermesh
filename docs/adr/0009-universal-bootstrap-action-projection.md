@@ -3,6 +3,10 @@
 - Status: accepted
 - Date: 2026-07-29
 
+The action projection is refined by ADR 0020. Human decisions and role actions
+are now separate queues, and exact decisions are bound to a server-generated
+Decision Packet in addition to the artifact or tool-call hash.
+
 ## Context
 
 The product must be applicable when a user gives any capable coding agent the

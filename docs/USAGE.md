@@ -78,11 +78,22 @@ canonical call hash. A human can approve that exact call, which returns the
 WorkItem to ready, then start a new fenced run:
 
 ```powershell
+node bin/chartermesh.mjs decision-packet --id work-000001 --target TARGET --json
 node bin/chartermesh.mjs approve-tool `
   --id work-000001 `
   --call-hash CALL_SHA256 `
   --tool workspace.write_file `
+  --packet-hash PACKET_SHA256 `
   --note "Exact path and content hash reviewed." `
+  --target TARGET
+
+# Reject the exact call without executing it and cancel the WorkItem.
+node bin/chartermesh.mjs deny-tool `
+  --id work-000001 `
+  --call-hash CALL_SHA256 `
+  --tool workspace.write_file `
+  --packet-hash PACKET_SHA256 `
+  --note "This exact change is not allowed." `
   --target TARGET
 
 node bin/chartermesh.mjs run --id work-000001 --target TARGET
@@ -97,6 +108,10 @@ node bin/chartermesh.mjs run --id work-000001 --target TARGET
 ```
 
 Each retry creates a new generation. Old workers cannot submit into it.
+If a tool returned but its evidence commit failed, CharterMesh records an
+unknown outcome and refuses an ordinary retry. Inspect the workspace first,
+then use `--acknowledge-tool-outcome` to make the human acknowledgement
+explicit. The dashboard asks for the same confirmation before retrying.
 
 ## Exact review
 
@@ -139,6 +154,13 @@ Wait types are `predecessor`, `not_before`, `user_input`, `manual_resume`, and
 ```powershell
 node bin/chartermesh.mjs resume --id work-000001 --target TARGET
 ```
+
+Do not put passwords, API keys, tokens, certificates, or other secrets in a
+user-input response. The value passed to `provide-input --response` can remain
+visible in shell history or process-argument listings. For sensitive but
+non-secret responses, prefer the local dashboard input form; secrets belong in
+environment variables or a dedicated secret-management channel, not in either
+input path.
 
 ## Dashboard
 

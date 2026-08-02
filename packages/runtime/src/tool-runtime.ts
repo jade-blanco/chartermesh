@@ -41,6 +41,21 @@ export interface ToolExecutionEvidence {
   createdAt: string;
 }
 
+export interface ToolEvidenceIntent {
+  callHash: string;
+  toolName: string;
+  inputHash: string;
+}
+
+export interface ToolEvidencePreparation {
+  id: string;
+  token: string;
+}
+
+export interface ToolEvidenceReceipt extends ToolEvidencePreparation {
+  runtimeProof: string;
+}
+
 export interface ToolExecutionContext {
   workspaceRoot: string;
   signal?: AbortSignal;
@@ -61,8 +76,12 @@ export interface ToolRuntimeOptions {
   policy: ToolPolicy;
   tools: RuntimeTool[];
   isApproved?: (callHash: string, toolName: string) => boolean;
+  prepareEvidence?: (
+    intent: ToolEvidenceIntent,
+  ) => ToolEvidencePreparation | Promise<ToolEvidencePreparation>;
   onEvidence?: (
     evidence: ToolExecutionEvidence,
+    receipt?: ToolEvidenceReceipt,
   ) => void | Promise<void>;
 }
 
@@ -107,6 +126,22 @@ export class ToolIterationLimitError extends Error {
   }
 }
 
+export class ToolEvidenceCommitError extends Error {
+  readonly code = "TOOL_OUTCOME_UNKNOWN";
+  readonly callHash: string;
+  readonly toolName: string;
+
+  constructor(callHash: string, toolName: string, cause: unknown) {
+    super(
+      `TOOL_OUTCOME_UNKNOWN: '${toolName}' returned, but its execution evidence could not be committed.`,
+      { cause },
+    );
+    this.name = "ToolEvidenceCommitError";
+    this.callHash = callHash;
+    this.toolName = toolName;
+  }
+}
+
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value && typeof value === "object") {
@@ -125,6 +160,35 @@ function digest(value: unknown): string {
       ? value
       : JSON.stringify(stableValue(value));
   return createHash("sha256").update(content).digest("hex");
+}
+
+const runtimeReceiptProofs = new WeakMap<ToolEvidenceReceipt, string>();
+
+function createRuntimeReceipt(
+  workItemId: string,
+  evidence: ToolExecutionEvidence,
+  preparation: ToolEvidencePreparation,
+): ToolEvidenceReceipt {
+  const receipt = Object.freeze({
+    ...preparation,
+    runtimeProof: randomUUID(),
+  });
+  runtimeReceiptProofs.set(
+    receipt,
+    digest({ workItemId, evidence, receipt }),
+  );
+  return receipt;
+}
+
+export function verifyToolRuntimeReceipt(
+  workItemId: string,
+  evidence: ToolExecutionEvidence,
+  receipt: ToolEvidenceReceipt,
+): boolean {
+  return (
+    runtimeReceiptProofs.get(receipt) ===
+    digest({ workItemId, evidence, receipt })
+  );
 }
 
 function declaredPaths(value: unknown): string[] {
@@ -603,53 +667,86 @@ export function createWorkspaceTools(
   ];
 }
 
+function snapshotToolPolicy(input: ToolPolicy): ToolPolicy {
+  const policy: ToolPolicy = {
+    ...input,
+    allow: [...input.allow],
+    ...(input.approvalRequired
+      ? { approvalRequired: [...input.approvalRequired] }
+      : {}),
+    ...(input.workspaceRoots
+      ? { workspaceRoots: [...input.workspaceRoots] }
+      : {}),
+  };
+  Object.freeze(policy.allow);
+  if (policy.approvalRequired) Object.freeze(policy.approvalRequired);
+  if (policy.workspaceRoots) Object.freeze(policy.workspaceRoots);
+  return Object.freeze(policy);
+}
+
 export class ToolRuntime {
-  private readonly workspaceRoot: string;
-  private readonly workItemId: string;
-  private readonly policy: ToolPolicy;
-  private readonly tools: Map<string, RuntimeTool>;
-  private readonly isApproved: (callHash: string, toolName: string) => boolean;
-  private readonly onEvidence?: ToolRuntimeOptions["onEvidence"];
+  readonly #workspaceRoot: string;
+  readonly #workItemId: string;
+  readonly #policy: ToolPolicy;
+  readonly #tools: Map<string, RuntimeTool>;
+  readonly #isApproved: (callHash: string, toolName: string) => boolean;
+  readonly #prepareEvidence?: ToolRuntimeOptions["prepareEvidence"];
+  readonly #onEvidence?: ToolRuntimeOptions["onEvidence"];
 
   constructor(options: ToolRuntimeOptions) {
-    this.workspaceRoot = realpathSync(options.workspaceRoot);
-    this.workItemId = options.workItemId;
-    this.policy = options.policy;
-    this.tools = new Map(
+    this.#workspaceRoot = realpathSync(options.workspaceRoot);
+    this.#workItemId = options.workItemId;
+    this.#policy = snapshotToolPolicy(options.policy);
+    this.#tools = new Map(
       options.tools.map((tool) => [tool.modelTool.name, tool]),
     );
-    this.isApproved = options.isApproved ?? (() => false);
-    this.onEvidence = options.onEvidence;
-    const maximum = this.policy.maxIterations ?? 4;
+    this.#isApproved = options.isApproved ?? (() => false);
+    this.#prepareEvidence = options.prepareEvidence;
+    this.#onEvidence = options.onEvidence;
+    const maximum = this.#policy.maxIterations ?? 4;
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 12) {
       throw new Error("Tool maxIterations must be an integer from 1 through 12.");
     }
-    for (const name of this.policy.approvalRequired ?? []) {
-      if (!this.policy.allow.includes(name)) {
+    for (const name of this.#policy.approvalRequired ?? []) {
+      if (!this.#policy.allow.includes(name)) {
         throw new Error(
           `Approval-required tool '${name}' is not in the OrgSpec allowlist.`,
         );
       }
     }
-    canonicalAllowedRoots(this.workspaceRoot, this.policy);
+    canonicalAllowedRoots(this.#workspaceRoot, this.#policy);
   }
 
   modelTools(): ModelTool[] {
-    return this.policy.allow.flatMap((name) => {
-      const tool = this.tools.get(name);
+    return this.#policy.allow.flatMap((name) => {
+      const tool = this.#tools.get(name);
       return tool ? [tool.modelTool] : [];
     });
   }
 
-  private async record(
+  async #record(
     evidence: ToolExecutionEvidence,
     collection: ToolExecutionEvidence[],
+    preparation?: ToolEvidencePreparation,
   ): Promise<void> {
     collection.push(evidence);
-    await this.onEvidence?.(evidence);
+    const receipt = preparation
+      ? createRuntimeReceipt(this.#workItemId, evidence, preparation)
+      : undefined;
+    await this.#onEvidence?.(evidence, receipt);
   }
 
-  private evidence(
+  async #prepare(
+    call: ModelToolCall,
+  ): Promise<ToolEvidencePreparation | undefined> {
+    return this.#prepareEvidence?.({
+      callHash: toolCallHash(this.#workItemId, call),
+      toolName: call.name,
+      inputHash: digest(call.arguments),
+    });
+  }
+
+  #evidence(
     call: ModelToolCall,
     status: ToolExecutionStatus,
     started: number,
@@ -658,7 +755,7 @@ export class ToolRuntime {
   ): ToolExecutionEvidence {
     return {
       id: `tool-evidence-${randomUUID()}`,
-      callHash: toolCallHash(this.workItemId, call),
+      callHash: toolCallHash(this.#workItemId, call),
       toolName: call.name,
       status,
       inputHash: digest(call.arguments),
@@ -675,16 +772,17 @@ export class ToolRuntime {
   ): Promise<ApprovedToolCallResult> {
     const evidence: ToolExecutionEvidence[] = [];
     const started = Date.now();
-    const callHash = toolCallHash(this.workItemId, call);
-    const tool = this.tools.get(call.name);
-    if (!tool || !this.policy.allow.includes(call.name)) {
+    const callHash = toolCallHash(this.#workItemId, call);
+    const receipt = await this.#prepare(call);
+    const tool = this.#tools.get(call.name);
+    if (!tool || !this.#policy.allow.includes(call.name)) {
       const output = JSON.stringify({
         ok: false,
         code: "TOOL_DENIED",
         message: `Tool '${call.name}' is not allowed by OrgSpec.`,
       });
-      await this.record(
-        this.evidence(
+      await this.#record(
+        this.#evidence(
           call,
           "denied",
           started,
@@ -692,6 +790,7 @@ export class ToolRuntime {
           declaredPaths(call.arguments),
         ),
         evidence,
+        receipt,
       );
       throw new Error(`TOOL_DENIED: '${call.name}' is not allowed by OrgSpec.`);
     }
@@ -702,8 +801,8 @@ export class ToolRuntime {
         code: "TOOL_ARGUMENTS_INVALID",
         message: malformed,
       });
-      await this.record(
-        this.evidence(
+      await this.#record(
+        this.#evidence(
           call,
           "failed",
           started,
@@ -711,15 +810,16 @@ export class ToolRuntime {
           declaredPaths(call.arguments),
         ),
         evidence,
+        receipt,
       );
       throw new Error(`TOOL_ARGUMENTS_INVALID: ${malformed}`);
     }
     const approvalRequired =
       tool.permission !== "read_only" ||
-      (this.policy.approvalRequired ?? []).includes(call.name);
-    if (approvalRequired && !this.isApproved(callHash, call.name)) {
-      await this.record(
-        this.evidence(
+      (this.#policy.approvalRequired ?? []).includes(call.name);
+    if (approvalRequired && !this.#isApproved(callHash, call.name)) {
+      await this.#record(
+        this.#evidence(
           call,
           "approval_required",
           started,
@@ -727,45 +827,51 @@ export class ToolRuntime {
           declaredPaths(call.arguments),
         ),
         evidence,
+        receipt,
       );
       throw new ToolApprovalRequiredError(callHash, call.name, call);
     }
+    let result: Awaited<ReturnType<RuntimeTool["execute"]>>;
     try {
       options.signal?.throwIfAborted();
-      const result = await tool.execute(call.arguments, {
-        workspaceRoot: this.workspaceRoot,
+      result = await tool.execute(call.arguments, {
+        workspaceRoot: this.#workspaceRoot,
         signal: options.signal,
       });
-      const output = result.output.slice(0, 65_536);
-      const record = this.evidence(
-        call,
-        "succeeded",
-        started,
-        output,
-        result.paths ?? declaredPaths(call.arguments),
-      );
-      await this.record(record, evidence);
-      return { output, evidence: record };
     } catch (error) {
       const output = JSON.stringify({
         ok: false,
         code: "TOOL_EXECUTION_FAILED",
         message: error instanceof Error ? error.message : String(error),
       }).slice(0, 8_000);
-      const record = this.evidence(
+      const record = this.#evidence(
         call,
         "failed",
         started,
         output,
         declaredPaths(call.arguments),
       );
-      await this.record(record, evidence);
+      await this.#record(record, evidence, receipt);
       throw new Error(
         `TOOL_EXECUTION_FAILED: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     }
+    const output = result.output.slice(0, 65_536);
+    const record = this.#evidence(
+      call,
+      "succeeded",
+      started,
+      output,
+      result.paths ?? declaredPaths(call.arguments),
+    );
+    try {
+      await this.#record(record, evidence, receipt);
+    } catch (error) {
+      throw new ToolEvidenceCommitError(callHash, call.name, error);
+    }
+    return { output, evidence: record };
   }
 
   async run(
@@ -775,7 +881,7 @@ export class ToolRuntime {
   ): Promise<ToolLoopResult> {
     const evidence: ToolExecutionEvidence[] = [];
     const messages = [...request.messages];
-    const maximum = this.policy.maxIterations ?? 4;
+    const maximum = this.#policy.maxIterations ?? 4;
     let usage: ModelUsage | undefined;
     for (let iteration = 0; iteration <= maximum; iteration += 1) {
       const inference = await engine.generate(
@@ -807,17 +913,19 @@ export class ToolRuntime {
       });
       for (const call of inference.toolCalls) {
         const started = Date.now();
-        const callHash = toolCallHash(this.workItemId, call);
-        const tool = this.tools.get(call.name);
-        if (!tool || !this.policy.allow.includes(call.name)) {
+        const callHash = toolCallHash(this.#workItemId, call);
+        const receipt = await this.#prepare(call);
+        const tool = this.#tools.get(call.name);
+        if (!tool || !this.#policy.allow.includes(call.name)) {
           const output = JSON.stringify({
             ok: false,
             code: "TOOL_DENIED",
             message: `Tool '${call.name}' is not allowed by OrgSpec.`,
           });
-          await this.record(
-            this.evidence(call, "denied", started, output),
+          await this.#record(
+            this.#evidence(call, "denied", started, output),
             evidence,
+            receipt,
           );
           messages.push({
             role: "tool",
@@ -833,8 +941,8 @@ export class ToolRuntime {
             code: "TOOL_ARGUMENTS_INVALID",
             message: malformed,
           });
-          await this.record(
-            this.evidence(
+          await this.#record(
+            this.#evidence(
               call,
               "failed",
               started,
@@ -842,6 +950,7 @@ export class ToolRuntime {
               declaredPaths(call.arguments),
             ),
             evidence,
+            receipt,
           );
           messages.push({
             role: "tool",
@@ -852,13 +961,13 @@ export class ToolRuntime {
         }
         const approvalRequired =
           tool.permission !== "read_only" ||
-          (this.policy.approvalRequired ?? []).includes(call.name);
+          (this.#policy.approvalRequired ?? []).includes(call.name);
         if (
           approvalRequired &&
-          !this.isApproved(callHash, call.name)
+          !this.#isApproved(callHash, call.name)
         ) {
-          await this.record(
-            this.evidence(
+          await this.#record(
+            this.#evidence(
               call,
               "approval_required",
               started,
@@ -866,30 +975,16 @@ export class ToolRuntime {
               declaredPaths(call.arguments),
             ),
             evidence,
+            receipt,
           );
           throw new ToolApprovalRequiredError(callHash, call.name, call);
         }
+        let result: Awaited<ReturnType<RuntimeTool["execute"]>>;
         try {
           options.signal?.throwIfAborted();
-          const result = await tool.execute(call.arguments, {
-            workspaceRoot: this.workspaceRoot,
+          result = await tool.execute(call.arguments, {
+            workspaceRoot: this.#workspaceRoot,
             signal: options.signal,
-          });
-          const output = result.output.slice(0, 65_536);
-          await this.record(
-            this.evidence(
-              call,
-              "succeeded",
-              started,
-              output,
-              result.paths ?? [],
-            ),
-            evidence,
-          );
-          messages.push({
-            role: "tool",
-            toolCallId: call.id,
-            content: output,
           });
         } catch (error) {
           const output = JSON.stringify({
@@ -897,16 +992,36 @@ export class ToolRuntime {
             code: "TOOL_EXECUTION_FAILED",
             message: error instanceof Error ? error.message : String(error),
           }).slice(0, 8_000);
-          await this.record(
-            this.evidence(call, "failed", started, output),
+          await this.#record(
+            this.#evidence(call, "failed", started, output),
             evidence,
+            receipt,
           );
           messages.push({
             role: "tool",
             toolCallId: call.id,
             content: output,
           });
+          continue;
         }
+        const output = result.output.slice(0, 65_536);
+        const record = this.#evidence(
+          call,
+          "succeeded",
+          started,
+          output,
+          result.paths ?? [],
+        );
+        try {
+          await this.#record(record, evidence, receipt);
+        } catch (error) {
+          throw new ToolEvidenceCommitError(callHash, call.name, error);
+        }
+        messages.push({
+          role: "tool",
+          toolCallId: call.id,
+          content: output,
+        });
       }
     }
     throw new ToolIterationLimitError(maximum);
@@ -919,10 +1034,12 @@ export function createWorkspaceToolRuntime(
   },
 ): ToolRuntime {
   const { additionalTools = [], ...runtimeOptions } = options;
+  const policy = snapshotToolPolicy(options.policy);
   return new ToolRuntime({
     ...runtimeOptions,
+    policy,
     tools: [
-      ...createWorkspaceTools(options.workspaceRoot, options.policy),
+      ...createWorkspaceTools(options.workspaceRoot, policy),
       ...additionalTools,
     ],
   });

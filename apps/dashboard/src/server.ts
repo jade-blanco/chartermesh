@@ -329,6 +329,20 @@ export async function startDashboard(
         );
         return;
       }
+      const decisionPacketMatch = url.pathname.match(
+        /^\/api\/work-items\/([^/]+)\/decision-packet$/u,
+      );
+      if (method === "GET" && decisionPacketMatch) {
+        const packet = controlPlane.decisionPacket(
+          decodeURIComponent(decisionPacketMatch[1]),
+        );
+        if (!packet) {
+          json(response, 404, { error: "No current decision packet exists." });
+          return;
+        }
+        json(response, 200, packet);
+        return;
+      }
       if (method === "POST" && url.pathname === "/api/work-items") {
         const body = await readJson(request);
         const title = typeof body.title === "string" ? body.title : "";
@@ -347,7 +361,7 @@ export async function startDashboard(
         return;
       }
       const actionMatch = url.pathname.match(
-        /^\/api\/work-items\/([^/]+)\/(triage|run|cancel|retry|decision|complete|archive|approve-tool)$/u,
+        /^\/api\/work-items\/([^/]+)\/(triage|run|cancel|retry|decision|complete|archive|approve-tool|deny-tool|provide-input)$/u,
       );
       if (method === "POST" && actionMatch) {
         const id = decodeURIComponent(actionMatch[1]);
@@ -400,6 +414,8 @@ export async function startDashboard(
               id,
               actor: "human:dashboard",
               idempotencyKey,
+              acknowledgeUnknownToolOutcome:
+                body.acknowledgeUnknownToolOutcome === true,
             }),
           );
           return;
@@ -409,6 +425,8 @@ export async function startDashboard(
             typeof body.callHash === "string" ? body.callHash : "";
           const toolName =
             typeof body.toolName === "string" ? body.toolName : "";
+          const packetHash =
+            typeof body.packetHash === "string" ? body.packetHash : "";
           const note =
             typeof body.note === "string"
               ? body.note
@@ -420,9 +438,78 @@ export async function startDashboard(
               id,
               callHash,
               toolName,
+              packetHash,
               note,
               actor: "human:dashboard",
               idempotencyKey,
+              activeReviewMs:
+                typeof body.activeReviewMs === "number"
+                  ? body.activeReviewMs
+                  : undefined,
+              detailsOpenCount:
+                typeof body.detailsOpenCount === "number"
+                  ? body.detailsOpenCount
+                  : undefined,
+            }),
+          );
+          return;
+        }
+        if (action === "deny-tool") {
+          const callHash =
+            typeof body.callHash === "string" ? body.callHash : "";
+          const toolName =
+            typeof body.toolName === "string" ? body.toolName : "";
+          const packetHash =
+            typeof body.packetHash === "string" ? body.packetHash : "";
+          const note =
+            typeof body.note === "string"
+              ? body.note
+              : "Rejected the exact tool call from the local dashboard.";
+          json(
+            response,
+            200,
+            controlPlane.denyToolCall({
+              id,
+              callHash,
+              toolName,
+              packetHash,
+              note,
+              actor: "human:dashboard",
+              idempotencyKey,
+              activeReviewMs:
+                typeof body.activeReviewMs === "number"
+                  ? body.activeReviewMs
+                  : undefined,
+              detailsOpenCount:
+                typeof body.detailsOpenCount === "number"
+                  ? body.detailsOpenCount
+                  : undefined,
+            }),
+          );
+          return;
+        }
+        if (action === "provide-input") {
+          const packetHash =
+            typeof body.packetHash === "string" ? body.packetHash : "";
+          const inputResponse =
+            typeof body.response === "string" ? body.response : "";
+          json(
+            response,
+            200,
+            controlPlane.provideUserInput({
+              id,
+              packetHash,
+              response: inputResponse,
+              actor: "human:dashboard",
+              idempotencyKey,
+              activeReviewMs:
+                typeof body.activeReviewMs === "number"
+                  ? body.activeReviewMs
+                  : undefined,
+              detailsOpenCount:
+                typeof body.detailsOpenCount === "number"
+                  ? body.detailsOpenCount
+                  : undefined,
             }),
           );
           return;
@@ -440,22 +527,32 @@ export async function startDashboard(
           }
           const artifactHash =
             typeof body.artifactHash === "string" ? body.artifactHash : "";
+          const packetHash =
+            typeof body.packetHash === "string" ? body.packetHash : "";
           const note =
             typeof body.note === "string"
               ? body.note
               : "Reviewed from the local dashboard.";
-          json(
-            response,
-            200,
-            controlPlane.decide({
+          const decided = controlPlane.decide({
               id,
               decision,
               artifactHash,
+              packetHash,
               note,
               actor: "human:dashboard",
               idempotencyKey,
-            }),
-          );
+              activeReviewMs:
+                typeof body.activeReviewMs === "number"
+                  ? body.activeReviewMs
+                  : undefined,
+              detailsOpenCount:
+                typeof body.detailsOpenCount === "number"
+                  ? body.detailsOpenCount
+                  : undefined,
+              completeOnApprove:
+                decision === "approve" && body.completeOnApprove === true,
+            });
+          json(response, 200, decided);
           return;
         }
         if (action === "complete") {

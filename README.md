@@ -4,6 +4,10 @@ CharterMesh is a local-first, provider-neutral control plane that turns a
 request into assigned work, model-assisted artifacts, exact human review, and
 an auditable completion record.
 
+Its primary job is not to claim an autonomous AI company. It compresses the
+work of many models, agents, and tools into one hash-bound decision a human can
+understand, verify, approve, revise, or reject.
+
 Give this repository URL to Codex, Claude Code, Gemini CLI, or another capable
 coding agent and say:
 
@@ -47,7 +51,8 @@ through the core OrgSpec schema.
 - User-owned unknown-cost policy, optional token-price estimation, and
   per-artifact/work-item byte limits
 - Policy-gated tool execution with path containment, exact-call approval,
-  hash-only evidence, and bounded iterations
+  one-use Control Plane/runtime receipts, hash-only evidence, and bounded
+  iterations
 - Structured artifacts with one bounded repair turn and cancellation
 - Fake, generic OpenAI-compatible, and shell-free, executable-hash-pinned
   command-process engines with dedicated working directories
@@ -61,7 +66,8 @@ through the core OrgSpec schema.
 - Human-controlled pause/resume for new run starts and bounded,
   no-redirect HTTP model responses
 - Versioned `--json` CLI output for coding agents and automation
-- Dashboard request, triage, run, artifact review, retry, approval, and complete
+- Decision Desk with one primary human decision, separate agent/wait/history
+  queues, claimed-vs-verified evidence, exact tool rejection, and input requests
 - Synthetic local-model evaluation for comparing small models
 - Buildable dependency-free npm package and clean-install verification
 - Four bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan
@@ -338,6 +344,11 @@ node bin/chartermesh.mjs complete --id work-000001 --target TARGET
 Add `--json` to agent-facing commands for the
 `chartermesh.dev/cli/v1alpha1` envelope.
 
+Never pass secrets through `provide-input --response`: command-line values can
+remain in shell history or process-argument listings. Prefer the local
+dashboard form for sensitive but non-secret responses, and use environment
+variables or a dedicated secret manager for credentials and tokens.
+
 Active runs can be canceled from another CLI or from the dashboard. Ctrl+C
 uses the same durable Control Plane cancellation command:
 
@@ -364,13 +375,18 @@ If a model requests `workspace.write_file`, CharterMesh does not execute it
 until a human approves the exact call hash:
 
 ```powershell
-node bin/chartermesh.mjs approve-tool --id work-000001 --call-hash CALL_SHA256 --tool workspace.write_file --target TARGET
+node bin/chartermesh.mjs decision-packet --id work-000001 --target TARGET --json
+node bin/chartermesh.mjs approve-tool --id work-000001 --call-hash CALL_SHA256 --tool workspace.write_file --packet-hash PACKET_SHA256 --target TARGET
+# Or reject without executing it:
+node bin/chartermesh.mjs deny-tool --id work-000001 --call-hash CALL_SHA256 --tool workspace.write_file --packet-hash PACKET_SHA256 --target TARGET
 node bin/chartermesh.mjs run --id work-000001 --target TARGET
 node bin/chartermesh.mjs tool-evidence --id work-000001 --target TARGET --json
 ```
 
 The unapproved call waits without changing the WorkItem to failed. Exact human
 approval returns it to ready, and the next `run` uses a new fenced generation.
+Exact human rejection cancels the WorkItem without executing the call and
+preserves the decision evidence.
 
 ## Local files added to a target
 
