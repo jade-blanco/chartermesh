@@ -216,6 +216,141 @@ test("C-level dispatch dynamically invokes the selected role engine and receives
   assert.deepEqual(parseStructuredArtifact(output.inference.text), artifact);
 });
 
+test("caller-owned final artifacts are typed objects with declared-role schemas", async () => {
+  const candidate = {
+    apiVersion: "example.dev/candidate/v1",
+    taskId: "launch-1",
+    artifact: { kind: "research", conclusion: "Proceed carefully." },
+  };
+  let cLevelCalls = 0;
+  const engine = scriptedEngine("typed-team", async (inferenceRequest) => {
+    const system = inferenceRequest.messages.find(
+      ({ role }) => role === "system",
+    )?.content;
+    if (system?.includes("You are worker role")) {
+      return result(inferenceRequest, "The public contract was checked.");
+    }
+    cLevelCalls += 1;
+    if (cLevelCalls === 1) {
+      const schema = inferenceRequest.responseSchema as {
+        properties?: {
+          recipients?: {
+            maxItems?: number;
+            items?: { properties?: { role?: { enum?: string[] } } };
+          };
+        };
+        oneOf?: unknown[];
+      };
+      assert.equal(schema.oneOf, undefined);
+      assert.equal(schema.properties?.recipients?.maxItems, 1);
+      assert.deepEqual(
+        schema.properties?.recipients?.items?.properties?.role?.enum,
+        ["researcher", "analyst"],
+      );
+      return result(
+        inferenceRequest,
+        JSON.stringify({
+          action: "dispatch",
+          reason: "Obtain one bounded check.",
+          recipients: [
+            {
+              role: "researcher",
+              instruction: "Check the public candidate contract.",
+              artifactAccess: "read_only",
+            },
+          ],
+        }),
+      );
+    }
+    const schema = inferenceRequest.responseSchema as {
+      properties?: { action?: { const?: string }; artifact?: unknown };
+    };
+    assert.equal(schema.properties?.action?.const, "request_review");
+    assert.deepEqual(schema.properties?.artifact, {
+      type: "object",
+      additionalProperties: false,
+      required: ["apiVersion", "taskId", "artifact"],
+      properties: {
+        apiVersion: { const: "example.dev/candidate/v1" },
+        taskId: { const: "launch-1" },
+        artifact: { type: "object" },
+      },
+    });
+    return result(
+      inferenceRequest,
+      JSON.stringify({
+        action: "request_review",
+        reason: "The typed candidate is ready.",
+        artifact: candidate,
+      }),
+    );
+  });
+
+  const output = await new PeerTeamController({ maxHandoffs: 1 }).run<typeof candidate>(request, {
+    team,
+    engine,
+    reviewRequiresHandoff: true,
+    finalArtifactContract: {
+      instruction: "Return the direct candidate object.",
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["apiVersion", "taskId", "artifact"],
+        properties: {
+          apiVersion: { const: "example.dev/candidate/v1" },
+          taskId: { const: "launch-1" },
+          artifact: { type: "object" },
+        },
+      },
+      parse(value) {
+        return JSON.stringify(value) === JSON.stringify(candidate)
+          ? candidate
+          : null;
+      },
+    },
+  });
+
+  assert.deepEqual(output.artifact, candidate);
+  assert.deepEqual(JSON.parse(output.inference.text), candidate);
+  assert.equal(output.inference.text.includes('"deliverable"'), false);
+});
+
+test("immediate review remains compatible unless handoff-first review is enabled", async () => {
+  const engine = scriptedEngine("premature-review", async (inferenceRequest) =>
+    result(
+      inferenceRequest,
+      JSON.stringify({
+        action: "request_review",
+        reason: "Too early.",
+        artifact,
+      }),
+    ),
+  );
+
+  const compatible = await new PeerTeamController().run(request, {
+    team,
+    engine,
+  });
+  assert.deepEqual(compatible.artifact, artifact);
+  assert.equal(compatible.handoffs.length, 0);
+  assert.equal(compatible.metrics.stageCalls, 1);
+
+  await assert.rejects(
+    () =>
+      new PeerTeamController().run(request, {
+        team,
+        engine,
+        reviewRequiresHandoff: true,
+      }),
+    (error: unknown) =>
+      error instanceof PeerTeamControllerError &&
+      error.code === "REVIEW_BEFORE_HANDOFF" &&
+      error.context?.stage === "review" &&
+      error.context.cycle === 1 &&
+      error.failureState?.metrics.stageCalls === 1,
+  );
+});
+
 test("same manifest is serialized unless it declares a native concurrency capability", async () => {
   let chiefCalls = 0;
   let active = 0;
@@ -477,9 +612,60 @@ test("stage-call budget stops a team before an extra model call starts", async (
       }),
     (error: unknown) =>
       error instanceof PeerTeamControllerError &&
-      error.code === "STAGE_CALL_LIMIT_EXCEEDED",
+      error.code === "STAGE_CALL_LIMIT_EXCEEDED" &&
+      error.failureState?.metrics.stageCalls === 2 &&
+      error.failureState.metrics.usage.inputTokens === 4 &&
+      error.failureState.metrics.usage.outputTokens === 6 &&
+      error.failureState.stages.length === 2 &&
+      error.failureState.stages.every(
+        (stage, index) => stage.index === index && stage.status === "succeeded",
+      ),
   );
   assert.equal(calls, 2);
+});
+
+test("an unmetered engine failure keeps the started stage and makes aggregate usage unknown", async () => {
+  let chiefCalls = 0;
+  const chief = scriptedEngine("unmetered-failure-chief", async (inferenceRequest) => {
+    chiefCalls += 1;
+    return result(
+      inferenceRequest,
+      JSON.stringify({
+        action: "dispatch",
+        reason: "Run one bounded check.",
+        recipients: [
+          {
+            role: "researcher",
+            instruction: "Fail before returning metered inference.",
+            artifactAccess: "read_only",
+          },
+        ],
+      }),
+    );
+  });
+  const worker = scriptedEngine("unmetered-failure-worker", async () => {
+    throw new Error("synthetic engine failure");
+  });
+
+  await assert.rejects(
+    () =>
+      new PeerTeamController().run(request, {
+        team,
+        engine: chief,
+        engineForRole: (role) => (role === "chief" ? chief : worker),
+      }),
+    (error: unknown) =>
+      error instanceof PeerTeamControllerError &&
+      error.code === "STAGE_EXECUTION_FAILED" &&
+      error.failureState?.metrics.stageCalls === 2 &&
+      error.failureState.metrics.usage.inputTokens === null &&
+      error.failureState.metrics.usage.outputTokens === null &&
+      error.failureState.metrics.usage.cost === null &&
+      error.failureState.metrics.usage.measurementStatus === "unknown" &&
+      error.failureState.stages[1]?.status === "failed" &&
+      error.failureState.stages[1]?.inference === undefined,
+  );
+  assert.equal(chiefCalls, 1);
 });
 
 test("a token cap prevents a peer stage that cannot fit before model execution", async () => {
@@ -549,6 +735,88 @@ test("parallel workers reserve one shared token budget before either call starts
   );
   assert.equal(chiefCalls, 1);
   assert.ok(workerCalls < 2);
+});
+
+test("parallel worker failure snapshots every settled sibling stage", async () => {
+  let workerStarts = 0;
+  let releaseBothWorkers: (() => void) | undefined;
+  const bothWorkersStarted = new Promise<void>((resolve) => {
+    releaseBothWorkers = resolve;
+  });
+  const chief = scriptedEngine("parallel-failure-chief", async (inferenceRequest) =>
+    result(
+      inferenceRequest,
+      JSON.stringify({
+        action: "dispatch",
+        reason: "Run two isolated checks and fail one deterministically.",
+        recipients: [
+          {
+            role: "researcher",
+            instruction: "Fail this check deterministically.",
+            artifactAccess: "isolated",
+          },
+          {
+            role: "analyst",
+            instruction: "Wait until the sibling failure cancels this check.",
+            artifactAccess: "isolated",
+          },
+        ],
+      }),
+    ),
+  );
+  const workers = scriptedEngine(
+    "parallel-failure-workers",
+    async (inferenceRequest, options) => {
+      workerStarts += 1;
+      if (workerStarts === 2) releaseBothWorkers?.();
+      const system =
+        inferenceRequest.messages.find(({ role }) => role === "system")
+          ?.content ?? "";
+      if (system.includes("worker role researcher")) {
+        await bothWorkersStarted;
+        throw new PeerTeamControllerError(
+          "PROTOCOL_INVALID_DIRECTIVE",
+          "Synthetic primary worker failure.",
+        );
+      }
+      return await new Promise<InferenceResult>((_resolve, reject) => {
+        const signal = options?.signal;
+        if (signal?.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal?.addEventListener(
+          "abort",
+          () => reject(signal.reason),
+          { once: true },
+        );
+      });
+    },
+    { concurrency: 2 },
+  );
+
+  await assert.rejects(
+    () =>
+      new PeerTeamController({ maxParallel: 2 }).run(request, {
+        team,
+        engine: chief,
+        engineForRole: (role) =>
+          role === "chief" ? chief : workers,
+      }),
+    (error: unknown) =>
+      error instanceof PeerTeamControllerError &&
+      error.code === "PROTOCOL_INVALID_DIRECTIVE" &&
+      error.failureState?.metrics.stageCalls === 3 &&
+      error.failureState.metrics.maxObservedParallel === 2 &&
+      error.failureState.stages.length === 3 &&
+      error.failureState.stages.filter(({ status }) => status === "succeeded")
+        .length === 1 &&
+      error.failureState.stages.filter(({ status }) => status === "failed")
+        .length === 1 &&
+      error.failureState.stages.filter(({ status }) => status === "canceled")
+        .length === 1,
+  );
+  assert.equal(workerStarts, 2);
 });
 
 test("AbortSignal cancels an active routed worker and closes lifecycle as canceled", async () => {

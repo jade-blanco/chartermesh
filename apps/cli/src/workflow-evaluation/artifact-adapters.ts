@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import {
+  ARTIFACT_CELL_REFERENCE_PATTERN,
   ARTIFACT_CANDIDATE_API_VERSION,
+  ARTIFACT_COLUMN_KEY_PATTERN,
+  ARTIFACT_IDENTIFIER_PATTERN,
+  ARTIFACT_ISO_DATE_PATTERN,
+  ARTIFACT_HTTPS_URL_PATTERN,
   canonicalArtifactJson,
   evaluateArtifactOracle,
   parseArtifactCandidate,
@@ -34,21 +39,47 @@ export function artifactFamilyContract(
   }
 }
 
-const boundedText = {
-  type: "string",
-  minLength: 1,
-  maxLength: 12_000,
-} as const;
-const shortText = {
-  type: "string",
-  minLength: 1,
-  maxLength: 1_000,
-} as const;
-const stringList = {
-  type: "array",
-  maxItems: 128,
-  items: shortText,
-} as const;
+function textSchema(
+  maxLength: number,
+  options: { pattern?: string; allowEmpty?: boolean } = {},
+): Record<string, unknown> {
+  return {
+    type: "string",
+    minLength: options.allowEmpty ? 0 : 1,
+    maxLength,
+    ...(options.pattern ? { pattern: options.pattern } : {}),
+  };
+}
+
+function stringListSchema(
+  maxItems: number,
+  options: {
+    minItems?: number;
+    itemMaxLength?: number;
+    itemPattern?: string;
+  } = {},
+): Record<string, unknown> {
+  return {
+    type: "array",
+    ...(options.minItems === undefined
+      ? {}
+      : { minItems: options.minItems }),
+    maxItems,
+    items: textSchema(options.itemMaxLength ?? 4_096, {
+      ...(options.itemPattern ? { pattern: options.itemPattern } : {}),
+    }),
+  };
+}
+
+const identifierText = textSchema(64, {
+  pattern: ARTIFACT_IDENTIFIER_PATTERN,
+});
+const columnKeyText = textSchema(64, {
+  pattern: ARTIFACT_COLUMN_KEY_PATTERN,
+});
+const cellReferenceText = textSchema(12, {
+  pattern: ARTIFACT_CELL_REFERENCE_PATTERN,
+});
 
 function familyArtifactSchema(
   family: PublicArtifactEvaluationTask["family"],
@@ -59,33 +90,45 @@ function familyArtifactSchema(
     required: ["kind", "name", "positioning", "deliverables", "launchChecklist"],
     properties: {
       kind: { const: "product_package" },
-      name: shortText,
+      name: textSchema(160),
       positioning: {
         type: "object",
         additionalProperties: false,
         required: ["audience", "problem", "promise"],
-        properties: { audience: shortText, problem: boundedText, promise: boundedText },
+        properties: {
+          audience: textSchema(1_000),
+          problem: textSchema(2_000),
+          promise: textSchema(2_000),
+        },
       },
       deliverables: {
         type: "array",
         minItems: 1,
-        maxItems: 128,
+        maxItems: 64,
         items: {
           type: "object",
           additionalProperties: false,
           required: ["id", "name", "acceptance"],
-          properties: { id: shortText, name: shortText, acceptance: stringList },
+          properties: {
+            id: identifierText,
+            name: textSchema(240),
+            acceptance: stringListSchema(32, { minItems: 1 }),
+          },
         },
       },
       launchChecklist: {
         type: "array",
         minItems: 1,
-        maxItems: 128,
+        maxItems: 64,
         items: {
           type: "object",
           additionalProperties: false,
           required: ["id", "owner", "done"],
-          properties: { id: shortText, owner: shortText, done: { type: "boolean" } },
+          properties: {
+            id: identifierText,
+            owner: textSchema(160),
+            done: { type: "boolean" },
+          },
         },
       },
     },
@@ -96,7 +139,7 @@ function familyArtifactSchema(
     required: ["kind", "question", "sources", "findings", "limitations"],
     properties: {
       kind: { const: "research" },
-      question: boundedText,
+      question: textSchema(2_000),
       sources: {
         type: "array",
         minItems: 1,
@@ -106,10 +149,17 @@ function familyArtifactSchema(
           additionalProperties: false,
           required: ["id", "title", "url", "publishedDate"],
           properties: {
-            id: shortText,
-            title: boundedText,
-            url: { type: "string", minLength: 9, maxLength: 4_000 },
-            publishedDate: { type: "string", minLength: 1, maxLength: 64 },
+            id: identifierText,
+            title: textSchema(500),
+            url: {
+              type: "string",
+              minLength: 9,
+              maxLength: 2_048,
+              pattern: ARTIFACT_HTTPS_URL_PATTERN,
+            },
+            publishedDate: textSchema(10, {
+              pattern: ARTIFACT_ISO_DATE_PATTERN,
+            }),
           },
         },
       },
@@ -122,14 +172,18 @@ function familyArtifactSchema(
           additionalProperties: false,
           required: ["id", "claim", "sourceIds", "confidence"],
           properties: {
-            id: shortText,
-            claim: boundedText,
-            sourceIds: stringList,
+            id: identifierText,
+            claim: textSchema(4_000),
+            sourceIds: stringListSchema(32, {
+              minItems: 1,
+              itemMaxLength: 64,
+              itemPattern: ARTIFACT_IDENTIFIER_PATTERN,
+            }),
             confidence: { enum: ["low", "medium", "high"] },
           },
         },
       },
-      limitations: stringList,
+      limitations: stringListSchema(64),
     },
   };
   const xlsx = {
@@ -138,7 +192,7 @@ function familyArtifactSchema(
     required: ["kind", "workbookTitle", "sheets", "namedRanges"],
     properties: {
       kind: { const: "xlsx" },
-      workbookTitle: shortText,
+      workbookTitle: textSchema(240),
       sheets: {
         type: "array",
         minItems: 1,
@@ -148,7 +202,7 @@ function familyArtifactSchema(
           additionalProperties: false,
           required: ["name", "columns", "rows", "formulas"],
           properties: {
-            name: shortText,
+            name: textSchema(31),
             columns: {
               type: "array",
               minItems: 1,
@@ -158,8 +212,8 @@ function familyArtifactSchema(
                 additionalProperties: false,
                 required: ["key", "header", "type"],
                 properties: {
-                  key: shortText,
-                  header: shortText,
+                  key: columnKeyText,
+                  header: textSchema(240),
                   type: { enum: ["text", "number", "date", "boolean", "currency"] },
                 },
               },
@@ -180,7 +234,7 @@ function familyArtifactSchema(
                       additionalProperties: false,
                       required: ["columnKey", "value"],
                       properties: {
-                        columnKey: shortText,
+                        columnKey: columnKeyText,
                         value: {
                           oneOf: [
                             { type: "string", maxLength: 4_000 },
@@ -202,13 +256,17 @@ function familyArtifactSchema(
                 type: "object",
                 additionalProperties: false,
                 required: ["cell", "expression", "dependsOn"],
-                properties: { cell: shortText, expression: shortText, dependsOn: stringList },
+                properties: {
+                  cell: cellReferenceText,
+                  expression: textSchema(1_000),
+                  dependsOn: stringListSchema(128),
+                },
               },
             },
           },
         },
       },
-      namedRanges: stringList,
+      namedRanges: stringListSchema(128),
     },
   };
   const docxBlock = {
@@ -217,13 +275,16 @@ function familyArtifactSchema(
         type: "object",
         additionalProperties: false,
         required: ["type", "text"],
-        properties: { type: { const: "paragraph" }, text: boundedText },
+        properties: { type: { const: "paragraph" }, text: textSchema(12_000) },
       },
       {
         type: "object",
         additionalProperties: false,
         required: ["type", "items"],
-        properties: { type: { const: "bullets" }, items: stringList },
+        properties: {
+          type: { const: "bullets" },
+          items: stringListSchema(128, { minItems: 1 }),
+        },
       },
       {
         type: "object",
@@ -231,8 +292,13 @@ function familyArtifactSchema(
         required: ["type", "headers", "rows"],
         properties: {
           type: { const: "table" },
-          headers: stringList,
-          rows: { type: "array", maxItems: 128, items: stringList },
+          headers: stringListSchema(32, { minItems: 1 }),
+          rows: {
+            type: "array",
+            minItems: 1,
+            maxItems: 128,
+            items: stringListSchema(32),
+          },
         },
       },
     ],
@@ -243,8 +309,8 @@ function familyArtifactSchema(
     required: ["kind", "title", "audience", "sections", "reviewChecklist"],
     properties: {
       kind: { const: "docx" },
-      title: shortText,
-      audience: shortText,
+      title: textSchema(240),
+      audience: textSchema(1_000),
       sections: {
         type: "array",
         minItems: 1,
@@ -254,13 +320,13 @@ function familyArtifactSchema(
           additionalProperties: false,
           required: ["id", "heading", "blocks"],
           properties: {
-            id: shortText,
-            heading: shortText,
+            id: identifierText,
+            heading: textSchema(500),
             blocks: { type: "array", minItems: 1, maxItems: 128, items: docxBlock },
           },
         },
       },
-      reviewChecklist: stringList,
+      reviewChecklist: stringListSchema(128),
     },
   };
   const pptxBody = {
@@ -269,13 +335,21 @@ function familyArtifactSchema(
         type: "object",
         additionalProperties: false,
         required: ["type", "items"],
-        properties: { type: { const: "bullets" }, items: stringList },
+        properties: {
+          type: { const: "bullets" },
+          items: stringListSchema(32, { minItems: 1 }),
+        },
       },
       {
         type: "object",
         additionalProperties: false,
         required: ["type", "label", "value", "context"],
-        properties: { type: { const: "metric" }, label: shortText, value: shortText, context: boundedText },
+        properties: {
+          type: { const: "metric" },
+          label: textSchema(240),
+          value: textSchema(120),
+          context: textSchema(1_000),
+        },
       },
       {
         type: "object",
@@ -286,12 +360,15 @@ function familyArtifactSchema(
           milestones: {
             type: "array",
             minItems: 1,
-            maxItems: 128,
+            maxItems: 32,
             items: {
               type: "object",
               additionalProperties: false,
               required: ["label", "date"],
-              properties: { label: shortText, date: shortText },
+              properties: {
+                label: textSchema(240),
+                date: textSchema(40),
+              },
             },
           },
         },
@@ -304,8 +381,8 @@ function familyArtifactSchema(
     required: ["kind", "title", "theme", "slides", "narrative"],
     properties: {
       kind: { const: "pptx" },
-      title: shortText,
-      theme: shortText,
+      title: textSchema(240),
+      theme: textSchema(240),
       slides: {
         type: "array",
         minItems: 1,
@@ -315,15 +392,15 @@ function familyArtifactSchema(
           additionalProperties: false,
           required: ["id", "title", "purpose", "body", "speakerNotes"],
           properties: {
-            id: shortText,
-            title: shortText,
-            purpose: boundedText,
+            id: identifierText,
+            title: textSchema(240),
+            purpose: textSchema(1_000),
             body: pptxBody,
-            speakerNotes: boundedText,
+            speakerNotes: textSchema(8_000),
           },
         },
       },
-      narrative: stringList,
+      narrative: stringListSchema(128),
     },
   };
   return { product_package: product, research, xlsx, docx, pptx }[family];

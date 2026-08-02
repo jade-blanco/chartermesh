@@ -137,10 +137,18 @@ condition receives a matched model-generated orientation step so the team does
 not get an unrecorded planning opportunity. Setup latency, model calls, and
 reported usage count toward the condition total.
 
-The two orientations are opportunity-matched, not token-matched: both make one
-candidate-engine call, while the team call must also describe its roles. The
-team setup is then supplied declaratively to `PeerTeamController`, whose own
-setup hook makes no additional model call.
+Beginning with harness `v1alpha5`, the two orientations are schema-matched:
+both make one candidate-engine call and return only a concise `plan`. The host
+supplies a fixed coordinator-plus-specialist team to `PeerTeamController`,
+whose own setup hook makes no additional model call. Dynamic organization
+generation is deliberately excluded from this arm and must be measured as a
+separate condition.
+
+The study seed controls task and Williams-square condition order only.
+Candidate sampling remains the provider default, and orientations are not
+shared across feedback arms in this version. Feedback-policy deltas are
+therefore exploratory; the P0 canary may support architecture/protocol
+conclusions but must not claim a causal feedback-policy effect.
 
 Setup and final approvals are issued by `system:synthetic-evaluator`. They are
 experimental bookkeeping events, not production human approvals.
@@ -165,11 +173,20 @@ task capability. Both architectures receive the identical transform.
 
 ### Team communication
 
-In the team condition, only the declared C-level role may dispatch work or
-request review. It sends hash-bound command envelopes to declared worker roles.
-Workers return results to the C-level role; they cannot dispatch another role
-or approve the deliverable. The C-level role continues through bounded
-internal cycles until it requests human review or exhausts the liveness limit.
+In the `v1alpha5` Team-Lite condition, only the declared C-level role may
+dispatch work or request review. The host fixes one coordinator and one
+specialist and enforces one route: coordinator dispatch, specialist response,
+coordinator final review. The condition is capped at two internal cycles, one
+handoff, three peer-stage model calls, and serial execution. The generic runtime
+retains configurable dynamic cycles; these stricter bounds apply to this arm.
+
+Dispatch schemas enumerate the actual declared worker IDs, and review is not a
+valid action before a successful handoff. The caller injects the final artifact
+schema, instruction, and bounded transport parser. Artifact and code candidates
+are emitted as direct typed objects in `request_review.artifact`, not as JSON
+escaped inside `StructuredArtifact.deliverable`. Existing runtime callers that
+do not inject a contract retain the original `StructuredArtifact` behavior and
+may request immediate review unless they opt into `reviewRequiresHandoff`.
 
 Parallel recipients are allowed only with `read_only` or `isolated` artifact
 access. Actual parallelism is bounded by both the study limit and the selected
@@ -178,9 +195,27 @@ concurrency declaration are serialized.
 
 After a team deliverable is submitted, only the sealed evaluator determines
 whether the objective passed. A C-level assertion that the work is complete is
-not a passing result. When the evaluator does not pass the artifact, the outer
-trajectory obtains a new public feedback directive and starts the next
-submission with the exact prior artifact bound by SHA-256.
+not a passing result. When the evaluator does not pass, the outer trajectory
+obtains a new public feedback directive. Only the latest contract-valid, safe,
+protocol-valid artifact may become the next SHA-256-bound revision baseline.
+An invalid revision remains observable but cannot overwrite that baseline.
+Retention never uses sealed score or hidden criterion results.
+
+When the first output violates the public schema or ends with a non-`stop`
+finish reason, the host may spend at most one additional model call on a
+public-contract repair. The repair sees only public diagnostics, uses the same
+task-bound response schema, requires `stop`, and is skipped without a call when
+the trajectory budget cannot fit it. It applies symmetrically to single/team
+and artifact/code conditions. Its calls, tokens, and latency count toward the
+condition; it is a host capability, not unaided model quality.
+
+Every round records raw first-output validity, initial and final public
+diagnostics, repair attempts/outcome, effective validity, submitted and retained
+hashes, and the retention action. Aggregates expose raw and effective contract
+validity separately. Terminal failures
+record a sanitized phase, error code, stage index, cycle, and role without raw
+model output. A terminal protocol failure counts against protocol compliance
+even when it occurs before the first artifact round.
 
 ### The 10-feedback checkpoint
 
@@ -409,6 +444,11 @@ id, collected code-provenance hash, launcher commitment, and launcher
 attestation mode. The live runner rechecks the
 entire limits object and all applicable bindings. It fails if the approval
 token differs from the regenerated plan hash.
+
+Harness `v1alpha5` additionally commits the fixed-team manifest hashes, exact
+Team-Lite controller bounds, contract-repair prompt and limits, and the
+orientation-sampling disclosure. Changing any of these requires a new approval
+hash.
 
 A full run uses `--full --acknowledge-large-run`; 18 tasks by six conditions
 means 108 trajectories and can make many candidate and Codex calls. Live

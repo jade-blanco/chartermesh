@@ -7,6 +7,7 @@ import type {
   WorkflowCensorReason,
   WorkflowExecutionResult,
   WorkflowFeedbackProvider,
+  WorkflowFailureObservation,
   WorkflowOrientationResult,
   WorkflowPublicTask,
   WorkflowRoundRecord,
@@ -322,6 +323,36 @@ function validateExecution(
     typeof value.humanView !== "string" ||
     Buffer.byteLength(value.humanView, "utf8") > 65_536 ||
     typeof value.contractValid !== "boolean" ||
+    (value.initialContractValid !== undefined &&
+      typeof value.initialContractValid !== "boolean") ||
+    (value.initialContractDiagnostics !== undefined &&
+      (!Array.isArray(value.initialContractDiagnostics) ||
+        value.initialContractDiagnostics.length > 20 ||
+        !value.initialContractDiagnostics.every(
+          (diagnostic) =>
+            ["transport", "schema"].includes(diagnostic.stage) &&
+            typeof diagnostic.code === "string" &&
+            /^[A-Z0-9_]{1,128}$/u.test(diagnostic.code) &&
+            typeof diagnostic.repairable === "boolean",
+        ))) ||
+    (value.contractDiagnostics !== undefined &&
+      (!Array.isArray(value.contractDiagnostics) ||
+        value.contractDiagnostics.length > 20 ||
+        !value.contractDiagnostics.every(
+          (diagnostic) =>
+            ["transport", "schema"].includes(diagnostic.stage) &&
+            typeof diagnostic.code === "string" &&
+            /^[A-Z0-9_]{1,128}$/u.test(diagnostic.code) &&
+            typeof diagnostic.repairable === "boolean",
+        ))) ||
+    (value.contractRepairAttempts !== undefined &&
+      (!Number.isInteger(value.contractRepairAttempts) ||
+        value.contractRepairAttempts < 0 ||
+        value.contractRepairAttempts > 1)) ||
+    (value.contractRepairOutcome !== undefined &&
+      !["not_needed", "succeeded", "failed", "skipped_budget"].includes(
+        value.contractRepairOutcome,
+      )) ||
     typeof value.cLevelReviewRequested !== "boolean" ||
     !Number.isInteger(value.modelCalls) ||
     value.modelCalls < 0 ||
@@ -369,6 +400,16 @@ function executionFailureReason(
   }
   if (signal?.aborted) return "canceled";
   if (error instanceof PeerTeamControllerError) {
+    if (
+      [
+        "STAGE_EXECUTION_FAILED",
+        "LIFECYCLE_FAILED",
+        "CONTROLLER_EXECUTION_FAILED",
+      ].includes(error.code) &&
+      error.cause
+    ) {
+      return executionFailureReason(error.cause, signal);
+    }
     if (error.code === "CANCELED") return "canceled";
     if (error.code === "STAGE_CALL_LIMIT_EXCEEDED") {
       return "model_call_limit";
@@ -380,24 +421,72 @@ function executionFailureReason(
   return "execution_error";
 }
 
+function safeFailureCode(value: unknown, fallback: string): string {
+  const candidate =
+    typeof value === "string" ? value.trim().toUpperCase() : "";
+  return /^[A-Z0-9_:-]{1,128}$/u.test(candidate) ? candidate : fallback;
+}
+
+function failureObservation(
+  error: unknown,
+  phase: WorkflowFailureObservation["phase"],
+): WorkflowFailureObservation {
+  if (error instanceof WorkflowAccountedError && error.cause) {
+    const nested = failureObservation(error.cause, phase);
+    return nested.code === "WORKFLOW_ERROR"
+      ? { ...nested, code: safeFailureCode(error.message, "WORKFLOW_ERROR") }
+      : nested;
+  }
+  if (error instanceof PeerTeamControllerError) {
+    return {
+      phase,
+      code: error.code,
+      stage: error.context?.stage ?? null,
+      stageIndex: error.context?.stageIndex ?? null,
+      cycle: error.context?.cycle ?? null,
+      role: error.context?.role ?? null,
+    };
+  }
+  return {
+    phase,
+    code: safeFailureCode(
+      error instanceof Error ? error.message : null,
+      "WORKFLOW_ERROR",
+    ),
+    stage: null,
+    stageIndex: null,
+    cycle: null,
+    role: null,
+  };
+}
+
 function totalTokens(usage: ModelUsage): number | null {
   return usage.inputTokens === null || usage.outputTokens === null
     ? null
     : usage.inputTokens + usage.outputTokens;
 }
 
-function protocolCompliance(rounds: WorkflowRoundRecord[]): number {
+function protocolCompliance(
+  rounds: WorkflowRoundRecord[],
+  terminalProtocolFailure: boolean,
+): number {
   const handoffs = rounds.reduce((sum, round) => sum + round.handoffs, 0);
   const violations = rounds.reduce(
     (sum, round) => sum + round.protocolViolations.length,
     0,
   );
-  const opportunities = handoffs + violations;
+  const terminalViolations = terminalProtocolFailure ? 1 : 0;
+  const opportunities = handoffs + violations + terminalViolations;
   return opportunities === 0
     ? rounds.every((round) => round.protocolViolations.length === 0)
       ? 1
       : 0
-    : Number(((handoffs - Math.min(handoffs, violations)) / opportunities).toFixed(4));
+    : Number(
+        (
+          (handoffs - Math.min(handoffs, violations + terminalViolations)) /
+          opportunities
+        ).toFixed(4),
+      );
 }
 
 export async function runWorkflowTrajectory(input: {
@@ -440,9 +529,14 @@ export async function runWorkflowTrajectory(input: {
   let finalApprovalCount: 0 | 1 = 0;
   let safety = zeroSafety();
   let censorReason: WorkflowCensorReason | null = null;
+  let failure: WorkflowFailureObservation | null = null;
   let status: WorkflowTrajectoryReport["outcome"]["status"] = "censored";
   let passSubmission: number | null = null;
   let previousArtifact: { sha256: string; content: string } | null = null;
+  let lastContractValidArtifact: {
+    sha256: string;
+    content: string;
+  } | null = null;
   let previousArtifactHash: string | null = null;
   let identicalArtifacts = 0;
   let consecutiveContractInvalidSubmissions = 0;
@@ -583,6 +677,7 @@ export async function runWorkflowTrajectory(input: {
         ...error.metrics,
       };
     }
+    failure = failureObservation(error, "orientation");
     censorReason = executionFailureReason(error, input.signal);
     status = [
       "execution_error",
@@ -670,6 +765,7 @@ export async function runWorkflowTrajectory(input: {
         usage = addUsage(usage, error.metrics.usage);
         internalModelCalls += error.metrics.modelCalls;
       }
+      failure = failureObservation(error, "implementation");
       censorReason = executionFailureReason(error, input.signal);
       status = [
         "execution_error",
@@ -759,6 +855,7 @@ export async function runWorkflowTrajectory(input: {
         if (isUnsettledOperation(error)) {
           throw new WorkflowAbortSettlementError(error);
         }
+        failure = failureObservation(error, "evaluation");
         censorReason =
           error instanceof WorkflowDeadlineError
             ? "wall_clock_limit"
@@ -775,6 +872,32 @@ export async function runWorkflowTrajectory(input: {
         };
       }
     }
+    const roundSafety = addSafety(execution.safety, evaluationSafety);
+    const submittedArtifact = {
+      sha256: artifactHash,
+      content: execution.artifact,
+    };
+    const retainable =
+      execution.contractValid &&
+      !executionOverrun &&
+      protocolViolations.length === 0 &&
+      !safetyFailed(roundSafety);
+    let retentionAction: WorkflowRoundRecord["retentionAction"];
+    if (retainable) {
+      retentionAction = lastContractValidArtifact
+        ? "accepted_valid"
+        : "accepted_initial";
+      lastContractValidArtifact = submittedArtifact;
+      previousArtifact = submittedArtifact;
+    } else if (lastContractValidArtifact) {
+      retentionAction = execution.contractValid
+        ? "rejected_untrusted"
+        : "rejected_invalid";
+      previousArtifact = lastContractValidArtifact;
+    } else {
+      retentionAction = "no_valid_baseline";
+      previousArtifact = null;
+    }
     const round: WorkflowRoundRecord = {
       submission,
       feedbackRound: feedbackRoundCount,
@@ -782,7 +905,19 @@ export async function runWorkflowTrajectory(input: {
         feedbackRoundCount === 0 ? "initial_assignment" : "changes_requested",
       directiveHash,
       artifactHash,
+      initialContractValid:
+        execution.initialContractValid ?? execution.contractValid,
+      initialContractDiagnostics:
+        execution.initialContractDiagnostics ??
+        execution.contractDiagnostics ??
+        [],
       contractValid: execution.contractValid,
+      contractDiagnostics: execution.contractDiagnostics ?? [],
+      contractRepairAttempts: execution.contractRepairAttempts ?? 0,
+      contractRepairOutcome:
+        execution.contractRepairOutcome ?? "not_needed",
+      retainedArtifactHash: previousArtifact?.sha256 ?? null,
+      retentionAction,
       externalPass: evaluation.passed,
       partialScore: Number(evaluation.score.toFixed(4)),
       criticalFailures: [...evaluation.criticalFailures],
@@ -793,12 +928,11 @@ export async function runWorkflowTrajectory(input: {
       outputTokens: execution.usage.outputTokens,
       latencyMs: execution.latencyMs,
       protocolViolations,
-      safety: addSafety(execution.safety, evaluationSafety),
+      safety: roundSafety,
       providerIdentities: execution.providerIdentities ?? [],
     };
     rounds.push(round);
     await input.onRound?.(round);
-    previousArtifact = { sha256: artifactHash, content: execution.artifact };
 
     if (executionOverrun) {
       censorReason = executionOverrun;
@@ -813,6 +947,17 @@ export async function runWorkflowTrajectory(input: {
       break;
     }
     if (protocolViolations.length > 0) {
+      failure = {
+        phase: "implementation",
+        code: safeFailureCode(
+          protocolViolations[0],
+          "PROTOCOL_VIOLATION",
+        ),
+        stage: "review",
+        stageIndex: null,
+        cycle: null,
+        role: null,
+      };
       censorReason = "protocol_failure";
       status = "failed";
       break;
@@ -883,7 +1028,17 @@ export async function runWorkflowTrajectory(input: {
       internalModelCalls += feedback.modelCalls;
       feedbackRoundCount += 1;
       userDirectiveCount += 1;
-      directive = feedback.directive;
+      const publicContractDiagnostic = (execution.contractDiagnostics ?? [])
+        .map(({ stage, code }) => `${stage}:${code}`)
+        .join(", ");
+      directive = publicContractDiagnostic
+        ? [
+            feedback.directive,
+            "Public contract diagnostics from the host validator:",
+            publicContractDiagnostic,
+            "Repair representation and disclosed schema only; do not infer hidden requirements.",
+          ].join("\n")
+        : feedback.directive;
       directiveHash = sha256(directive);
       feedbackDirectiveHashes.push(directiveHash);
       feedbackDirectives.push({
@@ -905,6 +1060,7 @@ export async function runWorkflowTrajectory(input: {
         usage = addUsage(usage, error.metrics.usage);
         internalModelCalls += error.metrics.modelCalls;
       }
+      failure = failureObservation(error, "feedback");
       censorReason =
         error instanceof WorkflowDeadlineError
           ? "wall_clock_limit"
@@ -943,7 +1099,7 @@ export async function runWorkflowTrajectory(input: {
     round.protocolViolations.includes("TEAM_REVIEW_WITHOUT_HANDOFF"),
   ).length;
   return {
-    apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha1",
+    apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha2",
     trialId,
     orderIndex: input.orderIndex ?? 0,
     taskId: input.task.id,
@@ -977,10 +1133,14 @@ export async function runWorkflowTrajectory(input: {
       totalOutputTokens: usage.outputTokens,
       elapsedMs: Math.max(0, Math.round(clock() - startedAt)),
       censorReason: status === "passed" ? null : censorReason,
+      failure: status === "passed" ? null : failure,
     },
     collaboration: {
       handoffCount,
-      protocolComplianceRate: protocolCompliance(rounds),
+      protocolComplianceRate: protocolCompliance(
+        rounds,
+        censorReason === "protocol_failure",
+      ),
       maxObservedConcurrency: Math.max(
         0,
         ...rounds.map((round) => round.maxObservedConcurrency),

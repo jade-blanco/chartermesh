@@ -131,6 +131,9 @@ export function createControlPlanePeerTeamLifecycle(input: {
         roleId: stage.role,
         actor: input.actor,
         maxChildren: input.maxChildren,
+        stageIndex: stage.index,
+        cycle: stage.cycle,
+        stageKind: stage.kind,
         ...(stage.envelopeHash
           ? {
               handoffHash: stage.envelopeHash,

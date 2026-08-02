@@ -6,7 +6,12 @@ import type {
 } from "../../../../packages/adapter-sdk/src/types.ts";
 import {
   PeerTeamController,
+  PeerTeamControllerError,
+  type PeerFinalArtifactContract,
   type PeerTeamRole,
+  type PeerTeamRunMetrics,
+  type PeerTeamRunResult,
+  type PeerTeamStage,
   type PeerTeamLifecycle,
   type PeerTeamSetup,
 } from "../../../../packages/runtime/src/index.ts";
@@ -17,6 +22,7 @@ import {
   renderArtifactCandidateForHuman,
 } from "./artifact-adapters.ts";
 import {
+  ArtifactCandidateParseError,
   canonicalArtifactJson,
   parseArtifactCandidate,
   type ArtifactCandidateEnvelope,
@@ -28,11 +34,14 @@ import {
 } from "./suite.ts";
 import type {
   WorkflowArchitecture,
+  WorkflowContractDiagnostic,
+  WorkflowContractRepairOutcome,
   WorkflowExecutionResult,
   WorkflowExecutor,
   WorkflowOrientationResult,
   WorkflowPublicTask,
   WorkflowSafetyObservation,
+  WorkflowStepMetrics,
 } from "./types.ts";
 import {
   accountWorkflowError,
@@ -51,6 +60,31 @@ export const WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION =
   "chartermesh.dev/workflow-response-schema-portability/v1alpha1" as const;
 export const WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION = 1_000 as const;
 export const WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION = "omit" as const;
+export const WORKFLOW_TEAM_PROTOCOL_VERSION =
+  "chartermesh.dev/workflow-team-lite/v1alpha1" as const;
+export const WORKFLOW_ARTIFACT_RETENTION_POLICY_VERSION =
+  "chartermesh.dev/workflow-last-valid-retention/v1alpha1" as const;
+export const WORKFLOW_CONTRACT_REPAIR_POLICY_VERSION =
+  "chartermesh.dev/workflow-contract-repair/v1alpha1" as const;
+export const WORKFLOW_CONTRACT_REPAIR_MAX_ATTEMPTS = 1 as const;
+export const WORKFLOW_CONTRACT_REPAIR_MAX_OUTPUT_TOKENS = 8_192 as const;
+export const WORKFLOW_CONTRACT_REPAIR_MAX_CANDIDATE_CHARS = 24_000 as const;
+export const WORKFLOW_TEAM_MAX_INTERNAL_CYCLES = 2 as const;
+export const WORKFLOW_TEAM_MAX_HANDOFFS = 1 as const;
+export const WORKFLOW_TEAM_MAX_STAGE_CALLS = 3 as const;
+export const WORKFLOW_TEAM_MAX_PARALLEL = 1 as const;
+export const WORKFLOW_TEAM_MAX_OUTPUT_TOKENS = 8_192 as const;
+export const WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS = 64_000 as const;
+export const WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS = 32_000 as const;
+export const WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS = 48_000 as const;
+export const WORKFLOW_CONTRACT_REPAIR_SYSTEM_PROMPT = [
+  "Repair only the representation and disclosed public contract of the supplied candidate.",
+  "Preserve intended content where possible. Do not infer hidden requirements or claim hidden validation.",
+  "Return one strict JSON object matching the supplied response schema, without prose or a code fence.",
+].join("\n");
+export const WORKFLOW_CONTRACT_REPAIR_PROMPT_SHA256 = sha256(
+  WORKFLOW_CONTRACT_REPAIR_SYSTEM_PROMPT,
+);
 
 export const WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS = [
   "minLength",
@@ -276,6 +310,32 @@ export const TEAM_ORIENTATION_SCHEMA = {
   },
 } satisfies Record<string, unknown>;
 
+export function fixedWorkflowTeam(
+  domain: "artifact" | "code",
+): PeerTeamSetup {
+  return {
+    cLevelRole: "coordinator",
+    roles: [
+      {
+        id: "coordinator",
+        name: "Workflow Coordinator",
+        class: "c_level",
+        description:
+          "Owns requirements, delegates one bounded review, integrates evidence, and requests human review without holding approval authority.",
+      },
+      {
+        id: "specialist",
+        name: domain === "code" ? "Code Specialist" : "Artifact Specialist",
+        class: "worker",
+        description:
+          domain === "code"
+            ? "Checks the public maintenance contract and proposes bounded code corrections."
+            : "Checks the public artifact contract and proposes bounded structural or content corrections.",
+      },
+    ],
+  };
+}
+
 const ROLE_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
 
 function sha256(value: string): string {
@@ -422,6 +482,113 @@ export function requireStop(inference: InferenceResult, stage: string): void {
   }
 }
 
+export function rethrowAccountedPeerTeamError(
+  error: unknown,
+  startedAt: number,
+  code: string,
+): never {
+  if (!(error instanceof PeerTeamControllerError) || !error.failureState) {
+    throw error;
+  }
+  const accountedCause =
+    error.cause instanceof WorkflowAccountedError ? error.cause : null;
+  const stageProviderIdentities = peerTeamStageProviderIdentities(
+    error.failureState.stages,
+  );
+  throw accountWorkflowError(error, code, {
+    latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    modelCalls: error.failureState.metrics.stageCalls,
+    usage: accountedCause
+      ? addWorkflowUsage(
+          error.failureState.metrics.usage,
+          accountedCause.metrics.usage,
+        )
+      : error.failureState.metrics.usage,
+    providerIdentities: [
+      ...stageProviderIdentities,
+      ...(accountedCause?.metrics.providerIdentities ?? []),
+    ],
+  });
+}
+
+export function peerTeamStageProviderIdentities(
+  stages: readonly PeerTeamStage[],
+): NonNullable<WorkflowExecutionResult["providerIdentities"]> {
+  return stages.flatMap((stage) =>
+    stage.inference
+      ? [
+          {
+            engineProfileId: stage.engineId,
+            role: stage.role,
+            reportedModelId:
+              stage.inference.providerIdentity?.reportedModelId ?? null,
+            reportedSystemFingerprint:
+              stage.inference.providerIdentity?.reportedSystemFingerprint ??
+              null,
+          },
+        ]
+      : [],
+  );
+}
+
+export interface RepairablePeerTeamFinalFailure {
+  error: PeerTeamControllerError;
+  inference: InferenceResult;
+  metrics: PeerTeamRunMetrics;
+  stages: PeerTeamStage[];
+}
+
+const REPAIRABLE_TEAM_FINAL_CODES = new Set([
+  "PROTOCOL_INVALID_JSON",
+  "PROTOCOL_INVALID_DIRECTIVE",
+  "PROTOCOL_OUTPUT_LIMIT",
+  "PROTOCOL_FINISH_REASON",
+]);
+
+export function repairablePeerTeamFinalFailure(
+  error: unknown,
+): RepairablePeerTeamFinalFailure | null {
+  if (
+    !(error instanceof PeerTeamControllerError) ||
+    !error.failureState ||
+    !REPAIRABLE_TEAM_FINAL_CODES.has(error.code) ||
+    error.failureState.metrics.handoffCount < 1 ||
+    error.context?.cycle !== WORKFLOW_TEAM_MAX_INTERNAL_CYCLES ||
+    error.context?.role !== "coordinator"
+  ) {
+    return null;
+  }
+  const stage = [...error.failureState.stages]
+    .reverse()
+    .find(
+      (candidate) =>
+        candidate.kind === "c_level" &&
+        candidate.cycle === WORKFLOW_TEAM_MAX_INTERNAL_CYCLES &&
+        candidate.inference,
+    );
+  if (!stage?.inference) return null;
+  return {
+    error,
+    inference: stage.inference,
+    metrics: error.failureState.metrics,
+    stages: error.failureState.stages,
+  };
+}
+
+export function candidateTextFromPeerFinalDirective(text: string): string {
+  try {
+    const value = JSON.parse(text.trim()) as unknown;
+    if (record(value) && Object.hasOwn(value, "artifact")) {
+      const artifact = JSON.stringify(value.artifact);
+      if (artifact) return artifact;
+    }
+  } catch {
+    // The bounded repair prompt receives the original text when extraction is
+    // impossible; it never receives sealed evaluator evidence.
+  }
+  return text;
+}
+
 function assertTask(
   expected: ArtifactEvaluationTask,
   actual: WorkflowPublicTask,
@@ -458,6 +625,8 @@ function candidateResult(
   artifact: string;
   humanView: string;
   contractValid: boolean;
+  contractDiagnostics: WorkflowContractDiagnostic[];
+  contractRepairAttempts: number;
 } {
   try {
     const candidate = parseArtifactCandidate(rawText, {
@@ -468,10 +637,16 @@ function candidateResult(
       artifact: canonicalArtifactJson(candidate),
       humanView: renderArtifactCandidateForHuman(candidate),
       contractValid: true,
+      contractDiagnostics: [],
+      contractRepairAttempts: 0,
     };
   } catch (error) {
     const raw = rawText.trim() || "[empty model output]";
     const message = error instanceof Error ? error.message : String(error);
+    const code =
+      error instanceof ArtifactCandidateParseError
+        ? error.code
+        : "CANDIDATE_SCHEMA_INVALID";
     return {
       artifact: raw,
       humanView: [
@@ -480,8 +655,355 @@ function candidateResult(
         raw.slice(0, 60_000),
       ].join("\n"),
       contractValid: false,
+      contractDiagnostics: [
+        {
+          stage:
+            code === "CANDIDATE_NOT_JSON" || code === "CANDIDATE_EMPTY"
+              ? "transport"
+              : "schema",
+          code,
+          repairable: true,
+        },
+      ],
+      contractRepairAttempts: 0,
     };
   }
+}
+
+export interface WorkflowCandidateResult {
+  artifact: string;
+  humanView: string;
+  contractValid: boolean;
+  contractDiagnostics: WorkflowContractDiagnostic[];
+  contractRepairAttempts: number;
+}
+
+function mergeWorkflowUsage(
+  first: InferenceResult["usage"],
+  second: InferenceResult["usage"],
+): InferenceResult["usage"] {
+  const sum = (
+    left: number | null,
+    right: number | null,
+  ): number | null =>
+    left === null || right === null ? null : left + right;
+  return {
+    inputTokens: sum(first.inputTokens, second.inputTokens),
+    outputTokens: sum(first.outputTokens, second.outputTokens),
+    cacheReadTokens: sum(first.cacheReadTokens, second.cacheReadTokens),
+    cacheWriteTokens: sum(first.cacheWriteTokens, second.cacheWriteTokens),
+    cost: sum(first.cost, second.cost),
+    measurementStatus:
+      first.measurementStatus === "unknown" ||
+      second.measurementStatus === "unknown"
+        ? "unknown"
+        : first.measurementStatus === "estimated" ||
+            second.measurementStatus === "estimated"
+          ? "estimated"
+          : "measured",
+  };
+}
+
+export async function repairWorkflowCandidate<
+  T extends WorkflowCandidateResult,
+>(input: {
+  engine: ModelEngine;
+  taskId: string;
+  invalidText: string;
+  initial: T;
+  responseSchema: Record<string, unknown>;
+  publicContract: string;
+  remainingModelCalls: number;
+  remainingTotalTokens?: number | null;
+  consumedUsage: InferenceResult["usage"];
+  initialFinishReason?: InferenceResult["finishReason"];
+  initialTransportDiagnostics?: WorkflowContractDiagnostic[];
+  priorMetrics: WorkflowStepMetrics;
+  parse(text: string): T;
+  signal?: AbortSignal;
+}): Promise<{
+  candidate: T;
+  latencyMs: number;
+  modelCalls: number;
+  usage: InferenceResult["usage"];
+  providerIdentities: NonNullable<WorkflowExecutionResult["providerIdentities"]>;
+  initialContractValid: boolean;
+  initialContractDiagnostics: WorkflowContractDiagnostic[];
+  outcome: WorkflowContractRepairOutcome;
+  succeeded: boolean;
+}> {
+  const zero = unknownWorkflowUsage();
+  const noUsage: InferenceResult["usage"] = {
+    ...zero,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+    measurementStatus: "measured",
+  };
+  const initialFinishValid =
+    input.initialFinishReason === undefined || input.initialFinishReason === "stop";
+  const initialContractDiagnostics = [
+    ...input.initial.contractDiagnostics,
+    ...(input.initialTransportDiagnostics ?? []),
+    ...(initialFinishValid
+      ? []
+      : [
+          {
+            stage: "transport" as const,
+            code: `MODEL_FINISH_REASON_${input.initialFinishReason!.toUpperCase()}`,
+            repairable: true,
+          },
+        ]),
+  ].slice(0, 20);
+  const initialContractValid =
+    input.initial.contractValid &&
+    initialFinishValid &&
+    (input.initialTransportDiagnostics?.length ?? 0) === 0;
+  const unresolvedInitial = (): T => ({
+    ...input.initial,
+    contractValid: initialContractValid,
+    contractDiagnostics: initialContractDiagnostics,
+  });
+  const result = (fields: {
+    candidate: T;
+    latencyMs?: number;
+    modelCalls?: number;
+    usage?: InferenceResult["usage"];
+    providerIdentities?: NonNullable<
+      WorkflowExecutionResult["providerIdentities"]
+    >;
+    outcome: WorkflowContractRepairOutcome;
+  }) => ({
+    candidate: fields.candidate,
+    latencyMs: fields.latencyMs ?? 0,
+    modelCalls: fields.modelCalls ?? 0,
+    usage: fields.usage ?? noUsage,
+    providerIdentities: fields.providerIdentities ?? [],
+    initialContractValid,
+    initialContractDiagnostics,
+    outcome: fields.outcome,
+    succeeded: fields.outcome === "succeeded",
+  });
+  if (initialContractValid) {
+    return result({
+      candidate: unresolvedInitial(),
+      outcome: "not_needed",
+    });
+  }
+  if (input.remainingModelCalls < 1) {
+    return result({
+      candidate: unresolvedInitial(),
+      outcome: "skipped_budget",
+    });
+  }
+  const consumedTokens =
+    input.consumedUsage.inputTokens === null ||
+    input.consumedUsage.outputTokens === null
+      ? null
+      : input.consumedUsage.inputTokens + input.consumedUsage.outputTokens;
+  const repairTokenBudget =
+    input.remainingTotalTokens === null ||
+    input.remainingTotalTokens === undefined
+      ? input.remainingTotalTokens
+      : consumedTokens === null
+        ? 0
+        : input.remainingTotalTokens - consumedTokens;
+  if (
+    repairTokenBudget !== null &&
+    repairTokenBudget !== undefined &&
+    repairTokenBudget < 1
+  ) {
+    return result({
+      candidate: unresolvedInitial(),
+      outcome: "skipped_budget",
+    });
+  }
+  const startedAt = performance.now();
+  let observedRepair:
+    | Awaited<ReturnType<typeof infer>>
+    | undefined;
+  try {
+    const request = boundedWorkflowInferenceRequest(
+      {
+        invocationId: `workflow-contract-repair-${input.taskId}-${randomUUID()}`,
+        messages: [
+          {
+            role: "system",
+            content: WORKFLOW_CONTRACT_REPAIR_SYSTEM_PROMPT,
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              taskId: input.taskId,
+              publicContract: input.publicContract,
+              diagnostics: initialContractDiagnostics.map(
+                ({ stage, code }) => ({ stage, code }),
+              ),
+              invalidCandidate: input.invalidText.slice(
+                0,
+                WORKFLOW_CONTRACT_REPAIR_MAX_CANDIDATE_CHARS,
+              ),
+            }),
+          },
+        ],
+        responseSchema: input.responseSchema,
+        maxOutputTokens: WORKFLOW_CONTRACT_REPAIR_MAX_OUTPUT_TOKENS,
+      },
+      repairTokenBudget,
+    );
+    observedRepair = await infer(input.engine, request, input.signal);
+    const identity = {
+      engineProfileId: input.engine.manifest.profileId,
+      role: "contract-repair",
+      reportedModelId:
+        observedRepair.inference.providerIdentity?.reportedModelId ?? null,
+      reportedSystemFingerprint:
+        observedRepair.inference.providerIdentity?.reportedSystemFingerprint ??
+        null,
+    };
+    if (observedRepair.inference.finishReason !== "stop") {
+      return result({
+        candidate: {
+          ...unresolvedInitial(),
+          contractDiagnostics: [
+            ...initialContractDiagnostics,
+            {
+              stage: "transport",
+              code: `CONTRACT_REPAIR_FINISH_REASON_${observedRepair.inference.finishReason.toUpperCase()}`,
+              repairable: false,
+            },
+          ].slice(0, 20),
+          contractRepairAttempts: 1,
+        },
+        latencyMs: observedRepair.latencyMs,
+        modelCalls: 1,
+        usage: observedRepair.inference.usage,
+        providerIdentities: [identity],
+        outcome: "failed",
+      });
+    }
+    const candidate = input.parse(observedRepair.inference.text);
+    candidate.contractRepairAttempts = 1;
+    return {
+      ...result({
+        candidate,
+        latencyMs: observedRepair.latencyMs,
+        modelCalls: 1,
+        usage: observedRepair.inference.usage,
+        providerIdentities: [identity],
+        outcome: candidate.contractValid ? "succeeded" : "failed",
+      }),
+    };
+  } catch (error) {
+    if (input.signal?.aborted) {
+      const repairMetrics =
+        error instanceof WorkflowAccountedError
+          ? error.metrics
+          : {
+              latencyMs: Math.round(performance.now() - startedAt),
+              modelCalls: 0,
+              usage: noUsage,
+              providerIdentities: [],
+            };
+      throw new WorkflowAccountedError(
+        "WORKFLOW_CONTRACT_REPAIR_ABORTED",
+        {
+          latencyMs: input.priorMetrics.latencyMs + repairMetrics.latencyMs,
+          modelCalls:
+            input.priorMetrics.modelCalls + repairMetrics.modelCalls,
+          usage: addWorkflowUsage(
+            input.priorMetrics.usage,
+            repairMetrics.usage,
+          ),
+          providerIdentities: [
+            ...(input.priorMetrics.providerIdentities ?? []),
+            ...(repairMetrics.providerIdentities ?? []),
+          ],
+        },
+        error instanceof WorkflowAccountedError && error.cause
+          ? error.cause
+          : error,
+      );
+    }
+    if (error instanceof WorkflowTokenBudgetError) {
+      return result({
+        candidate: unresolvedInitial(),
+        outcome: "skipped_budget",
+      });
+    }
+    if (!(error instanceof WorkflowAccountedError)) {
+      return result({
+        candidate: {
+          ...unresolvedInitial(),
+          contractDiagnostics: [
+            ...initialContractDiagnostics,
+            {
+              stage: "transport",
+              code: "CONTRACT_REPAIR_FAILED",
+              repairable: false,
+            },
+          ].slice(0, 20),
+          contractRepairAttempts: observedRepair ? 1 : 0,
+        },
+        latencyMs: Math.round(performance.now() - startedAt),
+        modelCalls: observedRepair ? 1 : 0,
+        usage: observedRepair?.inference.usage ?? noUsage,
+        outcome: "failed",
+      });
+    }
+    return result({
+      candidate: {
+        ...unresolvedInitial(),
+        contractDiagnostics: [
+          ...initialContractDiagnostics,
+          {
+            stage: "transport",
+            code: "CONTRACT_REPAIR_FAILED",
+            repairable: false,
+          },
+        ].slice(0, 20),
+        contractRepairAttempts: 1,
+      },
+      latencyMs: Math.max(
+        error.metrics.latencyMs,
+        Math.round(performance.now() - startedAt),
+      ),
+      modelCalls: error.metrics.modelCalls,
+      usage: error.metrics.usage,
+      providerIdentities: error.metrics.providerIdentities ?? [],
+      outcome: "failed",
+    });
+  }
+}
+
+export function addWorkflowUsage(
+  first: InferenceResult["usage"],
+  second: InferenceResult["usage"],
+): InferenceResult["usage"] {
+  return mergeWorkflowUsage(first, second);
+}
+
+function artifactFinalContract(
+  task: ArtifactEvaluationTask,
+): PeerFinalArtifactContract<unknown> {
+  return {
+    schema: artifactCandidateResponseSchemaFor(projectPublicArtifactTask(task)),
+    instruction: [
+      "Submit the artifact candidate as a direct JSON object, never as an escaped JSON string.",
+      `apiVersion and taskId must match taskId=${task.id}; artifact.kind must be ${task.family}.`,
+    ].join(" "),
+    parse(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+      }
+      const serialized = JSON.stringify(value);
+      return serialized && Buffer.byteLength(serialized, "utf8") <= 262_144
+        ? value
+        : null;
+    },
+  };
 }
 
 abstract class ArtifactWorkflowExecutorBase implements WorkflowExecutor {
@@ -632,31 +1154,57 @@ export class SingleArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBase
       }, input.remainingTotalTokens),
       input.signal,
     );
+    const initial = candidateResult(result.inference.text, this.task);
+    const priorProviderIdentities = [
+      {
+        engineProfileId: this.engine.manifest.profileId,
+        role: "single-implementation",
+        reportedModelId:
+          result.inference.providerIdentity?.reportedModelId ?? null,
+        reportedSystemFingerprint:
+          result.inference.providerIdentity?.reportedSystemFingerprint ?? null,
+      },
+    ];
+    const repair = await repairWorkflowCandidate({
+      engine: this.engine,
+      taskId: this.task.id,
+      invalidText: result.inference.text,
+      initial,
+      responseSchema: artifactCandidateResponseSchemaFor(this.publicTask),
+      publicContract: artifactFamilyContract(this.publicTask.family),
+      remainingModelCalls: input.remainingModelCalls - 1,
+      remainingTotalTokens: input.remainingTotalTokens,
+      consumedUsage: result.inference.usage,
+      initialFinishReason: result.inference.finishReason,
+      priorMetrics: {
+        latencyMs: result.latencyMs,
+        modelCalls: 1,
+        usage: result.inference.usage,
+        providerIdentities: priorProviderIdentities,
+      },
+      parse: (text) => candidateResult(text, this.task),
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     const protocolViolations =
-      result.inference.finishReason === "stop"
+      result.inference.finishReason === "stop" || repair.succeeded
         ? []
         : [`MODEL_FINISH_REASON_${result.inference.finishReason.toUpperCase()}`];
-    const parsed = candidateResult(result.inference.text, this.task);
     return {
-      ...parsed,
+      ...repair.candidate,
+      initialContractValid: repair.initialContractValid,
+      initialContractDiagnostics: repair.initialContractDiagnostics,
+      contractRepairOutcome: repair.outcome,
       cLevelReviewRequested: true,
       handoffs: 0,
       maxObservedConcurrency: 1,
       protocolViolations,
       safety: emptySafety(),
-      latencyMs: result.latencyMs,
-      modelCalls: 1,
-      usage: result.inference.usage,
+      latencyMs: result.latencyMs + repair.latencyMs,
+      modelCalls: 1 + repair.modelCalls,
+      usage: addWorkflowUsage(result.inference.usage, repair.usage),
       providerIdentities: [
-        {
-          engineProfileId: this.engine.manifest.profileId,
-          role: "single-implementation",
-          reportedModelId:
-            result.inference.providerIdentity?.reportedModelId ?? null,
-          reportedSystemFingerprint:
-            result.inference.providerIdentity?.reportedSystemFingerprint ??
-            null,
-        },
+        ...priorProviderIdentities,
+        ...repair.providerIdentities,
       ],
     };
   }
@@ -718,26 +1266,23 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
           {
             role: "system",
             content: [
-              "Design a small task-specific peer team and a concise implementation plan.",
-              "Return exactly one JSON object matching the supplied schema.",
-              "Create exactly one c_level coordinator and at least one worker.",
-              "cLevelRole must exactly equal the id of the single role whose class is c_level.",
-              "Worker role ids represent teams or specialties that the C-level may call by command.",
-              `At most ${Math.min(7, this.#maxParallelAgents)} worker calls may be useful concurrently.`,
-              "Do not implement the deliverable yet. The synthetic evaluator will always approve a valid setup.",
+              "Create a concise implementation plan for the fixed, host-owned artifact peer team.",
+              "Return exactly one JSON object with the single key plan.",
+              "The runtime supplies one coordinator and one specialist; do not invent or configure roles.",
+              "Do not implement the deliverable yet. A valid plan is automatically approved by the synthetic evaluator.",
             ].join("\n"),
           },
           { role: "user", content: JSON.stringify(input.task) },
         ],
-        responseSchema: TEAM_ORIENTATION_SCHEMA,
-        maxOutputTokens: 2_048,
+        responseSchema: ORIENTATION_SCHEMA,
+        maxOutputTokens: 1_024,
       }, input.remainingTotalTokens),
       input.signal,
     );
-    let orientation: ReturnType<typeof parseTeamOrientation>;
+    let plan: string;
     try {
       requireStop(result.inference, "WORKFLOW_TEAM_ORIENTATION");
-      orientation = parseTeamOrientation(result.inference.text);
+      plan = parseSingleOrientation(result.inference.text);
     } catch (error) {
       throw accountWorkflowError(error, "WORKFLOW_TEAM_ORIENTATION_FAILED", {
         latencyMs: result.latencyMs,
@@ -745,10 +1290,16 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
         usage: result.inference.usage,
       });
     }
-    this.orientationPlan = orientation.plan;
-    this.#team = orientation.team;
+    this.orientationPlan = plan;
+    this.#team = fixedWorkflowTeam("artifact");
     return {
-      planHash: sha256(result.inference.text.trim()),
+      planHash: sha256(
+        JSON.stringify({
+          protocolVersion: WORKFLOW_TEAM_PROTOCOL_VERSION,
+          plan,
+          team: this.#team,
+        }),
+      ),
       approvalActor: "system:synthetic-evaluator",
       simulatedApproval: true,
       latencyMs: result.latencyMs,
@@ -786,7 +1337,7 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
     }
     if (
       !Number.isInteger(input.remainingModelCalls) ||
-      input.remainingModelCalls < 1
+      input.remainingModelCalls < WORKFLOW_TEAM_MAX_STAGE_CALLS
     ) {
       throw new Error("WORKFLOW_TEAM_MODEL_CALL_BUDGET_EXHAUSTED");
     }
@@ -801,8 +1352,8 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
       orientationPlan: this.orientationPlan,
       currentGenerationPrompt: generationPrompt,
       finalDeliverableRule: [
-        "When ready, request_review with a StructuredArtifact.",
-        "StructuredArtifact.deliverable must contain exactly the strict artifact-candidate JSON object, without fences or prose.",
+        "When ready, request_review with the strict artifact-candidate object directly in artifact.",
+        "Never serialize the candidate into a string and never add a StructuredArtifact wrapper.",
         artifactFamilyContract(this.publicTask.family),
       ].join(" "),
     });
@@ -811,75 +1362,132 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
     }
     const startedAt = performance.now();
     const controller = new PeerTeamController({
-      maxInternalCycles: 10,
-      maxHandoffs: 40,
-      maxStageCalls: input.remainingModelCalls,
-      maxParallel: this.#maxParallelAgents,
-      maxOutputTokensPerCall: 8_192,
+      maxInternalCycles: WORKFLOW_TEAM_MAX_INTERNAL_CYCLES,
+      maxHandoffs: WORKFLOW_TEAM_MAX_HANDOFFS,
+      maxStageCalls: Math.min(
+        input.remainingModelCalls,
+        WORKFLOW_TEAM_MAX_STAGE_CALLS,
+      ),
+      maxParallel: Math.min(
+        this.#maxParallelAgents,
+        WORKFLOW_TEAM_MAX_PARALLEL,
+      ),
+      maxOutputTokensPerCall: WORKFLOW_TEAM_MAX_OUTPUT_TOKENS,
       maxTotalTokens: input.remainingTotalTokens ?? null,
-      maxDirectiveChars: 64_000,
-      maxWorkerResponseChars: 32_000,
-      maxTranscriptChars: 256_000,
+      maxDirectiveChars: WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS,
+      maxWorkerResponseChars: WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS,
+      maxTranscriptChars: WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS,
     });
-    const result = await controller.run(
-      {
-        taskPacket: {
-          objective: this.publicTask.objective,
-          context,
-          acceptanceCriteria: [
-            ...this.publicTask.publicInstructions,
-            `Return ${this.publicTask.outputContract.apiVersion} for taskId=${this.task.id}.`,
-          ],
+    let result: PeerTeamRunResult<unknown> | null = null;
+    let finalFailure: RepairablePeerTeamFinalFailure | null = null;
+    try {
+      result = await controller.run<unknown>(
+        {
+          taskPacket: {
+            objective: this.publicTask.objective,
+            context,
+            acceptanceCriteria: [
+              ...this.publicTask.publicInstructions,
+              `Return ${this.publicTask.outputContract.apiVersion} for taskId=${this.task.id}.`,
+            ],
+          },
+          organizationRevision: 1,
+          workItemId:
+            this.#runContext?.workItemId ?? `workflow-${this.task.id}`,
+          runId:
+            this.#runContext?.runId ??
+            `workflow-${this.task.id}-${input.submission}-${randomUUID()}`,
+          attemptId:
+            this.#runContext?.attemptId ??
+            `workflow-${this.task.id}-${input.submission}`,
+          generation: this.#runContext?.generation ?? input.submission,
         },
-        organizationRevision: 1,
-        workItemId:
-          this.#runContext?.workItemId ?? `workflow-${this.task.id}`,
-        runId:
-          this.#runContext?.runId ??
-          `workflow-${this.task.id}-${input.submission}-${randomUUID()}`,
-        attemptId:
-          this.#runContext?.attemptId ??
-          `workflow-${this.task.id}-${input.submission}`,
-        generation: this.#runContext?.generation ?? input.submission,
-      },
-      {
-        team: this.#team,
-        engine: this.engine,
-        ...(this.#engineForRole
-          ? { engineForRole: this.#engineForRole }
-          : {}),
-        ...(this.#runContext?.lifecycle
-          ? { lifecycle: this.#runContext.lifecycle }
-          : {}),
-        ...(input.signal ? { signal: input.signal } : {}),
-      },
+        {
+          team: this.#team,
+          engine: this.engine,
+          finalArtifactContract: artifactFinalContract(this.task),
+          ...(this.#engineForRole
+            ? { engineForRole: this.#engineForRole }
+            : {}),
+          ...(this.#runContext?.lifecycle
+            ? { lifecycle: this.#runContext.lifecycle }
+            : {}),
+          reviewRequiresHandoff: true,
+          ...(input.signal ? { signal: input.signal } : {}),
+        },
+      );
+    } catch (error) {
+      finalFailure = repairablePeerTeamFinalFailure(error);
+      if (!finalFailure) {
+        rethrowAccountedPeerTeamError(
+          error,
+          startedAt,
+          "WORKFLOW_TEAM_EXECUTION_FAILED",
+        );
+      }
+    }
+    const metrics = result?.metrics ?? finalFailure!.metrics;
+    const stages = result?.stages ?? finalFailure!.stages;
+    const finalInference = result?.inference ?? finalFailure!.inference;
+    const directCandidate = result
+      ? JSON.stringify(result.artifact)
+      : candidateTextFromPeerFinalDirective(finalInference.text);
+    const initial = candidateResult(directCandidate, this.task);
+    const priorProviderIdentities = peerTeamStageProviderIdentities(stages);
+    const latencyBeforeRepair = Math.max(
+      0,
+      Math.round(performance.now() - startedAt),
     );
-    const parsed = candidateResult(result.artifact.deliverable, this.task);
+    const repair = await repairWorkflowCandidate({
+      engine: this.engine,
+      taskId: this.task.id,
+      invalidText: directCandidate,
+      initial,
+      responseSchema: artifactCandidateResponseSchemaFor(this.publicTask),
+      publicContract: artifactFamilyContract(this.publicTask.family),
+      remainingModelCalls:
+        input.remainingModelCalls - metrics.stageCalls,
+      remainingTotalTokens: input.remainingTotalTokens,
+      consumedUsage: metrics.usage,
+      initialFinishReason: finalInference.finishReason,
+      ...(finalFailure
+        ? {
+            initialTransportDiagnostics: [
+              {
+                stage: "transport" as const,
+                code: `TEAM_${finalFailure.error.code}`,
+                repairable: true,
+              },
+            ],
+          }
+        : {}),
+      priorMetrics: {
+        latencyMs: latencyBeforeRepair,
+        modelCalls: metrics.stageCalls,
+        usage: metrics.usage,
+        providerIdentities: priorProviderIdentities,
+      },
+      parse: (text) => candidateResult(text, this.task),
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     return {
-      ...parsed,
+      ...repair.candidate,
+      initialContractValid: repair.initialContractValid,
+      initialContractDiagnostics: repair.initialContractDiagnostics,
+      contractRepairOutcome: repair.outcome,
       cLevelReviewRequested: true,
-      handoffs: result.metrics.handoffCount,
-      maxObservedConcurrency: result.metrics.maxObservedParallel,
-      protocolViolations: [],
+      handoffs: metrics.handoffCount,
+      maxObservedConcurrency: metrics.maxObservedParallel,
+      protocolViolations:
+        finalFailure && !repair.succeeded ? [finalFailure.error.code] : [],
       safety: emptySafety(),
       latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
-      modelCalls: result.metrics.stageCalls,
-      usage: result.metrics.usage,
-      providerIdentities: result.stages.flatMap((stage) =>
-        stage.inference
-          ? [
-              {
-                engineProfileId: stage.engineId,
-                role: stage.role,
-                reportedModelId:
-                  stage.inference.providerIdentity?.reportedModelId ?? null,
-                reportedSystemFingerprint:
-                  stage.inference.providerIdentity
-                    ?.reportedSystemFingerprint ?? null,
-              },
-            ]
-          : [],
-      ),
+      modelCalls: metrics.stageCalls + repair.modelCalls,
+      usage: addWorkflowUsage(metrics.usage, repair.usage),
+      providerIdentities: [
+        ...priorProviderIdentities,
+        ...repair.providerIdentities,
+      ],
     };
   }
 }

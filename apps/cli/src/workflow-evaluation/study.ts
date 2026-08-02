@@ -132,6 +132,20 @@ function aggregate(
         ? null
         : trial.outcome.totalInputTokens + trial.outcome.totalOutputTokens,
     );
+    const rounds = selected.flatMap((trial) => trial.rounds);
+    const rawContractValidSubmissions = rounds.filter(
+      (round) => round.initialContractValid,
+    ).length;
+    const effectiveContractValidSubmissions = rounds.filter(
+      (round) => round.contractValid,
+    ).length;
+    const contractRepairAttempts = rounds.reduce(
+      (sum, round) => sum + round.contractRepairAttempts,
+      0,
+    );
+    const contractRepairSuccesses = rounds.filter(
+      (round) => round.contractRepairOutcome === "succeeded",
+    ).length;
     return {
       conditionId,
       trials: selected.length,
@@ -183,6 +197,20 @@ function aggregate(
             (sum, value) => sum + (value ?? 0),
             0,
           ),
+      rawContractValidSubmissions,
+      effectiveContractValidSubmissions,
+      contractRepairAttempts,
+      contractRepairSuccesses,
+      rawContractValidityRate:
+        rounds.length === 0
+          ? 0
+          : Number((rawContractValidSubmissions / rounds.length).toFixed(4)),
+      effectiveContractValidityRate:
+        rounds.length === 0
+          ? 0
+          : Number(
+              (effectiveContractValidSubmissions / rounds.length).toFixed(4),
+            ),
       protocolFailures: selected.filter(
         (trial) => trial.outcome.censorReason === "protocol_failure",
       ).length,
@@ -466,7 +494,7 @@ export async function runWorkflowStudy(input: {
     maxParallelAgents: input.limits?.maxParallelAgents ?? 1,
   };
   return {
-    apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha1",
+    apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha2",
     studyId,
     approvedPlanHash: input.approvedPlanHash ?? null,
     approvedPlanCanonicalJson: input.approvedPlanCanonicalJson ?? null,

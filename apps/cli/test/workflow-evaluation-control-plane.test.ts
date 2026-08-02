@@ -179,6 +179,9 @@ test("peer-team stages, invocations, handoff hashes, and final evidence are dura
   );
   assert.ok(handoffEvent, JSON.stringify(audit, null, 2));
   assert.match(String(handoffEvent?.payload.handoffHash), /^[a-f0-9]{64}$/u);
+  assert.equal(handoffEvent?.payload.stageIndex, 1);
+  assert.equal(handoffEvent?.payload.cycle, 1);
+  assert.equal(handoffEvent?.payload.stageKind, "worker");
 
   await runtime.recordExecution?.({
     submission: 1,

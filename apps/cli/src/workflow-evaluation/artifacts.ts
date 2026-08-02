@@ -227,10 +227,17 @@ export class ArtifactCandidateParseError extends Error {
   }
 }
 
-const IDENTIFIER = /^[a-z][a-z0-9-]{0,63}$/u;
-const COLUMN_KEY = /^[a-z][a-z0-9_]{0,63}$/u;
-const CELL_REFERENCE = /^[A-Z]{1,3}[1-9][0-9]{0,5}$/u;
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/u;
+export const ARTIFACT_IDENTIFIER_PATTERN = "^[a-z][a-z0-9-]{0,63}$";
+export const ARTIFACT_COLUMN_KEY_PATTERN = "^[a-z][a-z0-9_]{0,63}$";
+export const ARTIFACT_CELL_REFERENCE_PATTERN = "^[A-Z]{1,3}[1-9][0-9]{0,5}$";
+export const ARTIFACT_ISO_DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$";
+export const ARTIFACT_HTTPS_URL_PATTERN = "^[Hh][Tt][Tt][Pp][Ss]://";
+
+const IDENTIFIER = new RegExp(ARTIFACT_IDENTIFIER_PATTERN, "u");
+const COLUMN_KEY = new RegExp(ARTIFACT_COLUMN_KEY_PATTERN, "u");
+const CELL_REFERENCE = new RegExp(ARTIFACT_CELL_REFERENCE_PATTERN, "u");
+const ISO_DATE = new RegExp(ARTIFACT_ISO_DATE_PATTERN, "u");
+const HTTPS_URL = new RegExp(ARTIFACT_HTTPS_URL_PATTERN, "u");
 const FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const MAX_COLLECTION_ITEMS = 512;
 const MAX_JSON_DEPTH = 64;
@@ -385,7 +392,10 @@ function validateResearch(value: Record<string, unknown>): void {
     );
     const id = identifier(child.id, `sources[${index}].id`);
     text(child.title, `sources[${index}].title`, { max: 500 });
-    const url = text(child.url, `sources[${index}].url`, { max: 2048 });
+    const url = text(child.url, `sources[${index}].url`, {
+      max: 2048,
+      pattern: HTTPS_URL,
+    });
     let parsed: URL;
     try {
       parsed = new URL(url);

@@ -1847,3 +1847,31 @@ ADR 0018 adds the first opt-in generated-code evaluation boundary:
 This pilot establishes only comparative evidence for the declared task
 families. It does not meet the sample size, repeated-run, or operational
 duration needed for a company-autonomy claim.
+
+# Longitudinal collaboration-study reliability amendment — 2026-08-02
+
+ADR 0019 and harness `v1alpha5` define the current provider-neutral comparison
+boundary:
+
+- Team-Lite uses one host-owned coordinator and one specialist with a fixed
+  three-stage route: coordinator dispatch, specialist response, coordinator
+  final review. One handoff, two internal cycles, serial execution, and a
+  caller-owned typed final artifact are plan-hash commitments.
+- The generic peer-team controller remains configurable. Handoff-first review
+  is opt-in so existing callers retain immediate `StructuredArtifact` review.
+- Public application schemas and parsers share field constraints. A first
+  output that is public-contract-invalid or has a non-`stop` finish may receive
+  one budgeted repair call using only public diagnostics and the same task-bound
+  schema. No hidden evaluator result influences repair or artifact retention.
+- Reports keep raw first-output validity, repair outcome, and effective
+  validity separate. Repair calls, tokens, and latency are charged to the
+  originating condition. Only the latest contract-valid, protocol-valid, safe
+  artifact becomes the next revision baseline; sealed score never selects it.
+- Peer-stage failures retain bounded stage, cycle, role, invocation, usage, and
+  partial-call evidence after parallel settlement. Raw model text and exception
+  messages are not exported as failure telemetry.
+- The approved plan binds the fixed-team manifests, controller bounds, repair
+  prompt and limits, schema-portability and retention policies, and provider
+  bindings. The seed controls task and condition order only; provider-default
+  sampling and unshared orientations mean feedback-policy deltas remain
+  exploratory until a shared-orientation design is implemented.

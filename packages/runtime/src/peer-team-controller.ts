@@ -41,13 +41,21 @@ export interface PeerDispatchDirective {
   recipients: PeerDispatchRecipient[];
 }
 
-export interface PeerReviewDirective {
-  action: "request_review";
-  reason: string;
-  artifact: StructuredArtifact;
+export interface PeerFinalArtifactContract<T> {
+  schema: Record<string, unknown>;
+  instruction: string;
+  parse(value: unknown): T | null;
 }
 
-export type PeerTeamDirective = PeerDispatchDirective | PeerReviewDirective;
+export interface PeerReviewDirective<T = StructuredArtifact> {
+  action: "request_review";
+  reason: string;
+  artifact: T;
+}
+
+export type PeerTeamDirective<T = StructuredArtifact> =
+  | PeerDispatchDirective
+  | PeerReviewDirective<T>;
 
 export interface PeerHandoffEnvelope {
   apiVersion: "chartermesh.dev/peer-handoff/v1alpha1";
@@ -133,10 +141,10 @@ export interface PeerTeamRunMetrics {
   usage: ModelUsage;
 }
 
-export interface PeerTeamRunResult {
+export interface PeerTeamRunResult<T = StructuredArtifact> {
   hostRunId: string;
   inference: InferenceResult;
-  artifact: StructuredArtifact;
+  artifact: T;
   reviewReason: string;
   stages: PeerTeamStage[];
   handoffs: PeerHandoffRecord[];
@@ -161,6 +169,9 @@ export type PeerTeamErrorCode =
   | "INVALID_TEAM_SETUP"
   | "INVALID_TASK_PACKET"
   | "ENGINE_RESOLUTION_FAILED"
+  | "STAGE_EXECUTION_FAILED"
+  | "LIFECYCLE_FAILED"
+  | "CONTROLLER_EXECUTION_FAILED"
   | "PROTOCOL_INVALID_JSON"
   | "PROTOCOL_INVALID_DIRECTIVE"
   | "PROTOCOL_OUTPUT_LIMIT"
@@ -168,6 +179,7 @@ export type PeerTeamErrorCode =
   | "INVALID_TARGET"
   | "C_LEVEL_TARGET_FORBIDDEN"
   | "C_LEVEL_ONLY_REVIEW"
+  | "REVIEW_BEFORE_HANDOFF"
   | "WORKER_DIRECTIVE_FORBIDDEN"
   | "HANDOFF_LIMIT_EXCEEDED"
   | "STAGE_CALL_LIMIT_EXCEEDED"
@@ -178,13 +190,51 @@ export type PeerTeamErrorCode =
   | "CANCELLATION_UNSETTLED"
   | "CANCELED";
 
+export interface PeerTeamFailureContext {
+  stage:
+    | "setup"
+    | "c_level"
+    | "dispatch"
+    | "worker"
+    | "review"
+    | "liveness"
+    | "controller";
+  stageIndex: number | null;
+  cycle: number | null;
+  role: string | null;
+}
+
+export interface PeerTeamFailureState {
+  metrics: PeerTeamRunMetrics;
+  stages: PeerTeamStage[];
+}
+
 export class PeerTeamControllerError extends Error {
   readonly code: PeerTeamErrorCode;
+  context: PeerTeamFailureContext | null;
+  failureState: PeerTeamFailureState | null;
 
-  constructor(code: PeerTeamErrorCode, message: string, cause?: unknown) {
+  constructor(
+    code: PeerTeamErrorCode,
+    message: string,
+    cause?: unknown,
+    context: PeerTeamFailureContext | null = null,
+  ) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "PeerTeamControllerError";
     this.code = code;
+    this.context = context;
+    this.failureState = null;
+  }
+
+  withContext(context: PeerTeamFailureContext): PeerTeamControllerError {
+    this.context ??= context;
+    return this;
+  }
+
+  withFailureState(state: PeerTeamFailureState): PeerTeamControllerError {
+    this.failureState = state;
+    return this;
   }
 }
 
@@ -212,48 +262,72 @@ const artifactKeys = [
   "confidence",
 ] as const;
 
-const directiveSchema = {
-  oneOf: [
-    {
-      type: "object",
-      additionalProperties: false,
-      required: ["action", "reason", "recipients"],
-      properties: {
-        action: { const: "dispatch" },
-        reason: { type: "string", minLength: 1, maxLength: 2_000 },
-        recipients: {
-          type: "array",
-          minItems: 1,
-          maxItems: 16,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: ["role", "instruction", "artifactAccess"],
-            properties: {
-              role: { type: "string", minLength: 1, maxLength: 64 },
-              instruction: {
-                type: "string",
-                minLength: 1,
-                maxLength: 8_000,
-              },
-              artifactAccess: { enum: ["read_only", "isolated"] },
-            },
+const dispatchDirectiveSchema = (
+  workerRoleIds: readonly string[],
+  maxRecipients = 16,
+) => ({
+  type: "object",
+  additionalProperties: false,
+  required: ["action", "reason", "recipients"],
+  properties: {
+    action: { const: "dispatch" },
+    reason: { type: "string", minLength: 1, maxLength: 2_000 },
+    recipients: {
+      type: "array",
+      minItems: 1,
+      maxItems: Math.min(16, maxRecipients),
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["role", "instruction", "artifactAccess"],
+        properties: {
+          role: { enum: [...workerRoleIds] },
+          instruction: {
+            type: "string",
+            minLength: 1,
+            maxLength: 8_000,
           },
+          artifactAccess: { enum: ["read_only", "isolated"] },
         },
       },
     },
-    {
+  },
+});
+
+function directiveSchemaFor(
+  workerRoleIds: readonly string[],
+  artifactSchema: Record<string, unknown>,
+  allowDispatch: boolean,
+  allowReview: boolean,
+  maxDispatchRecipients = 16,
+): Record<string, unknown> {
+  const dispatch = dispatchDirectiveSchema(
+    workerRoleIds,
+    maxDispatchRecipients,
+  );
+  const review = {
       type: "object",
       additionalProperties: false,
       required: ["action", "reason", "artifact"],
       properties: {
         action: { const: "request_review" },
         reason: { type: "string", minLength: 1, maxLength: 2_000 },
-        artifact: structuredArtifactSchema,
+        artifact: artifactSchema,
       },
-    },
-  ],
-} satisfies Record<string, unknown>;
+    };
+  if (!allowReview) return dispatch;
+  if (!allowDispatch) return review;
+  return {
+    oneOf: [dispatch, review],
+  };
+}
+
+const defaultFinalArtifactContract: PeerFinalArtifactContract<StructuredArtifact> = {
+  schema: structuredArtifactSchema,
+  instruction:
+    "Submit one complete human-reviewable StructuredArtifact matching the supplied response schema.",
+  parse: strictArtifact,
+};
 
 function ownRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -394,10 +468,23 @@ function strictArtifact(value: unknown): StructuredArtifact | null {
   return parseStructuredArtifact(JSON.stringify(value));
 }
 
-export function parsePeerTeamDirective(
+export function parsePeerTeamDirective<T = StructuredArtifact>(
   text: string,
   maxChars = 64_000,
-): PeerTeamDirective {
+  options: {
+    finalArtifactContract?: PeerFinalArtifactContract<T>;
+    allowedWorkerRoles?: readonly string[];
+    allowDispatch?: boolean;
+    allowReview?: boolean;
+    maxDispatchRecipients?: number;
+  } = {},
+): PeerTeamDirective<T> {
+  const finalArtifactContract =
+    options.finalArtifactContract ??
+    (defaultFinalArtifactContract as unknown as PeerFinalArtifactContract<T>);
+  const allowedWorkerRoles = options.allowedWorkerRoles
+    ? new Set(options.allowedWorkerRoles)
+    : null;
   if (text.length > maxChars) {
     throw new PeerTeamControllerError(
       "PROTOCOL_OUTPUT_LIMIT",
@@ -428,12 +515,18 @@ export function parsePeerTeamDirective(
     );
   }
   if (value.action === "dispatch") {
+    if (options.allowDispatch === false) {
+      throw new PeerTeamControllerError(
+        "HANDOFF_LIMIT_EXCEEDED",
+        "C-level cannot dispatch another handoff at this stage.",
+      );
+    }
     if (
       !exactKeys(value, ["action", "reason", "recipients"]) ||
       !boundedString(value.reason, 2_000) ||
       !Array.isArray(value.recipients) ||
       value.recipients.length < 1 ||
-      value.recipients.length > 16
+      value.recipients.length > (options.maxDispatchRecipients ?? 16)
     ) {
       throw new PeerTeamControllerError(
         "PROTOCOL_INVALID_DIRECTIVE",
@@ -454,6 +547,12 @@ export function parsePeerTeamDirective(
           "Each dispatch recipient must have a bounded role, instruction, and safe artifactAccess.",
         );
       }
+      if (allowedWorkerRoles && !allowedWorkerRoles.has(candidate.role)) {
+        throw new PeerTeamControllerError(
+          "INVALID_TARGET",
+          `C-level dispatched unknown role ${candidate.role}.`,
+        );
+      }
       recipients.push(candidate as unknown as PeerDispatchRecipient);
     }
     return {
@@ -463,7 +562,22 @@ export function parsePeerTeamDirective(
     };
   }
   if (value.action === "request_review") {
-    const artifact = strictArtifact(value.artifact);
+    if (options.allowReview === false) {
+      throw new PeerTeamControllerError(
+        "REVIEW_BEFORE_HANDOFF",
+        "C-level must complete at least one command handoff before requesting review.",
+      );
+    }
+    let artifact: T | null = null;
+    try {
+      artifact = finalArtifactContract.parse(value.artifact);
+    } catch (error) {
+      throw new PeerTeamControllerError(
+        "PROTOCOL_INVALID_DIRECTIVE",
+        "The final artifact contract parser rejected the review artifact.",
+        error,
+      );
+    }
     if (
       !exactKeys(value, ["action", "reason", "artifact"]) ||
       !boundedString(value.reason, 2_000) ||
@@ -471,7 +585,7 @@ export function parsePeerTeamDirective(
     ) {
       throw new PeerTeamControllerError(
         "PROTOCOL_INVALID_DIRECTIVE",
-        "request_review must contain a strictly valid StructuredArtifact.",
+        "request_review must contain an artifact accepted by the caller-owned final contract.",
       );
     }
     return { action: "request_review", reason: value.reason, artifact };
@@ -623,25 +737,71 @@ export class PeerTeamController {
     };
   }
 
-  async run(
+  async run<T = StructuredArtifact>(
     request: HostRunRequest,
     options: {
       team: PeerTeamSetup;
       engine: ModelEngine;
+      finalArtifactContract?: PeerFinalArtifactContract<T>;
       engineForRole?: (role: string) => ModelEngine;
       lifecycle?: Partial<PeerTeamLifecycle>;
+      reviewRequiresHandoff?: boolean;
       signal?: AbortSignal;
     },
-  ): Promise<PeerTeamRunResult> {
-    const task = normalizeTask(request.taskPacket);
-    const roleMap = validateTeam(options.team);
+  ): Promise<PeerTeamRunResult<T>> {
+    let task: NormalizedTask;
+    let roleMap: Map<string, PeerTeamRole>;
+    try {
+      task = normalizeTask(request.taskPacket);
+      roleMap = validateTeam(options.team);
+    } catch (error) {
+      throw error instanceof PeerTeamControllerError
+        ? error.withContext({
+            stage: "setup",
+            stageIndex: null,
+            cycle: null,
+            role: null,
+          })
+        : error;
+    }
     const cLevel = roleMap.get(options.team.cLevelRole);
     if (!cLevel) {
       throw new PeerTeamControllerError(
         "INVALID_TEAM_SETUP",
         "The configured C-level role was not found.",
+        undefined,
+        {
+          stage: "setup",
+          stageIndex: null,
+          cycle: null,
+          role: options.team.cLevelRole,
+        },
       );
     }
+    const finalArtifactContract =
+      options.finalArtifactContract ??
+      (defaultFinalArtifactContract as unknown as PeerFinalArtifactContract<T>);
+    if (
+      !ownRecord(finalArtifactContract) ||
+      !ownRecord(finalArtifactContract.schema) ||
+      !boundedString(finalArtifactContract.instruction, 4_000) ||
+      typeof finalArtifactContract.parse !== "function"
+    ) {
+      throw new PeerTeamControllerError(
+        "INVALID_CONFIGURATION",
+        "The caller-owned final artifact contract is invalid.",
+        undefined,
+        {
+          stage: "setup",
+          stageIndex: null,
+          cycle: null,
+          role: cLevel.id,
+        },
+      );
+    }
+    const workerRoleIds = options.team.roles
+      .filter(({ class: roleClass }) => roleClass === "worker")
+      .map(({ id }) => id);
     assertEngine(options.engine, "default");
     if (options.signal?.aborted) throw canceled(options.signal.reason);
 
@@ -655,6 +815,53 @@ export class PeerTeamController {
     let workerCalls = 0;
     let consumedTokens = 0;
     let reservedTokens = 0;
+    let currentCycle = 0;
+    let currentContext: PeerTeamFailureContext = {
+      stage: "setup",
+      stageIndex: null,
+      cycle: null,
+      role: cLevel.id,
+    };
+
+    const captureFailureState = (
+      error: PeerTeamControllerError,
+      cycle: number,
+    ): PeerTeamControllerError => {
+      const orderedStages = [...stages].sort(
+        (left, right) => left.index - right.index,
+      );
+      const successfulInferences = orderedStages.flatMap((stage) =>
+        stage.inference ? [stage.inference] : [],
+      );
+      const hasStartedUnmeteredStage = orderedStages.some(
+        (stage) => stage.status !== "succeeded" && !stage.inference,
+      );
+      const usage = hasStartedUnmeteredStage
+        ? {
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadTokens: null,
+            cacheWriteTokens: null,
+            cost: null,
+            measurementStatus: "unknown" as const,
+          }
+        : aggregateUsage(successfulInferences);
+      return error.withFailureState({
+        stages: orderedStages,
+        metrics: {
+          setupModelCalls: 0,
+          internalCycles: Math.max(0, cycle),
+          cLevelCalls,
+          workerCalls,
+          stageCalls: orderedStages.length,
+          handoffCount: handoffs.length,
+          configuredMaxParallel: this.maxParallel,
+          effectiveMaxParallel,
+          maxObservedParallel,
+          usage,
+        },
+      });
+    };
 
     const resolveEngine = (role: string): ModelEngine => {
       let engine: unknown;
@@ -750,6 +957,13 @@ export class PeerTeamController {
         throw new PeerTeamControllerError(
           "STAGE_CALL_LIMIT_EXCEEDED",
           `Peer-team execution reached the ${this.maxStageCalls} stage-call limit.`,
+          undefined,
+          {
+            stage: input.kind,
+            stageIndex: nextStageIndex,
+            cycle: input.cycle,
+            role: input.role,
+          },
         );
       }
       let maxOutputTokens = this.maxOutputTokensPerCall;
@@ -777,6 +991,13 @@ export class PeerTeamController {
           throw new PeerTeamControllerError(
             "TOKEN_LIMIT_EXCEEDED",
             "The next peer-team stage cannot fit within the remaining token budget.",
+            undefined,
+            {
+              stage: input.kind,
+              stageIndex: nextStageIndex,
+              cycle: input.cycle,
+              role: input.role,
+            },
           );
         }
         maxOutputTokens = Math.min(
@@ -805,7 +1026,20 @@ export class PeerTeamController {
         });
       } catch (error) {
         releaseTokenReservation();
-        throw error;
+        throw captureFailureState(
+          new PeerTeamControllerError(
+            "LIFECYCLE_FAILED",
+            `Lifecycle startStage failed for ${input.role}.`,
+            error,
+            {
+              stage: input.kind,
+              stageIndex: index,
+              cycle: input.cycle,
+              role: input.role,
+            },
+          ),
+          input.cycle,
+        );
       }
       const attemptId =
         started?.attemptId ??
@@ -813,6 +1047,8 @@ export class PeerTeamController {
       const invocationId = `${attemptId}:inference`;
       const startedAt = performance.now();
       let inference: InferenceResult | undefined;
+      if (input.kind === "c_level") cLevelCalls += 1;
+      else workerCalls += 1;
       try {
         inference = await generate(
           input.engine,
@@ -876,13 +1112,59 @@ export class PeerTeamController {
         });
         return { inference, value, latencyMs, attemptId };
       } catch (error) {
+        if (stages.some((stage) => stage.index === index)) {
+          throw captureFailureState(
+            new PeerTeamControllerError(
+              "LIFECYCLE_FAILED",
+              `Lifecycle finishStage failed for ${input.role}.`,
+              error,
+              {
+                stage: input.kind,
+                stageIndex: index,
+                cycle: input.cycle,
+                role: input.role,
+              },
+            ),
+            input.cycle,
+          );
+        }
+        const failureStage: PeerTeamFailureContext["stage"] =
+          error instanceof PeerTeamControllerError &&
+          ["INVALID_TARGET", "C_LEVEL_TARGET_FORBIDDEN"].includes(error.code)
+            ? "dispatch"
+            : error instanceof PeerTeamControllerError &&
+                ["REVIEW_BEFORE_HANDOFF", "C_LEVEL_ONLY_REVIEW"].includes(
+                  error.code,
+                )
+              ? "review"
+              : input.kind;
+        const contextualError =
+          error instanceof PeerTeamControllerError
+            ? error.withContext({
+                stage: failureStage,
+                stageIndex: index,
+                cycle: input.cycle,
+                role: input.role,
+              })
+            : new PeerTeamControllerError(
+                "STAGE_EXECUTION_FAILED",
+                `Model stage failed for ${input.role}.`,
+                error,
+                {
+                  stage: failureStage,
+                  stageIndex: index,
+                  cycle: input.cycle,
+                  role: input.role,
+                },
+              );
         const status =
           input.signal?.aborted ||
-          (error instanceof PeerTeamControllerError && error.code === "CANCELED")
+          (contextualError instanceof PeerTeamControllerError &&
+            contextualError.code === "CANCELED")
             ? "canceled"
             : "failed";
         const latencyMs = Math.round(performance.now() - startedAt);
-        const code = errorCode(error);
+        const code = errorCode(contextualError);
         stages.push({
           index,
           cycle: input.cycle,
@@ -903,19 +1185,19 @@ export class PeerTeamController {
           attemptId,
           status,
           ...(inference ? { inference } : {}),
-          error,
+          error: contextualError,
         });
-        throw error;
+        throw captureFailureState(contextualError, input.cycle);
       } finally {
         releaseTokenReservation();
       }
     };
 
-    await options.lifecycle?.setupTeam?.({ request, team: options.team });
+    try {
+      await options.lifecycle?.setupTeam?.({ request, team: options.team });
 
-    const transcript = (): string => {
-      const value = JSON.stringify(
-        handoffs.map(({ envelope, envelopeHash, inference }) => ({
+    const transcript = () => {
+      const value = handoffs.map(({ envelope, envelopeHash, inference }) => ({
           commandId: envelope.commandId,
           envelopeHash,
           fromRole: envelope.fromRole,
@@ -923,9 +1205,8 @@ export class PeerTeamController {
           artifactAccess: envelope.artifactAccess,
           instruction: envelope.instruction,
           result: inference.text,
-        })),
-      );
-      if (value.length > this.maxTranscriptChars) {
+        }));
+      if (JSON.stringify(value).length > this.maxTranscriptChars) {
         throw new PeerTeamControllerError(
           "TRANSCRIPT_LIMIT_EXCEEDED",
           `Peer-team transcript exceeded ${this.maxTranscriptChars} characters.`,
@@ -934,14 +1215,27 @@ export class PeerTeamController {
       return value;
     };
 
-    const cLevelMessages = (cycle: number): InferenceRequest["messages"] => [
+    const cLevelMessages = (
+      cycle: number,
+      allowDispatch: boolean,
+      allowReview: boolean,
+    ): InferenceRequest["messages"] => [
       {
         role: "system",
         content: [
           "You are the C-level coordinator of a bounded peer team.",
           "Return exactly one JSON object and no Markdown, prose, or code fence.",
-          "Use action=dispatch to send command-mediated work to declared worker roles.",
-          "Use action=request_review only when a complete human-reviewable StructuredArtifact is ready.",
+          ...(allowDispatch
+            ? [
+                "Use action=dispatch to send command-mediated work to declared worker roles.",
+              ]
+            : []),
+          ...(allowReview
+            ? [
+                "Use action=request_review when the caller-owned final artifact is ready.",
+              ]
+            : []),
+          finalArtifactContract.instruction,
           "Only you may request human review. Workers cannot approve work or substitute for a human.",
           "Parallel recipients are limited to read_only or isolated artifact access.",
           `This is internal cycle ${cycle} of ${this.maxInternalCycles}.`,
@@ -955,31 +1249,34 @@ export class PeerTeamController {
           acceptanceCriteria: task.acceptanceCriteria,
           team: options.team,
           completedHandoffs: transcript(),
+          finalArtifactInstruction: finalArtifactContract.instruction,
           allowedActions: {
-            dispatch: {
-              action: "dispatch",
-              reason: "Why these commands are needed",
-              recipients: [
-                {
-                  role: "a declared worker role id",
-                  instruction: "A bounded command",
-                  artifactAccess: "read_only or isolated",
-                },
-              ],
-            },
-            request_review: {
-              action: "request_review",
-              reason: "Why the artifact is ready for human review",
-              artifact: {
-                apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
-                summary: "...",
-                deliverable: "...",
-                checks: [],
-                risks: [],
-                nextActions: [],
-                confidence: "low, medium, or high",
-              },
-            },
+            ...(allowDispatch
+              ? {
+                  dispatch: {
+                    action: "dispatch",
+                    reason: "Why these commands are needed",
+                    recipients: [
+                      {
+                        role: "a declared worker role id",
+                        instruction: "A bounded command",
+                        artifactAccess: "read_only or isolated",
+                      },
+                    ],
+                  },
+                }
+              : {}),
+            ...(allowReview
+              ? {
+                  request_review: {
+                    action: "request_review",
+                    reason:
+                      "Why the caller-owned artifact is ready for human review",
+                    artifact:
+                      "Emit the artifact object required by the supplied response schema, never a JSON string.",
+                  },
+                }
+              : {}),
           },
         }),
       },
@@ -1002,7 +1299,9 @@ export class PeerTeamController {
         role: "user",
         content: JSON.stringify({
           objective: task.objective,
+          context: task.context,
           acceptanceCriteria: task.acceptanceCriteria,
+          assignedRole: roleMap.get(envelope.toRole),
           command: envelope,
           envelopeHash,
         }),
@@ -1046,25 +1345,64 @@ export class PeerTeamController {
     };
 
     for (let cycle = 1; cycle <= this.maxInternalCycles; cycle += 1) {
+      currentCycle = cycle;
+      currentContext = {
+        stage: "c_level",
+        stageIndex: nextStageIndex,
+        cycle,
+        role: cLevel.id,
+      };
       if (options.signal?.aborted) throw canceled(options.signal.reason);
       const cLevelEngine = resolveEngine(cLevel.id);
-      cLevelCalls += 1;
+      const allowDispatch = handoffs.length < this.maxHandoffs;
+      const allowReview =
+        !options.reviewRequiresHandoff || handoffs.length > 0;
+      const maxDispatchRecipients = Math.max(
+        1,
+        Math.min(16, this.maxHandoffs - handoffs.length),
+      );
       const decision = await invoke({
         cycle,
         kind: "c_level",
         role: cLevel.id,
         engine: cLevelEngine,
-        messages: cLevelMessages(cycle),
-        responseSchema: directiveSchema,
+        messages: cLevelMessages(cycle, allowDispatch, allowReview),
+        responseSchema: directiveSchemaFor(
+          workerRoleIds,
+          finalArtifactContract.schema,
+          allowDispatch,
+          allowReview,
+          maxDispatchRecipients,
+        ),
         ...(options.signal ? { signal: options.signal } : {}),
         validate: ({ text }) =>
-          parsePeerTeamDirective(text, this.maxDirectiveChars),
+          parsePeerTeamDirective<T>(text, this.maxDirectiveChars, {
+            finalArtifactContract,
+            allowedWorkerRoles: workerRoleIds,
+            allowDispatch,
+            allowReview,
+            maxDispatchRecipients,
+          }),
       });
 
       if (decision.value.action === "request_review") {
+        const artifactText = JSON.stringify(decision.value.artifact);
+        if (!artifactText) {
+          throw captureFailureState(new PeerTeamControllerError(
+            "PROTOCOL_INVALID_DIRECTIVE",
+            "The caller-owned final artifact was not JSON serializable.",
+            undefined,
+            {
+              stage: "review",
+              stageIndex: stages.length - 1,
+              cycle,
+              role: cLevel.id,
+            },
+          ), cycle);
+        }
         const finalInference: InferenceResult = {
           ...decision.inference,
-          text: JSON.stringify(decision.value.artifact),
+          text: artifactText,
         };
         const orderedStages = [...stages].sort(
           (left, right) => left.index - right.index,
@@ -1098,25 +1436,52 @@ export class PeerTeamController {
         handoffs.length + decision.value.recipients.length >
         this.maxHandoffs
       ) {
-        throw new PeerTeamControllerError(
+        throw captureFailureState(new PeerTeamControllerError(
           "HANDOFF_LIMIT_EXCEEDED",
           `Dispatch would exceed the ${this.maxHandoffs} handoff limit.`,
-        );
+          undefined,
+          {
+            stage: "dispatch",
+            stageIndex: decision.value.recipients.length + stages.length,
+            cycle,
+            role: cLevel.id,
+          },
+        ), cycle);
       }
 
+      currentContext = {
+        stage: "dispatch",
+        stageIndex: nextStageIndex,
+        cycle,
+        role: cLevel.id,
+      };
       const pending = decision.value.recipients.map((recipient, offset) => {
         const role = roleMap.get(recipient.role);
         if (!role) {
-          throw new PeerTeamControllerError(
+          throw captureFailureState(new PeerTeamControllerError(
             "INVALID_TARGET",
             `C-level dispatched unknown role ${recipient.role}.`,
-          );
+            undefined,
+            {
+              stage: "dispatch",
+              stageIndex: stages.length,
+              cycle,
+              role: cLevel.id,
+            },
+          ), cycle);
         }
         if (role.class === "c_level") {
-          throw new PeerTeamControllerError(
+          throw captureFailureState(new PeerTeamControllerError(
             "C_LEVEL_TARGET_FORBIDDEN",
             "C-level cannot be used as its own worker target.",
-          );
+            undefined,
+            {
+              stage: "dispatch",
+              stageIndex: stages.length,
+              cycle,
+              role: cLevel.id,
+            },
+          ), cycle);
         }
         const engine = resolveEngine(role.id);
         const envelope: PeerHandoffEnvelope = {
@@ -1191,7 +1556,6 @@ export class PeerTeamController {
         );
         activeWorkers += 1;
         maxObservedParallel = Math.max(maxObservedParallel, activeWorkers);
-        workerCalls += 1;
         const promise = (async () => {
           const startedAt = performance.now();
           try {
@@ -1281,7 +1645,9 @@ export class PeerTeamController {
             error,
           });
         }
-        throw error;
+        throw error instanceof PeerTeamControllerError
+          ? captureFailureState(error, cycle)
+          : error;
       }
       for (let index = 0; index < pending.length; index += 1) {
         const record = records.get(index);
@@ -1298,6 +1664,25 @@ export class PeerTeamController {
     throw new PeerTeamControllerError(
       "LIVENESS_EXHAUSTED",
       `C-level did not request human review within ${this.maxInternalCycles} internal cycles.`,
+      undefined,
+      {
+        stage: "liveness",
+        stageIndex: stages.length,
+        cycle: this.maxInternalCycles,
+        role: cLevel.id,
+      },
     );
+    } catch (error) {
+      const normalized =
+        error instanceof PeerTeamControllerError
+          ? error.withContext(currentContext)
+          : new PeerTeamControllerError(
+              "CONTROLLER_EXECUTION_FAILED",
+              "Peer-team execution failed outside a model-stage protocol boundary.",
+              error,
+              currentContext,
+            );
+      throw captureFailureState(normalized, currentCycle);
+    }
   }
 }

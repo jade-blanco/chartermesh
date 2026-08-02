@@ -232,36 +232,17 @@ test("single executor uses one matched orientation call and emits canonical huma
   assert.equal(output.handoffs, 0);
 });
 
-test("peer-team executor forms a task-specific team and only returns after a command handoff", async () => {
+test("peer-team executor uses the fixed typed team and only returns after a command handoff", async () => {
   const task = generateReferenceArtifactSuite()[0]!;
   const publicTask = workflowTaskFromArtifactTask(task);
   let cLevelCalls = 0;
   const implementation = engine(async (request) => {
     const system = request.messages.find(({ role }) => role === "system")?.content ?? "";
-    if (system.includes("Design a small task-specific peer team")) {
-      assert.match(
-        system,
-        /cLevelRole must exactly equal the id of the single role/u,
-      );
+    if (system.includes("fixed, host-owned artifact peer team")) {
       return result(
         request,
         JSON.stringify({
           plan: "Delegate a schema check, then synthesize the candidate.",
-          cLevelRole: "chief",
-          roles: [
-            {
-              id: "chief",
-              name: "Chief",
-              class: "c_level",
-              description: "Coordinates the bounded implementation.",
-            },
-            {
-              id: "maker",
-              name: "Maker Team",
-              class: "worker",
-              description: "Checks public requirements and artifact structure.",
-            },
-          ],
         }),
       );
     }
@@ -278,7 +259,7 @@ test("peer-team executor forms a task-specific team and only returns after a com
             reason: "A worker must check the public contract.",
             recipients: [
               {
-                role: "maker",
+                role: "specialist",
                 instruction: "Check all public requirements and report omissions.",
                 artifactAccess: "read_only",
               },
@@ -291,15 +272,7 @@ test("peer-team executor forms a task-specific team and only returns after a com
         JSON.stringify({
           action: "request_review",
           reason: "The worker check was incorporated.",
-          artifact: {
-            apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
-            summary: "Candidate ready for sealed evaluation.",
-            deliverable: canonicalArtifactJson(task.oracleCandidate),
-            checks: ["Worker result returned through the handoff channel."],
-            risks: ["Semantic evaluation only."],
-            nextActions: ["Await sealed evaluator result."],
-            confidence: "high",
-          },
+          artifact: task.oracleCandidate,
         }),
       );
     }
@@ -331,6 +304,279 @@ test("peer-team executor forms a task-specific team and only returns after a com
   assert.equal(output.handoffs, 1);
   assert.equal(output.contractValid, true);
   assert.equal(output.artifact, canonicalArtifactJson(task.oracleCandidate));
+});
+
+test("peer-team executor repairs one malformed final C-level response with symmetric accounting", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  let cLevelCalls = 0;
+  let calls = 0;
+  const implementation = engine(async (request) => {
+    calls += 1;
+    const system = request.messages.find(({ role }) => role === "system")?.content ?? "";
+    if (system.includes("fixed, host-owned artifact peer team")) {
+      return result(
+        request,
+        JSON.stringify({ plan: "Delegate once, then synthesize and repair only representation." }),
+      );
+    }
+    if (system.includes("You are worker role")) {
+      return result(request, "The public contract was checked without omissions.");
+    }
+    if (system.includes("You are the C-level coordinator")) {
+      cLevelCalls += 1;
+      if (cLevelCalls === 1) {
+        return result(
+          request,
+          JSON.stringify({
+            action: "dispatch",
+            reason: "Obtain the required independent contract check.",
+            recipients: [
+              {
+                role: "specialist",
+                instruction: "Check every public field and report omissions.",
+                artifactAccess: "read_only",
+              },
+            ],
+          }),
+        );
+      }
+      return {
+        ...result(
+          request,
+          JSON.stringify({
+            action: "request_review",
+            reason: "The checked artifact is ready.",
+            artifact: task.oracleCandidate,
+          }),
+        ),
+        finishReason: "length",
+      };
+    }
+    assert.match(system, /Repair only the representation/u);
+    return result(request, JSON.stringify(task.oracleCandidate));
+  });
+  const executor = new PeerTeamArtifactWorkflowExecutor({
+    engine: implementation,
+    task,
+    maxParallelAgents: 1,
+  });
+  await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+  const directiveHash = await crypto.subtle
+    .digest("SHA-256", new TextEncoder().encode(directive))
+    .then((bytes) => Buffer.from(bytes).toString("hex"));
+
+  const output = await executor.execute({
+    task: publicTask,
+    submission: 1,
+    feedbackRound: 0,
+    directive,
+    directiveHash,
+    remainingModelCalls: 4,
+    previousArtifact: null,
+  });
+
+  assert.equal(calls, 5);
+  assert.equal(cLevelCalls, 2);
+  assert.equal(output.initialContractValid, false);
+  assert.equal(output.contractValid, true);
+  assert.equal(output.contractRepairAttempts, 1);
+  assert.equal(output.contractRepairOutcome, "succeeded");
+  assert.equal(output.modelCalls, 4);
+  assert.equal(output.usage.inputTokens, 20);
+  assert.equal(output.usage.outputTokens, 28);
+  assert.deepEqual(output.protocolViolations, []);
+  assert.equal(output.artifact, canonicalArtifactJson(task.oracleCandidate));
+});
+
+test("single artifact executor repairs one invalid candidate and accounts the repair call", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  let calls = 0;
+  const implementation = engine(async (request) => {
+    calls += 1;
+    if (calls === 1) {
+      return result(request, JSON.stringify({ plan: "Repair public structure." }));
+    }
+    if (calls === 2) return result(request, "not-json");
+    const system = request.messages.find(({ role }) => role === "system")?.content;
+    assert.match(system ?? "", /Repair only the representation/u);
+    return result(request, JSON.stringify(task.oracleCandidate));
+  });
+  const executor = new SingleArtifactWorkflowExecutor({
+    engine: implementation,
+    task,
+  });
+  await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+  const directiveHash = await crypto.subtle
+    .digest("SHA-256", new TextEncoder().encode(directive))
+    .then((bytes) => Buffer.from(bytes).toString("hex"));
+
+  const output = await executor.execute({
+    task: publicTask,
+    submission: 1,
+    feedbackRound: 0,
+    directive,
+    directiveHash,
+    remainingModelCalls: 2,
+    previousArtifact: null,
+  });
+
+  assert.equal(calls, 3);
+  assert.equal(output.contractValid, true);
+  assert.equal(output.contractRepairAttempts, 1);
+  assert.equal(output.modelCalls, 2);
+  assert.equal(output.usage.inputTokens, 10);
+  assert.equal(output.usage.outputTokens, 14);
+  assert.equal(output.artifact, canonicalArtifactJson(task.oracleCandidate));
+  assert.equal(output.providerIdentities?.length, 2);
+});
+
+test("cancellation during contract repair preserves implementation and repair accounting", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  const abortController = new AbortController();
+  let calls = 0;
+  const implementation = engine(async (request) => {
+    calls += 1;
+    if (calls === 1) {
+      return result(request, JSON.stringify({ plan: "Attempt one bounded repair." }));
+    }
+    if (calls === 2) return result(request, "not-json");
+    const reason = new Error("synthetic repair cancellation");
+    abortController.abort(reason);
+    throw reason;
+  });
+  const executor = new SingleArtifactWorkflowExecutor({
+    engine: implementation,
+    task,
+  });
+  await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+  const directiveHash = await crypto.subtle
+    .digest("SHA-256", new TextEncoder().encode(directive))
+    .then((bytes) => Buffer.from(bytes).toString("hex"));
+
+  await assert.rejects(
+    () =>
+      executor.execute({
+        task: publicTask,
+        submission: 1,
+        feedbackRound: 0,
+        directive,
+        directiveHash,
+        remainingModelCalls: 2,
+        previousArtifact: null,
+        signal: abortController.signal,
+      }),
+    (error: unknown) =>
+      error instanceof WorkflowAccountedError &&
+      error.message === "WORKFLOW_CONTRACT_REPAIR_ABORTED" &&
+      error.metrics.modelCalls === 2 &&
+      error.metrics.usage.inputTokens === null &&
+      error.metrics.usage.outputTokens === null &&
+      error.metrics.usage.measurementStatus === "unknown" &&
+      error.metrics.providerIdentities?.length === 1,
+  );
+  assert.equal(calls, 3);
+});
+
+test("single artifact executor skips repair when the first call consumes the token budget", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  let calls = 0;
+  const implementation = engine(async (request) => {
+    calls += 1;
+    if (calls === 1) {
+      return result(request, JSON.stringify({ plan: "Respect the token cap." }));
+    }
+    if (calls > 2) throw new Error("Repair must not start without token budget.");
+    return {
+      ...result(request, "not-json"),
+      usage: {
+        inputTokens: 90_000,
+        outputTokens: 10_000,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cost: 0,
+        measurementStatus: "measured",
+      },
+    };
+  });
+  const executor = new SingleArtifactWorkflowExecutor({
+    engine: implementation,
+    task,
+  });
+  await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+  const directiveHash = await crypto.subtle
+    .digest("SHA-256", new TextEncoder().encode(directive))
+    .then((bytes) => Buffer.from(bytes).toString("hex"));
+
+  const output = await executor.execute({
+    task: publicTask,
+    submission: 1,
+    feedbackRound: 0,
+    directive,
+    directiveHash,
+    remainingModelCalls: 2,
+    remainingTotalTokens: 100_000,
+    previousArtifact: null,
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(output.contractValid, false);
+  assert.equal(output.contractRepairAttempts, 0);
+  assert.equal(output.modelCalls, 1);
+  assert.equal(output.usage.inputTokens, 90_000);
+  assert.equal(output.usage.outputTokens, 10_000);
+  assert.equal(output.artifact, "not-json");
+});
+
+test("single artifact executor does not adopt a non-stop repair response", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  let calls = 0;
+  const implementation = engine(async (request) => {
+    calls += 1;
+    if (calls === 1) {
+      return result(request, JSON.stringify({ plan: "Repair only if complete." }));
+    }
+    if (calls === 2) return result(request, "not-json");
+    return {
+      ...result(request, JSON.stringify(task.oracleCandidate)),
+      finishReason: "length",
+    };
+  });
+  const executor = new SingleArtifactWorkflowExecutor({
+    engine: implementation,
+    task,
+  });
+  await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+  const directiveHash = await crypto.subtle
+    .digest("SHA-256", new TextEncoder().encode(directive))
+    .then((bytes) => Buffer.from(bytes).toString("hex"));
+
+  const output = await executor.execute({
+    task: publicTask,
+    submission: 1,
+    feedbackRound: 0,
+    directive,
+    directiveHash,
+    remainingModelCalls: 2,
+    previousArtifact: null,
+  });
+
+  assert.equal(calls, 3);
+  assert.equal(output.contractValid, false);
+  assert.equal(output.contractRepairAttempts, 1);
+  assert.equal(output.modelCalls, 2);
+  assert.equal(output.usage.inputTokens, 10);
+  assert.equal(output.usage.outputTokens, 14);
+  assert.equal(output.artifact, "not-json");
 });
 
 test("invalid model artifact remains reviewable without entering the sealed oracle", async () => {

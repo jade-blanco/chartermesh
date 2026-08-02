@@ -126,6 +126,9 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "kind",
   "handoffHash",
   "commandId",
+  "stageIndex",
+  "cycle",
+  "stageKind",
 ]);
 
 function allowlistedAuditPayload(
@@ -1182,6 +1185,9 @@ export class ControlPlane {
     maxChildren?: number;
     handoffHash?: string;
     commandId?: string;
+    stageIndex?: number;
+    cycle?: number;
+    stageKind?: "c_level" | "worker";
   }): AttemptRecord {
     return this.transact(() => {
       const parent = this.database
@@ -1222,6 +1228,24 @@ export class ControlPlane {
         (input.commandId.trim().length === 0 || input.commandId.length > 128)
       ) {
         throw new Error("commandId must contain 1 to 128 characters.");
+      }
+      if (
+        input.stageIndex !== undefined &&
+        (!Number.isInteger(input.stageIndex) || input.stageIndex < 0)
+      ) {
+        throw new Error("stageIndex must be a non-negative integer.");
+      }
+      if (
+        input.cycle !== undefined &&
+        (!Number.isInteger(input.cycle) || input.cycle < 1)
+      ) {
+        throw new Error("cycle must be a positive integer.");
+      }
+      if (
+        input.stageKind !== undefined &&
+        !["c_level", "worker"].includes(input.stageKind)
+      ) {
+        throw new Error("stageKind must be c_level or worker.");
       }
       const count = this.database
         .prepare(`
@@ -1274,6 +1298,11 @@ export class ControlPlane {
           ...(input.commandId
             ? { commandId: assertText(input.commandId, "commandId") }
             : {}),
+          ...(input.stageIndex === undefined
+            ? {}
+            : { stageIndex: input.stageIndex }),
+          ...(input.cycle === undefined ? {} : { cycle: input.cycle }),
+          ...(input.stageKind ? { stageKind: input.stageKind } : {}),
         },
       );
       return asAttempt(

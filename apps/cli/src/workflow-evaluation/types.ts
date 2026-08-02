@@ -98,10 +98,27 @@ export interface WorkflowOrientationResult extends WorkflowStepMetrics {
   simulatedApproval: boolean;
 }
 
+export interface WorkflowContractDiagnostic {
+  stage: "transport" | "schema";
+  code: string;
+  repairable: boolean;
+}
+
+export type WorkflowContractRepairOutcome =
+  | "not_needed"
+  | "succeeded"
+  | "failed"
+  | "skipped_budget";
+
 export interface WorkflowExecutionResult extends WorkflowStepMetrics {
   artifact: string;
   humanView: string;
   contractValid: boolean;
+  initialContractValid?: boolean;
+  initialContractDiagnostics?: WorkflowContractDiagnostic[];
+  contractDiagnostics?: WorkflowContractDiagnostic[];
+  contractRepairAttempts?: number;
+  contractRepairOutcome?: WorkflowContractRepairOutcome;
   cLevelReviewRequested: boolean;
   handoffs: number;
   maxObservedConcurrency: number;
@@ -205,7 +222,19 @@ export interface WorkflowRoundRecord {
   directiveType: "initial_assignment" | "changes_requested";
   directiveHash: string;
   artifactHash: string;
+  initialContractValid: boolean;
+  initialContractDiagnostics: WorkflowContractDiagnostic[];
   contractValid: boolean;
+  contractDiagnostics: WorkflowContractDiagnostic[];
+  contractRepairAttempts: number;
+  contractRepairOutcome: WorkflowContractRepairOutcome;
+  retainedArtifactHash: string | null;
+  retentionAction:
+    | "accepted_initial"
+    | "accepted_valid"
+    | "rejected_invalid"
+    | "rejected_untrusted"
+    | "no_valid_baseline";
   externalPass: boolean;
   partialScore: number;
   criticalFailures: string[];
@@ -225,8 +254,17 @@ export interface WorkflowRoundRecord {
   }>;
 }
 
+export interface WorkflowFailureObservation {
+  phase: "orientation" | "implementation" | "evaluation" | "feedback";
+  code: string;
+  stage: string | null;
+  stageIndex: number | null;
+  cycle: number | null;
+  role: string | null;
+}
+
 export interface WorkflowTrajectoryReport {
-  apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha1";
+  apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha2";
   trialId: string;
   orderIndex: number;
   taskId: string;
@@ -264,6 +302,7 @@ export interface WorkflowTrajectoryReport {
     totalOutputTokens: number | null;
     elapsedMs: number;
     censorReason: WorkflowCensorReason | null;
+    failure: WorkflowFailureObservation | null;
   };
   collaboration: {
     handoffCount: number;
@@ -278,7 +317,7 @@ export interface WorkflowTrajectoryReport {
 }
 
 export interface WorkflowStudyReport {
-  apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha1";
+  apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha2";
   studyId: string;
   approvedPlanHash: string | null;
   approvedPlanCanonicalJson: string | null;
@@ -335,6 +374,12 @@ export interface WorkflowStudyReport {
     meanScorePerModelCall: number;
     totalModelCalls: number;
     totalTokens: number | null;
+    rawContractValidSubmissions: number;
+    effectiveContractValidSubmissions: number;
+    contractRepairAttempts: number;
+    contractRepairSuccesses: number;
+    rawContractValidityRate: number;
+    effectiveContractValidityRate: number;
     protocolFailures: number;
     safetyFailures: number;
   }>;

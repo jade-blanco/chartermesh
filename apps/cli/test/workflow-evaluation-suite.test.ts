@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   ARTIFACT_CANDIDATE_API_VERSION,
+  ARTIFACT_CELL_REFERENCE_PATTERN,
+  ARTIFACT_COLUMN_KEY_PATTERN,
+  ARTIFACT_IDENTIFIER_PATTERN,
+  ARTIFACT_HTTPS_URL_PATTERN,
+  ARTIFACT_ISO_DATE_PATTERN,
   ARTIFACT_ORACLE_OPERATORS,
   ArtifactCandidateParseError,
   MAX_ARTIFACT_CANDIDATE_BYTES,
@@ -231,6 +236,37 @@ test("candidate parser accepts one bounded JSON envelope and fails closed", () =
   );
 });
 
+test("research URL parsing matches the provider-facing HTTPS prefix boundary", () => {
+  const task = generateReferenceArtifactSuite().find(
+    ({ family }) => family === "research",
+  )!;
+  const candidate = structuredClone(task.oracleCandidate) as unknown as {
+    artifact: { sources: Array<{ url: string }> };
+  };
+  for (const invalidUrl of [
+    "https:a",
+    "https:/a",
+    " https://example.com ",
+  ]) {
+    candidate.artifact.sources[0]!.url = invalidUrl;
+    assertParseCode(
+      () =>
+        parseArtifactCandidate(JSON.stringify(candidate), {
+          taskId: task.id,
+          family: task.family,
+        }),
+      "CANDIDATE_SCHEMA_INVALID",
+    );
+  }
+  candidate.artifact.sources[0]!.url = "HTTPS://example.com/source";
+  assert.doesNotThrow(() =>
+    parseArtifactCandidate(JSON.stringify(candidate), {
+      taskId: task.id,
+      family: task.family,
+    }),
+  );
+});
+
 test("IR validation is discriminated and office artifacts remain semantic gates", () => {
   const tasks = generateReferenceArtifactSuite();
   for (const task of tasks) {
@@ -327,4 +363,72 @@ test("every live response schema is task-bound and recursively closes object fie
     assert.equal(artifactProperties.kind?.const, task.family);
     visit(schema, task.id);
   }
+});
+
+test("provider schemas expose the parser's identifier and format boundaries", () => {
+  const at = (
+    value: Record<string, unknown>,
+    ...path: string[]
+  ): Record<string, unknown> =>
+    path.reduce<Record<string, unknown>>((node, key) => {
+      const child = node[key];
+      assert.ok(child && typeof child === "object" && !Array.isArray(child));
+      return child as Record<string, unknown>;
+    }, value);
+  const schemas = Object.fromEntries(
+    generateReferenceArtifactSuite()
+      .filter(({ difficulty }) => difficulty === "easy")
+      .map((task) => [
+        task.family,
+        artifactCandidateResponseSchemaFor({
+          id: task.id,
+          family: task.family,
+        }),
+      ]),
+  ) as Record<string, Record<string, unknown>>;
+
+  const product = at(schemas.product_package!, "properties", "artifact", "properties");
+  const deliverables = at(product, "deliverables");
+  assert.equal(
+    at(deliverables, "items", "properties", "id").pattern,
+    ARTIFACT_IDENTIFIER_PATTERN,
+  );
+  assert.equal(deliverables.maxItems, 64);
+  assert.equal(
+    at(deliverables, "items", "properties", "acceptance").maxItems,
+    32,
+  );
+
+  const research = at(schemas.research!, "properties", "artifact", "properties");
+  const sourceProperties = at(research, "sources", "items", "properties");
+  assert.equal(
+    at(sourceProperties, "publishedDate").pattern,
+    ARTIFACT_ISO_DATE_PATTERN,
+  );
+  assert.equal(
+    at(sourceProperties, "url").pattern,
+    ARTIFACT_HTTPS_URL_PATTERN,
+  );
+
+  const xlsx = at(schemas.xlsx!, "properties", "artifact", "properties");
+  const sheetProperties = at(xlsx, "sheets", "items", "properties");
+  assert.equal(
+    at(sheetProperties, "columns", "items", "properties", "key").pattern,
+    ARTIFACT_COLUMN_KEY_PATTERN,
+  );
+  assert.equal(
+    at(sheetProperties, "formulas", "items", "properties", "cell").pattern,
+    ARTIFACT_CELL_REFERENCE_PATTERN,
+  );
+
+  const docx = at(schemas.docx!, "properties", "artifact", "properties");
+  assert.equal(
+    at(docx, "sections", "items", "properties", "id").pattern,
+    ARTIFACT_IDENTIFIER_PATTERN,
+  );
+  const pptx = at(schemas.pptx!, "properties", "artifact", "properties");
+  assert.equal(
+    at(pptx, "slides", "items", "properties", "id").pattern,
+    ARTIFACT_IDENTIFIER_PATTERN,
+  );
 });

@@ -27,10 +27,26 @@ import {
 import {
   createArtifactWorkflowExecutor,
   createIdentityAttestingWorkflowEngine,
+  fixedWorkflowTeam,
+  WORKFLOW_CONTRACT_REPAIR_MAX_ATTEMPTS,
+  WORKFLOW_CONTRACT_REPAIR_MAX_CANDIDATE_CHARS,
+  WORKFLOW_CONTRACT_REPAIR_MAX_OUTPUT_TOKENS,
+  WORKFLOW_CONTRACT_REPAIR_POLICY_VERSION,
+  WORKFLOW_CONTRACT_REPAIR_PROMPT_SHA256,
   WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION,
   WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
   WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
   WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
+  WORKFLOW_ARTIFACT_RETENTION_POLICY_VERSION,
+  WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS,
+  WORKFLOW_TEAM_MAX_HANDOFFS,
+  WORKFLOW_TEAM_MAX_INTERNAL_CYCLES,
+  WORKFLOW_TEAM_MAX_OUTPUT_TOKENS,
+  WORKFLOW_TEAM_MAX_PARALLEL,
+  WORKFLOW_TEAM_MAX_STAGE_CALLS,
+  WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS,
+  WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS,
+  WORKFLOW_TEAM_PROTOCOL_VERSION,
   type WorkflowProviderIdentityObservation,
 } from "./model-executors.ts";
 import {
@@ -58,9 +74,9 @@ export type WorkflowStudyTaskBinding =
     };
 
 export const WORKFLOW_STUDY_PLAN_API_VERSION =
-  "chartermesh.dev/collaboration-study-plan/v1alpha3" as const;
+  "chartermesh.dev/collaboration-study-plan/v1alpha5" as const;
 export const WORKFLOW_STUDY_HARNESS_VERSION =
-  "chartermesh.dev/collaboration-study-harness/v1alpha3" as const;
+  "chartermesh.dev/collaboration-study-harness/v1alpha5" as const;
 
 export interface WorkflowStudyPlan {
   apiVersion: typeof WORKFLOW_STUDY_PLAN_API_VERSION;
@@ -85,6 +101,49 @@ export interface WorkflowStudyPlan {
     repetitionKeywords: Array<
       (typeof WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS)[number]
     >;
+  };
+  teamProtocolPolicy: {
+    version: typeof WORKFLOW_TEAM_PROTOCOL_VERSION;
+    setup: "fixed_host_owned_two_role";
+    finalSubmission: "caller_owned_typed_object";
+    dispatchRoleConstraint: "declared_worker_enum";
+    reviewRequiresHandoff: true;
+    fixedTeamSha256: {
+      artifact: string;
+      code: string;
+    };
+    controller: {
+      maxInternalCycles: typeof WORKFLOW_TEAM_MAX_INTERNAL_CYCLES;
+      maxHandoffs: typeof WORKFLOW_TEAM_MAX_HANDOFFS;
+      maxStageCalls: typeof WORKFLOW_TEAM_MAX_STAGE_CALLS;
+      maxParallel: typeof WORKFLOW_TEAM_MAX_PARALLEL;
+      maxOutputTokensPerCall: typeof WORKFLOW_TEAM_MAX_OUTPUT_TOKENS;
+      maxDirectiveChars: typeof WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS;
+      maxWorkerResponseChars: typeof WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS;
+      maxTranscriptChars: typeof WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS;
+    };
+  };
+  artifactRetentionPolicy: {
+    version: typeof WORKFLOW_ARTIFACT_RETENTION_POLICY_VERSION;
+    nextRevisionBaseline: "last_contract_valid";
+    sealedScoreInfluencesRetention: false;
+  };
+  contractRepairPolicy: {
+    version: typeof WORKFLOW_CONTRACT_REPAIR_POLICY_VERSION;
+    maximumAttempts: typeof WORKFLOW_CONTRACT_REPAIR_MAX_ATTEMPTS;
+    appliesTo: "single_and_team_artifact_and_code";
+    trigger: "public_contract_or_transport_invalid_and_budget_available";
+    diagnosticDisclosure: "public_codes_only";
+    maximumInvalidCandidateChars: typeof WORKFLOW_CONTRACT_REPAIR_MAX_CANDIDATE_CHARS;
+    maximumOutputTokensPerCall: typeof WORKFLOW_CONTRACT_REPAIR_MAX_OUTPUT_TOKENS;
+    finishReasonPolicy: "stop_required";
+    budgetBehavior: "skip_without_call";
+    promptSha256: string;
+  };
+  orientationSamplingPolicy: {
+    designSeedPurpose: "task_and_condition_order_only";
+    inferenceSampling: "provider_default_uncontrolled";
+    sharedAcrossFeedbackPolicies: false;
   };
   feedbackAdapterVersion: typeof WORKFLOW_FEEDBACK_ADAPTER_VERSION;
   feedbackInterventionHashes: {
@@ -159,6 +218,10 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
     fixedSelfReview: FIXED_SELF_REVIEW_FEEDBACK_SHA256,
     codexGeneralist: CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256,
   };
+  const expectedFixedTeamSha256 = {
+    artifact: hash(fixedWorkflowTeam("artifact")),
+    code: hash(fixedWorkflowTeam("code")),
+  };
   if (
     recomputed !== planHash ||
     studyId !== `collaboration-study-${recomputed.slice(0, 16)}` ||
@@ -178,6 +241,54 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
         repetitionKeywords: [
           ...WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
         ],
+      }) ||
+    hash(plan.teamProtocolPolicy) !==
+      hash({
+        version: WORKFLOW_TEAM_PROTOCOL_VERSION,
+        setup: "fixed_host_owned_two_role",
+        finalSubmission: "caller_owned_typed_object",
+        dispatchRoleConstraint: "declared_worker_enum",
+        reviewRequiresHandoff: true,
+        fixedTeamSha256: expectedFixedTeamSha256,
+        controller: {
+          maxInternalCycles: WORKFLOW_TEAM_MAX_INTERNAL_CYCLES,
+          maxHandoffs: WORKFLOW_TEAM_MAX_HANDOFFS,
+          maxStageCalls: WORKFLOW_TEAM_MAX_STAGE_CALLS,
+          maxParallel: WORKFLOW_TEAM_MAX_PARALLEL,
+          maxOutputTokensPerCall: WORKFLOW_TEAM_MAX_OUTPUT_TOKENS,
+          maxDirectiveChars: WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS,
+          maxWorkerResponseChars:
+            WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS,
+          maxTranscriptChars: WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS,
+        },
+      }) ||
+    hash(plan.artifactRetentionPolicy) !==
+      hash({
+        version: WORKFLOW_ARTIFACT_RETENTION_POLICY_VERSION,
+        nextRevisionBaseline: "last_contract_valid",
+        sealedScoreInfluencesRetention: false,
+      }) ||
+    hash(plan.contractRepairPolicy) !==
+      hash({
+        version: WORKFLOW_CONTRACT_REPAIR_POLICY_VERSION,
+        maximumAttempts: WORKFLOW_CONTRACT_REPAIR_MAX_ATTEMPTS,
+        appliesTo: "single_and_team_artifact_and_code",
+        trigger:
+          "public_contract_or_transport_invalid_and_budget_available",
+        diagnosticDisclosure: "public_codes_only",
+        maximumInvalidCandidateChars:
+          WORKFLOW_CONTRACT_REPAIR_MAX_CANDIDATE_CHARS,
+        maximumOutputTokensPerCall:
+          WORKFLOW_CONTRACT_REPAIR_MAX_OUTPUT_TOKENS,
+        finishReasonPolicy: "stop_required",
+        budgetBehavior: "skip_without_call",
+        promptSha256: WORKFLOW_CONTRACT_REPAIR_PROMPT_SHA256,
+      }) ||
+    hash(plan.orientationSamplingPolicy) !==
+      hash({
+        designSeedPurpose: "task_and_condition_order_only",
+        inferenceSampling: "provider_default_uncontrolled",
+        sharedAcrossFeedbackPolicies: false,
       }) ||
     plan.feedbackAdapterVersion !== WORKFLOW_FEEDBACK_ADAPTER_VERSION ||
     hash(plan.feedbackInterventionHashes) !==
@@ -394,6 +505,53 @@ export function createWorkflowStudyPlan(input: {
       repetitionKeywords: [
         ...WORKFLOW_RESPONSE_SCHEMA_REPETITION_KEYWORDS,
       ],
+    },
+    teamProtocolPolicy: {
+      version: WORKFLOW_TEAM_PROTOCOL_VERSION,
+      setup: "fixed_host_owned_two_role" as const,
+      finalSubmission: "caller_owned_typed_object" as const,
+      dispatchRoleConstraint: "declared_worker_enum" as const,
+      reviewRequiresHandoff: true as const,
+      fixedTeamSha256: {
+        artifact: hash(fixedWorkflowTeam("artifact")),
+        code: hash(fixedWorkflowTeam("code")),
+      },
+      controller: {
+        maxInternalCycles: WORKFLOW_TEAM_MAX_INTERNAL_CYCLES,
+        maxHandoffs: WORKFLOW_TEAM_MAX_HANDOFFS,
+        maxStageCalls: WORKFLOW_TEAM_MAX_STAGE_CALLS,
+        maxParallel: WORKFLOW_TEAM_MAX_PARALLEL,
+        maxOutputTokensPerCall: WORKFLOW_TEAM_MAX_OUTPUT_TOKENS,
+        maxDirectiveChars: WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS,
+        maxWorkerResponseChars:
+          WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS,
+        maxTranscriptChars: WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS,
+      },
+    },
+    artifactRetentionPolicy: {
+      version: WORKFLOW_ARTIFACT_RETENTION_POLICY_VERSION,
+      nextRevisionBaseline: "last_contract_valid" as const,
+      sealedScoreInfluencesRetention: false as const,
+    },
+    contractRepairPolicy: {
+      version: WORKFLOW_CONTRACT_REPAIR_POLICY_VERSION,
+      maximumAttempts: WORKFLOW_CONTRACT_REPAIR_MAX_ATTEMPTS,
+      appliesTo: "single_and_team_artifact_and_code" as const,
+      trigger:
+        "public_contract_or_transport_invalid_and_budget_available" as const,
+      diagnosticDisclosure: "public_codes_only" as const,
+      maximumInvalidCandidateChars:
+        WORKFLOW_CONTRACT_REPAIR_MAX_CANDIDATE_CHARS,
+      maximumOutputTokensPerCall:
+        WORKFLOW_CONTRACT_REPAIR_MAX_OUTPUT_TOKENS,
+      finishReasonPolicy: "stop_required" as const,
+      budgetBehavior: "skip_without_call" as const,
+      promptSha256: WORKFLOW_CONTRACT_REPAIR_PROMPT_SHA256,
+    },
+    orientationSamplingPolicy: {
+      designSeedPurpose: "task_and_condition_order_only" as const,
+      inferenceSampling: "provider_default_uncontrolled" as const,
+      sharedAcrossFeedbackPolicies: false as const,
     },
     feedbackAdapterVersion: WORKFLOW_FEEDBACK_ADAPTER_VERSION,
     feedbackInterventionHashes: {

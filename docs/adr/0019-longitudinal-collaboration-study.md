@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-31
+- Amended: 2026-08-02
 
 ## Context
 
@@ -62,23 +63,47 @@ the C-level role, can satisfy a production human-approval requirement.
 
 ### Matched orientation and command-mediated teams
 
-Team setup is outside the feedback-round count. Only a successfully parsed and
-validated orientation is synthetically auto-approved. A failed setup records
-zero setup approvals and ends before implementation. The single condition
-receives the same one-call orientation opportunity. Setup calls, usage, and
-latency remain part of total resource measurements; the different orientation
-schemas and output ceilings are not claimed to be token-matched.
+Team setup is outside the feedback-round count. Beginning with harness
+`v1alpha5`, both conditions use the same one-field planning schema. The study
+runtime, rather than the candidate model, supplies a fixed two-role team with
+one coordinator and one specialist. This removes model-generated organization
+syntax as an artifact-only failure surface while leaving dynamic team design as
+a separate capability to test in a future `team_dynamic` arm. A failed plan
+records zero setup approvals and ends before implementation. Setup calls,
+usage, and latency remain part of total resource measurements.
 
-The team condition uses an experimental peer-team controller. Only a declared
-C-level role may send hash-bound command handoffs to declared workers or
-request review. Workers report back to the C-level role and cannot dispatch,
-approve, or request review. C-level cycles continue until a reviewable artifact
-is produced or a liveness bound is reached. Parallel dispatch is capped by the
-study configuration and each engine's declared concurrency capability.
+The Team-Lite condition uses an experimental peer-team controller with a
+host-owned deterministic state shape: one coordinator dispatch, one specialist
+response, then one coordinator final review. Its limits are two internal
+cycles, one handoff, three peer-stage calls, and effective parallelism one.
+The generic runtime keeps configurable dynamic cycles, but this comparison arm
+removes model-controlled redispatch and unbounded transcript growth.
+
+The controller constrains dispatch targets to the declared worker-role enum and
+does not expose the review action until at least one handoff succeeds. The host
+injects a caller-owned final-artifact schema and transport parser. Artifact and
+code studies therefore submit their candidate object directly in
+`request_review.artifact`; they never escape candidate JSON into a
+`StructuredArtifact.deliverable` string. The application parser remains the
+acceptance authority after transport, so a schema-invalid candidate is a
+contract-invalid submission rather than an automatic claim of success.
+
+The host may make one bounded repair call after a public-contract-invalid or
+non-`stop` first output. It supplies only public diagnostics and the same
+task-bound schema, requires a `stop` finish, and skips without a call if the
+remaining trajectory budget cannot fit it. Calls, usage, and latency are
+charged to the originating condition. Reports preserve raw first-output
+validity and diagnostics separately from effective post-repair validity and
+repair outcome.
 
 The sealed evaluator, not the C-level role, decides whether a submitted
 artifact passes. If it does not pass, the outer trajectory supplies the next
-public feedback directive with the exact prior artifact bound by SHA-256.
+public feedback directive. A contract-valid, protocol-valid, safe submission
+becomes the next SHA-256-bound revision baseline. A later contract-invalid or
+untrusted submission remains visible for feedback but cannot replace that
+baseline. When no valid baseline exists, the next attempt starts without a
+prior artifact. The sealed score never selects the retained artifact, because
+that would leak hidden-oracle information through the trajectory.
 
 ### Checkpoint and convergence
 
@@ -159,11 +184,18 @@ requires `--live`, an explicit candidate engine, Codex executable/model
 bindings, and `--approve` with the regenerated plan's exact SHA-256. The hash
 commits the sealed task bindings, condition matrix, seed, complete trajectory
 limits, harness/feedback-adapter versions, exact fixed intervention hashes,
-the Codex review-protocol hash, candidate runtime profile, Codex binding, and any selected code-sandbox
+the Codex review-protocol hash, fixed-team manifests, exact Team-Lite
+controller bounds, the last-valid retention policy, the repair prompt and
+limits, orientation-sampling disclosure, candidate runtime profile, Codex
+binding, and any selected code-sandbox
 identity, provenance, launcher commitment, and launcher-attestation mode. The
 live runner rechecks those bindings and
 limits. Full, artifact-only, and code-only live runs additionally require
 explicit large-run acknowledgement.
+
+The design seed controls task and condition ordering, not provider sampling.
+Harness `v1alpha5` does not share a model-generated orientation across feedback
+arms, so feedback-policy differences remain exploratory rather than causal.
 
 The plan also binds a versioned structured-output portability policy. The
 candidate-engine boundary clones every response schema and omits grammar

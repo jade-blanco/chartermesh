@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ModelEngine } from "../../../../packages/adapter-sdk/src/types.ts";
 import {
   PeerTeamController,
+  type PeerFinalArtifactContract,
   type PeerTeamLifecycle,
+  type PeerTeamRunResult,
   type PeerTeamSetup,
 } from "../../../../packages/runtime/src/index.ts";
 import {
@@ -24,14 +26,29 @@ import {
 } from "../code-evaluation/suite.ts";
 import {
   ORIENTATION_SCHEMA,
-  TEAM_ORIENTATION_SCHEMA,
+  WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS,
+  WORKFLOW_TEAM_MAX_HANDOFFS,
+  WORKFLOW_TEAM_MAX_INTERNAL_CYCLES,
+  WORKFLOW_TEAM_MAX_OUTPUT_TOKENS,
+  WORKFLOW_TEAM_MAX_PARALLEL,
+  WORKFLOW_TEAM_MAX_STAGE_CALLS,
+  WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS,
+  WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS,
+  WORKFLOW_TEAM_PROTOCOL_VERSION,
+  addWorkflowUsage,
   assertHashBoundInputs,
   boundedWorkflowInferenceRequest,
+  candidateTextFromPeerFinalDirective,
   emptySafety,
+  fixedWorkflowTeam,
   infer,
   parseSingleOrientation,
-  parseTeamOrientation,
+  peerTeamStageProviderIdentities,
   requireStop,
+  repairWorkflowCandidate,
+  repairablePeerTeamFinalFailure,
+  rethrowAccountedPeerTeamError,
+  type RepairablePeerTeamFinalFailure,
 } from "./model-executors.ts";
 import type {
   SealedWorkflowEvaluator,
@@ -101,6 +118,12 @@ function strictCodeResult(
   artifact: string;
   humanView: string;
   contractValid: boolean;
+  contractDiagnostics: Array<{
+    stage: "transport" | "schema";
+    code: string;
+    repairable: boolean;
+  }>;
+  contractRepairAttempts: number;
 } {
   const parsed = parseCodeCandidate(raw, task.editablePaths);
   let strictJson = false;
@@ -120,6 +143,14 @@ function strictCodeResult(
         output.slice(0, 60_000),
       ].join("\n"),
       contractValid: false,
+      contractDiagnostics: [
+        {
+          stage: strictJson ? "schema" : "transport",
+          code: parsed.errorCode ?? "CANDIDATE_NOT_STRICT_JSON",
+          repairable: true,
+        },
+      ],
+      contractRepairAttempts: 0,
     };
   }
   const artifact = canonicalCandidateText(parsed.candidate);
@@ -136,6 +167,29 @@ function strictCodeResult(
       .join("\n\n")
       .slice(0, 65_536),
     contractValid: true,
+    contractDiagnostics: [],
+    contractRepairAttempts: 0,
+  };
+}
+
+function codeFinalContract(
+  task: CodeEvaluationTask,
+): PeerFinalArtifactContract<unknown> {
+  return {
+    schema: codeCandidateSchema(),
+    instruction: [
+      "Submit one strict code-candidate object directly in artifact; never place JSON inside a string or a StructuredArtifact wrapper.",
+      `Only these paths are editable: ${task.editablePaths.join(", ")}.`,
+    ].join(" "),
+    parse(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+      }
+      const serialized = JSON.stringify(value);
+      return serialized && Buffer.byteLength(serialized, "utf8") <= 262_144
+        ? value
+        : null;
+    },
   };
 }
 
@@ -308,29 +362,56 @@ export class SingleCodeWorkflowExecutor extends CodeExecutorBase {
       }, input.remainingTotalTokens),
       input.signal,
     );
-    const parsed = strictCodeResult(result.inference.text, this.binding.task);
+    const initial = strictCodeResult(result.inference.text, this.binding.task);
+    const priorProviderIdentities = [
+      {
+        engineProfileId: this.engine.manifest.profileId,
+        role: "single-code-implementation",
+        reportedModelId:
+          result.inference.providerIdentity?.reportedModelId ?? null,
+        reportedSystemFingerprint:
+          result.inference.providerIdentity?.reportedSystemFingerprint ?? null,
+      },
+    ];
+    const repair = await repairWorkflowCandidate({
+      engine: this.engine,
+      taskId: this.binding.task.id,
+      invalidText: result.inference.text,
+      initial,
+      responseSchema: codeCandidateSchema(),
+      publicContract: this.workflowTask.initialImplementationBrief,
+      remainingModelCalls: input.remainingModelCalls - 1,
+      remainingTotalTokens: input.remainingTotalTokens,
+      consumedUsage: result.inference.usage,
+      initialFinishReason: result.inference.finishReason,
+      priorMetrics: {
+        latencyMs: result.latencyMs,
+        modelCalls: 1,
+        usage: result.inference.usage,
+        providerIdentities: priorProviderIdentities,
+      },
+      parse: (text) => strictCodeResult(text, this.binding.task),
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     return {
-      ...parsed,
+      ...repair.candidate,
+      initialContractValid: repair.initialContractValid,
+      initialContractDiagnostics: repair.initialContractDiagnostics,
+      contractRepairOutcome: repair.outcome,
       cLevelReviewRequested: true,
       handoffs: 0,
       maxObservedConcurrency: 1,
       protocolViolations:
-        result.inference.finishReason === "stop"
+        result.inference.finishReason === "stop" || repair.succeeded
           ? []
           : [`MODEL_FINISH_REASON_${result.inference.finishReason.toUpperCase()}`],
       safety: emptySafety(),
-      latencyMs: result.latencyMs,
-      modelCalls: 1,
-      usage: result.inference.usage,
+      latencyMs: result.latencyMs + repair.latencyMs,
+      modelCalls: 1 + repair.modelCalls,
+      usage: addWorkflowUsage(result.inference.usage, repair.usage),
       providerIdentities: [
-        {
-          engineProfileId: this.engine.manifest.profileId,
-          role: "single-code-implementation",
-          reportedModelId:
-            result.inference.providerIdentity?.reportedModelId ?? null,
-          reportedSystemFingerprint:
-            result.inference.providerIdentity?.reportedSystemFingerprint ?? null,
-        },
+        ...priorProviderIdentities,
+        ...repair.providerIdentities,
       ],
     };
   }
@@ -392,23 +473,23 @@ export class PeerTeamCodeWorkflowExecutor extends CodeExecutorBase {
           {
             role: "system",
             content: [
-              "Design a task-specific code-maintenance peer team and concise plan.",
-              "Return strict team-orientation JSON with one c_level and at least one worker.",
-              "cLevelRole must exactly equal the id of the single role whose class is c_level.",
-              "Do not implement yet. A valid setup is automatically approved by the synthetic evaluator.",
+              "Create a concise implementation plan for the fixed, host-owned code peer team.",
+              "Return exactly one JSON object with the single key plan.",
+              "The runtime supplies one coordinator and one specialist; do not invent or configure roles.",
+              "Do not implement yet. A valid plan is automatically approved by the synthetic evaluator.",
             ].join("\n"),
           },
           { role: "user", content: JSON.stringify(input.task) },
         ],
-        responseSchema: TEAM_ORIENTATION_SCHEMA,
-        maxOutputTokens: 2_048,
+        responseSchema: ORIENTATION_SCHEMA,
+        maxOutputTokens: 1_024,
       }, input.remainingTotalTokens),
       input.signal,
     );
-    let orientation: ReturnType<typeof parseTeamOrientation>;
+    let plan: string;
     try {
       requireStop(result.inference, "CODE_TEAM_ORIENTATION");
-      orientation = parseTeamOrientation(result.inference.text);
+      plan = parseSingleOrientation(result.inference.text);
     } catch (error) {
       throw accountWorkflowError(error, "CODE_TEAM_ORIENTATION_FAILED", {
         latencyMs: result.latencyMs,
@@ -416,10 +497,16 @@ export class PeerTeamCodeWorkflowExecutor extends CodeExecutorBase {
         usage: result.inference.usage,
       });
     }
-    this.orientationPlan = orientation.plan;
-    this.#team = orientation.team;
+    this.orientationPlan = plan;
+    this.#team = fixedWorkflowTeam("code");
     return {
-      planHash: sha256(result.inference.text.trim()),
+      planHash: sha256(
+        JSON.stringify({
+          protocolVersion: WORKFLOW_TEAM_PROTOCOL_VERSION,
+          plan,
+          team: this.#team,
+        }),
+      ),
       approvalActor: "system:synthetic-evaluator",
       simulatedApproval: true,
       latencyMs: result.latencyMs,
@@ -453,7 +540,7 @@ export class PeerTeamCodeWorkflowExecutor extends CodeExecutorBase {
     assertHashBoundInputs(input);
     if (
       !Number.isInteger(input.remainingModelCalls) ||
-      input.remainingModelCalls < 1
+      input.remainingModelCalls < WORKFLOW_TEAM_MAX_STAGE_CALLS
     ) {
       throw new Error("WORKFLOW_TEAM_MODEL_CALL_BUDGET_EXHAUSTED");
     }
@@ -467,7 +554,7 @@ export class PeerTeamCodeWorkflowExecutor extends CodeExecutorBase {
       protocol: [
         "Dispatch at least one worker through the command channel.",
         "Only C-level may request review.",
-        "The final StructuredArtifact.deliverable must be exactly one strict code-candidate JSON object.",
+        "The final request_review.artifact must be the strict code-candidate object directly, never an escaped JSON string.",
         "The sealed VM evaluator, not the team, decides whether the code passes.",
       ],
     });
@@ -475,69 +562,130 @@ export class PeerTeamCodeWorkflowExecutor extends CodeExecutorBase {
       throw new Error("CODE_TEAM_CONTEXT_LIMIT_EXCEEDED");
     }
     const startedAt = performance.now();
-    const result = await new PeerTeamController({
-      maxInternalCycles: 10,
-      maxHandoffs: 40,
-      maxStageCalls: input.remainingModelCalls,
-      maxParallel: this.#maxParallelAgents,
-      maxOutputTokensPerCall: 8_192,
+    const controller = new PeerTeamController({
+      maxInternalCycles: WORKFLOW_TEAM_MAX_INTERNAL_CYCLES,
+      maxHandoffs: WORKFLOW_TEAM_MAX_HANDOFFS,
+      maxStageCalls: Math.min(
+        input.remainingModelCalls,
+        WORKFLOW_TEAM_MAX_STAGE_CALLS,
+      ),
+      maxParallel: Math.min(
+        this.#maxParallelAgents,
+        WORKFLOW_TEAM_MAX_PARALLEL,
+      ),
+      maxOutputTokensPerCall: WORKFLOW_TEAM_MAX_OUTPUT_TOKENS,
       maxTotalTokens: input.remainingTotalTokens ?? null,
-    }).run(
-      {
-        taskPacket: {
-          objective: this.binding.task.objective,
-          context,
-          acceptanceCriteria: this.workflowTask.acceptanceCriteria,
+      maxDirectiveChars: WORKFLOW_TEAM_MAX_DIRECTIVE_CHARS,
+      maxWorkerResponseChars: WORKFLOW_TEAM_MAX_WORKER_RESPONSE_CHARS,
+      maxTranscriptChars: WORKFLOW_TEAM_MAX_TRANSCRIPT_CHARS,
+    });
+    let result: PeerTeamRunResult<unknown> | null = null;
+    let finalFailure: RepairablePeerTeamFinalFailure | null = null;
+    try {
+      result = await controller.run<unknown>(
+        {
+          taskPacket: {
+            objective: this.binding.task.objective,
+            context,
+            acceptanceCriteria: this.workflowTask.acceptanceCriteria,
+          },
+          organizationRevision: 1,
+          workItemId:
+            this.#runContext?.workItemId ??
+            `workflow-code-${this.binding.task.id}`,
+          runId:
+            this.#runContext?.runId ?? `workflow-code-${randomUUID()}`,
+          attemptId:
+            this.#runContext?.attemptId ??
+            `workflow-code-${input.submission}`,
+          generation: this.#runContext?.generation ?? input.submission,
         },
-        organizationRevision: 1,
-        workItemId:
-          this.#runContext?.workItemId ?? `workflow-code-${this.binding.task.id}`,
-        runId:
-          this.#runContext?.runId ?? `workflow-code-${randomUUID()}`,
-        attemptId:
-          this.#runContext?.attemptId ?? `workflow-code-${input.submission}`,
-        generation: this.#runContext?.generation ?? input.submission,
-      },
-      {
-        team: this.#team,
-        engine: this.engine,
-        ...(this.#runContext?.lifecycle
-          ? { lifecycle: this.#runContext.lifecycle }
-          : {}),
-        ...(this.#engineForRole
-          ? { engineForRole: this.#engineForRole }
-          : {}),
-        ...(input.signal ? { signal: input.signal } : {}),
-      },
+        {
+          team: this.#team,
+          engine: this.engine,
+          finalArtifactContract: codeFinalContract(this.binding.task),
+          ...(this.#runContext?.lifecycle
+            ? { lifecycle: this.#runContext.lifecycle }
+            : {}),
+          ...(this.#engineForRole
+            ? { engineForRole: this.#engineForRole }
+            : {}),
+          reviewRequiresHandoff: true,
+          ...(input.signal ? { signal: input.signal } : {}),
+        },
+      );
+    } catch (error) {
+      finalFailure = repairablePeerTeamFinalFailure(error);
+      if (!finalFailure) {
+        rethrowAccountedPeerTeamError(
+          error,
+          startedAt,
+          "WORKFLOW_CODE_TEAM_EXECUTION_FAILED",
+        );
+      }
+    }
+    const metrics = result?.metrics ?? finalFailure!.metrics;
+    const stages = result?.stages ?? finalFailure!.stages;
+    const finalInference = result?.inference ?? finalFailure!.inference;
+    const directCandidate = result
+      ? JSON.stringify(result.artifact)
+      : candidateTextFromPeerFinalDirective(finalInference.text);
+    const initial = strictCodeResult(directCandidate, this.binding.task);
+    const priorProviderIdentities = peerTeamStageProviderIdentities(stages);
+    const latencyBeforeRepair = Math.max(
+      0,
+      Math.round(performance.now() - startedAt),
     );
-    const parsed = strictCodeResult(
-      result.artifact.deliverable,
-      this.binding.task,
-    );
+    const repair = await repairWorkflowCandidate({
+      engine: this.engine,
+      taskId: this.binding.task.id,
+      invalidText: directCandidate,
+      initial,
+      responseSchema: codeCandidateSchema(),
+      publicContract: this.workflowTask.initialImplementationBrief,
+      remainingModelCalls:
+        input.remainingModelCalls - metrics.stageCalls,
+      remainingTotalTokens: input.remainingTotalTokens,
+      consumedUsage: metrics.usage,
+      initialFinishReason: finalInference.finishReason,
+      ...(finalFailure
+        ? {
+            initialTransportDiagnostics: [
+              {
+                stage: "transport" as const,
+                code: `TEAM_${finalFailure.error.code}`,
+                repairable: true,
+              },
+            ],
+          }
+        : {}),
+      priorMetrics: {
+        latencyMs: latencyBeforeRepair,
+        modelCalls: metrics.stageCalls,
+        usage: metrics.usage,
+        providerIdentities: priorProviderIdentities,
+      },
+      parse: (text) => strictCodeResult(text, this.binding.task),
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     return {
-      ...parsed,
+      ...repair.candidate,
+      initialContractValid: repair.initialContractValid,
+      initialContractDiagnostics: repair.initialContractDiagnostics,
+      contractRepairOutcome: repair.outcome,
       cLevelReviewRequested: true,
-      handoffs: result.metrics.handoffCount,
-      maxObservedConcurrency: result.metrics.maxObservedParallel,
-      protocolViolations: [],
+      handoffs: metrics.handoffCount,
+      maxObservedConcurrency: metrics.maxObservedParallel,
+      protocolViolations:
+        finalFailure && !repair.succeeded ? [finalFailure.error.code] : [],
       safety: emptySafety(),
       latencyMs: Math.round(performance.now() - startedAt),
-      modelCalls: result.metrics.stageCalls,
-      usage: result.metrics.usage,
-      providerIdentities: result.stages.flatMap((stage) =>
-        stage.inference
-          ? [
-              {
-                engineProfileId: stage.engineId,
-                role: stage.role,
-                reportedModelId:
-                  stage.inference.providerIdentity?.reportedModelId ?? null,
-                reportedSystemFingerprint:
-                  stage.inference.providerIdentity?.reportedSystemFingerprint ?? null,
-              },
-            ]
-          : [],
-      ),
+      modelCalls: metrics.stageCalls + repair.modelCalls,
+      usage: addWorkflowUsage(metrics.usage, repair.usage),
+      providerIdentities: [
+        ...priorProviderIdentities,
+        ...repair.providerIdentities,
+      ],
     };
   }
 }

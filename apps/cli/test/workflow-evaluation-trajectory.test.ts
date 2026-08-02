@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
+import { PeerTeamControllerError } from "../../../packages/runtime/src/index.ts";
 import {
   runWorkflowTrajectory,
   WorkflowAbortSettlementError,
@@ -566,6 +567,155 @@ test("a contract-valid submission resets the consecutive invalid-submission guar
   assert.equal(report.rounds.length, 6);
   assert.equal(report.outcome.feedbackRoundCount, 5);
   assert.equal(evaluations, 1);
+});
+
+test("an invalid revision cannot replace the last contract-valid baseline", async () => {
+  const receivedBaselines: Array<string | null> = [];
+  const receivedDirectives: string[] = [];
+  const guarded = executor("single");
+  guarded.execute = async ({ submission, previousArtifact, directive }) => {
+    receivedBaselines.push(previousArtifact?.content ?? null);
+    receivedDirectives.push(directive);
+    const contractValid = submission !== 2;
+    return {
+      artifact: JSON.stringify({ submission, valid: contractValid }),
+      humanView: `Visible result ${submission}`,
+      contractValid,
+      contractDiagnostics: contractValid
+        ? []
+        : [
+            {
+              stage: "schema",
+              code: "CANDIDATE_SCHEMA_INVALID",
+              repairable: true,
+            },
+          ],
+      contractRepairAttempts: 0,
+      cLevelReviewRequested: true,
+      handoffs: 0,
+      maxObservedConcurrency: 1,
+      protocolViolations: [],
+      safety,
+      latencyMs: 1,
+      modelCalls: 1,
+      usage,
+    };
+  };
+  const report = await runWorkflowTrajectory({
+    task,
+    executor: guarded,
+    feedbackProvider: feedbackProvider("fixed_self_review"),
+    evaluator: {
+      id: "last-valid-evaluator",
+      async evaluate({ artifact }) {
+        const submission = (JSON.parse(artifact) as { submission: number })
+          .submission;
+        return {
+          passed: submission === 3,
+          score: submission === 3 ? 1 : 0.5,
+          criticalFailures: submission === 3 ? [] : ["still.pending"],
+          criterionResults: [],
+        };
+      },
+    },
+    trialId: "trial-last-valid-retention",
+  });
+
+  assert.equal(report.outcome.status, "passed");
+  assert.deepEqual(receivedBaselines, [null, '{"submission":1,"valid":true}', '{"submission":1,"valid":true}']);
+  assert.equal(report.rounds[0]?.retentionAction, "accepted_initial");
+  assert.equal(report.rounds[1]?.retentionAction, "rejected_invalid");
+  assert.equal(
+    report.rounds[1]?.retainedArtifactHash,
+    report.rounds[0]?.artifactHash,
+  );
+  assert.match(receivedDirectives[2] ?? "", /schema:CANDIDATE_SCHEMA_INVALID/u);
+});
+
+test("a repaired round preserves raw validity separately from effective validity", async () => {
+  const repaired = executor("single");
+  const baseExecute = repaired.execute.bind(repaired);
+  repaired.execute = async (input) => ({
+    ...(await baseExecute(input)),
+    initialContractValid: false,
+    initialContractDiagnostics: [
+      {
+        stage: "schema",
+        code: "CANDIDATE_SCHEMA_INVALID",
+        repairable: true,
+      },
+    ],
+    contractValid: true,
+    contractDiagnostics: [],
+    contractRepairAttempts: 1,
+    contractRepairOutcome: "succeeded",
+    modelCalls: 2,
+  });
+  const report = await runWorkflowTrajectory({
+    task,
+    executor: repaired,
+    feedbackProvider: feedbackProvider("neutral_repeat"),
+    evaluator: {
+      id: "repair-metadata-evaluator",
+      async evaluate() {
+        return {
+          passed: true,
+          score: 1,
+          criticalFailures: [],
+          criterionResults: [],
+        };
+      },
+    },
+    trialId: "trial-repair-metadata",
+  });
+
+  assert.equal(report.rounds[0]?.initialContractValid, false);
+  assert.equal(report.rounds[0]?.contractValid, true);
+  assert.equal(report.rounds[0]?.contractRepairAttempts, 1);
+  assert.equal(report.rounds[0]?.contractRepairOutcome, "succeeded");
+  assert.equal(
+    report.rounds[0]?.initialContractDiagnostics[0]?.code,
+    "CANDIDATE_SCHEMA_INVALID",
+  );
+  assert.deepEqual(report.rounds[0]?.contractDiagnostics, []);
+});
+
+test("a terminal peer protocol error retains sanitized stage context", async () => {
+  const broken = executor("team");
+  broken.execute = async () => {
+    throw new PeerTeamControllerError(
+      "INVALID_TARGET",
+      "Unsafe raw details must not enter the report.",
+      undefined,
+      {
+        stage: "dispatch",
+        stageIndex: 0,
+        cycle: 1,
+        role: "coordinator",
+      },
+    );
+  };
+  const report = await runWorkflowTrajectory({
+    task,
+    executor: broken,
+    feedbackProvider: feedbackProvider("neutral_repeat"),
+    evaluator: evaluator(1),
+    trialId: "trial-peer-error-context",
+  });
+
+  assert.equal(report.outcome.status, "failed");
+  assert.equal(report.outcome.censorReason, "protocol_failure");
+  assert.deepEqual(report.outcome.failure, {
+    phase: "implementation",
+    code: "INVALID_TARGET",
+    stage: "dispatch",
+    stageIndex: 0,
+    cycle: 1,
+    role: "coordinator",
+  });
+  assert.equal(report.rounds.length, 0);
+  assert.equal(report.collaboration.protocolComplianceRate, 0);
+  assert.equal(JSON.stringify(report).includes("Unsafe raw details"), false);
 });
 
 test("team condition fails closed when C-level requests review without a handoff", async () => {

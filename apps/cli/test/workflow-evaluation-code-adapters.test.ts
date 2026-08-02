@@ -152,7 +152,8 @@ test("reference code workflow spans easy, medium, and hard sealed tasks", () => 
 test("single code workflow emits a strict hash-bound candidate for VM evaluation", async () => {
   const binding = generateReferenceCodeWorkflowSuite()[0]!;
   const publicTask = workflowTaskFromCodeTask(binding);
-  const artifact = canonicalCandidateText(candidate(binding.task.oracleContent));
+  const artifactCandidate = candidate(binding.task.oracleContent);
+  const artifact = canonicalCandidateText(artifactCandidate);
   const executor = new SingleCodeWorkflowExecutor({
     engine: scriptedEngine([
       JSON.stringify({ plan: "Implement every transition and public example." }),
@@ -180,37 +181,19 @@ test("single code workflow emits a strict hash-bound candidate for VM evaluation
 test("team code workflow reaches review only after a command-mediated worker handoff", async () => {
   const binding = generateReferenceCodeWorkflowSuite()[0]!;
   const publicTask = workflowTaskFromCodeTask(binding);
-  const artifact = canonicalCandidateText(candidate(binding.task.oracleContent));
+  const artifactCandidate = candidate(binding.task.oracleContent);
+  const artifact = canonicalCandidateText(artifactCandidate);
   let cLevelCalls = 0;
   const engine: ModelEngine = {
     ...scriptedEngine([]),
     async generate(request) {
       const system =
         request.messages.find(({ role }) => role === "system")?.content ?? "";
-      if (system.includes("Design a task-specific code-maintenance peer team")) {
-        assert.match(
-          system,
-          /cLevelRole must exactly equal the id of the single role/u,
-        );
+      if (system.includes("fixed, host-owned code peer team")) {
         return result(
           request,
           JSON.stringify({
             plan: "Delegate a public-contract check and synthesize the code.",
-            cLevelRole: "chief",
-            roles: [
-              {
-                id: "chief",
-                name: "Chief",
-                class: "c_level",
-                description: "Coordinates implementation and requests review.",
-              },
-              {
-                id: "reviewer",
-                name: "Reviewer",
-                class: "worker",
-                description: "Checks the maintenance contract.",
-              },
-            ],
           }),
         );
       }
@@ -227,7 +210,7 @@ test("team code workflow reaches review only after a command-mediated worker han
                 reason: "A worker must check the public contract.",
                 recipients: [
                   {
-                    role: "reviewer",
+                    role: "specialist",
                     instruction: "Check the candidate requirements.",
                     artifactAccess: "read_only",
                   },
@@ -236,15 +219,7 @@ test("team code workflow reaches review only after a command-mediated worker han
             : JSON.stringify({
                 action: "request_review",
                 reason: "The worker check was incorporated.",
-                artifact: {
-                  apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
-                  summary: "Code candidate ready for sealed VM evaluation.",
-                  deliverable: artifact,
-                  checks: ["Worker response returned through the command channel."],
-                  risks: ["Hidden VM cases remain sealed."],
-                  nextActions: ["Run the sealed VM evaluator."],
-                  confidence: "high",
-                },
+                artifact: artifactCandidate,
               }),
         );
       }
@@ -271,6 +246,94 @@ test("team code workflow reaches review only after a command-mediated worker han
   assert.equal(execution.handoffs, 1);
   assert.equal(execution.modelCalls, 3);
   assert.equal(execution.contractValid, true);
+  assert.equal(execution.artifact, artifact);
+});
+
+test("team code workflow repairs one invalid review artifact and aggregates every model call", async () => {
+  const binding = generateReferenceCodeWorkflowSuite()[0]!;
+  const publicTask = workflowTaskFromCodeTask(binding);
+  const artifactCandidate = candidate(binding.task.oracleContent);
+  const artifact = canonicalCandidateText(artifactCandidate);
+  let calls = 0;
+  let cLevelCalls = 0;
+  let repairCalls = 0;
+  const engine: ModelEngine = {
+    ...scriptedEngine([]),
+    async generate(request) {
+      calls += 1;
+      const system =
+        request.messages.find(({ role }) => role === "system")?.content ?? "";
+      if (system.includes("fixed, host-owned code peer team")) {
+        return result(
+          request,
+          JSON.stringify({ plan: "Delegate, integrate, and repair once." }),
+        );
+      }
+      if (system.includes("Repair only the representation")) {
+        repairCalls += 1;
+        return result(request, artifact);
+      }
+      if (system.includes("You are worker role")) {
+        return result(request, "The public transition contract is covered.");
+      }
+      if (system.includes("You are the C-level coordinator")) {
+        cLevelCalls += 1;
+        return result(
+          request,
+          cLevelCalls === 1
+            ? JSON.stringify({
+                action: "dispatch",
+                reason: "A worker must check the public contract.",
+                recipients: [
+                  {
+                    role: "specialist",
+                    instruction: "Check the candidate requirements.",
+                    artifactAccess: "read_only",
+                  },
+                ],
+              })
+            : JSON.stringify({
+                action: "request_review",
+                reason: "Submit a candidate for host contract repair.",
+                artifact: {
+                  apiVersion: artifactCandidate.apiVersion,
+                  files: [],
+                  summary: "",
+                },
+              }),
+        );
+      }
+      throw new Error(`Unexpected system prompt: ${system}`);
+    },
+  };
+  const executor = new PeerTeamCodeWorkflowExecutor({
+    engine,
+    binding,
+    maxParallelAgents: 2,
+  });
+  await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+
+  const execution = await executor.execute({
+    task: publicTask,
+    submission: 1,
+    feedbackRound: 0,
+    directive,
+    directiveHash: createHash("sha256").update(directive).digest("hex"),
+    remainingModelCalls: 16,
+    previousArtifact: null,
+  });
+
+  assert.equal(calls, 5);
+  assert.equal(cLevelCalls, 2);
+  assert.equal(repairCalls, 1);
+  assert.equal(execution.contractValid, true);
+  assert.equal(execution.contractRepairAttempts, 1);
+  assert.equal(execution.handoffs, 1);
+  assert.equal(execution.modelCalls, 4);
+  assert.equal(execution.usage.inputTokens, 44);
+  assert.equal(execution.usage.outputTokens, 52);
+  assert.equal(execution.providerIdentities?.length, 4);
   assert.equal(execution.artifact, artifact);
 });
 
