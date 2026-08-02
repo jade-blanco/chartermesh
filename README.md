@@ -291,6 +291,39 @@ model identity, and use a per-plan lock. After confirming a stopped process,
 `--restart-checkpoint` preserves its abandoned run and starts a fresh isolated
 ledger.
 
+To run the narrower three-condition C-level routing canary, add
+`--hybrid-c-level-canary` to both the dry plan and the approved live command:
+
+```powershell
+# Dry only: review data.planHash; no model or Codex process is started.
+node bin/chartermesh.mjs evaluate-workflow --target TARGET --fixture product-package-easy-001 `
+  --hybrid-c-level-canary --engine-id local-model `
+  --codex-executable C:\absolute\path\to\codex.exe --codex-sha256 SHA256 `
+  --codex-model CODEX_MODEL --codex-max-output-bytes 1048576 --json
+
+# Repeat every plan-defining option exactly, then approve the returned hash.
+node bin/chartermesh.mjs evaluate-workflow --target TARGET --fixture product-package-easy-001 `
+  --hybrid-c-level-canary --engine-id local-model `
+  --codex-executable C:\absolute\path\to\codex.exe --codex-sha256 SHA256 `
+  --codex-model CODEX_MODEL --codex-max-output-bytes 1048576 `
+  --live --approve PLAN_HASH --json
+```
+
+The canary compares a local single run, an all-local team, and a team whose
+coordinator/C-level role alone uses the attested Codex executable. All three
+receive the same host-owned orientation; specialist work and contract repair
+remain on the local candidate engine. It currently accepts artifact fixtures
+only: `--full`, `--code-only`, or any code fixture fails closed. Omit
+`--max-total-tokens`; Codex exec usage is unmeasured, so the canary rejects a
+finite total-token cap instead of pretending to guarantee it.
+`--codex-max-output-bytes` is a subprocess-output safety bound, not a token or
+cost cap, and is committed by the exact approval hash. Codex
+`maxOutputTokens` is advisory because CLI-side hard enforcement cannot be
+proven; timeout, call count, response schema, and output bytes are the hard
+bounds, while Codex token/cost usage remains unknown. Hybrid results are not
+compute matched; interpret `conditionComparisons` beside `engineAggregate`
+calls, known token/cost fields, and elapsed time.
+
 ## Operate from the CLI
 
 ```powershell

@@ -5,6 +5,7 @@ import type {
   SealedEvaluationResult,
   SealedWorkflowEvaluator,
   WorkflowCensorReason,
+  WorkflowEngineRoute,
   WorkflowExecutionResult,
   WorkflowFeedbackProvider,
   WorkflowFailureObservation,
@@ -99,15 +100,81 @@ function isUnsettledOperation(error: unknown): boolean {
     : false;
 }
 
+type ExpectedCandidateModelIdentity =
+  | string
+  | Readonly<Record<string, string>>;
+
+type NormalizedExpectedCandidateModelIdentity =
+  | string
+  | ReadonlyMap<string, string>;
+
+function boundedIdentity(
+  value: unknown,
+  maximumLength: number,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maximumLength &&
+    !/[\0\r\n]/u.test(value)
+  );
+}
+
+function normalizeExpectedCandidateModelIdentity(
+  value: ExpectedCandidateModelIdentity | undefined,
+): NormalizedExpectedCandidateModelIdentity | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") {
+    if (!boundedIdentity(value, 1_024)) {
+      throw new Error("expectedCandidateModelId must be a bounded model id.");
+    }
+    return value;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(
+      "expectedCandidateModelId must be a model id or profile-to-model map.",
+    );
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error(
+      "expectedCandidateModelId profile map must be a plain record.",
+    );
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length === 0 ||
+    ownKeys.some((key) => typeof key !== "string")
+  ) {
+    throw new Error(
+      "expectedCandidateModelId profile map must contain string entries.",
+    );
+  }
+  const normalized = new Map<string, string>();
+  for (const key of ownKeys as string[]) {
+    const modelId = value[key];
+    if (
+      !boundedIdentity(key, 200) ||
+      !boundedIdentity(modelId, 1_024)
+    ) {
+      throw new Error(
+        "expectedCandidateModelId profile map contains an invalid identity.",
+      );
+    }
+    normalized.set(key, modelId);
+  }
+  return normalized;
+}
+
 function attestCandidateIdentity(
   step: WorkflowOrientationResult | WorkflowExecutionResult,
-  expectedModelId: string | undefined,
+  expectedIdentity: NormalizedExpectedCandidateModelIdentity | undefined,
   observed: Map<
     string,
     { modelId: string; systemFingerprint: string | null }
   >,
 ): void {
-  if (expectedModelId === undefined) return;
+  if (expectedIdentity === undefined) return;
   const identities = step.providerIdentities ?? [];
   if (identities.length !== step.modelCalls) {
     throw new WorkflowProviderIdentityError(
@@ -115,6 +182,15 @@ function attestCandidateIdentity(
     );
   }
   for (const identity of identities) {
+    const expectedModelId =
+      typeof expectedIdentity === "string"
+        ? expectedIdentity
+        : expectedIdentity.get(identity.engineProfileId);
+    if (expectedModelId === undefined) {
+      throw new WorkflowProviderIdentityError(
+        "WORKFLOW_PROVIDER_PROFILE_UNBOUND",
+      );
+    }
     if (identity.reportedModelId !== expectedModelId) {
       throw new WorkflowProviderIdentityError(
         "WORKFLOW_PROVIDER_MODEL_ID_MISMATCH",
@@ -496,9 +572,11 @@ export async function runWorkflowTrajectory(input: {
   evaluator: SealedWorkflowEvaluator;
   limits?: Partial<WorkflowTrajectoryLimits>;
   trialId?: string;
+  conditionId?: string;
+  engineRoute?: WorkflowEngineRoute;
   orderIndex?: number;
   signal?: AbortSignal;
-  expectedCandidateModelId?: string;
+  expectedCandidateModelId?: ExpectedCandidateModelIdentity;
   now?: () => number;
   onRound?: (round: WorkflowRoundRecord) => Promise<void> | void;
 }): Promise<WorkflowTrajectoryReport> {
@@ -518,6 +596,28 @@ export async function runWorkflowTrajectory(input: {
   const clock = input.now ?? (() => performance.now());
   const startedAt = clock();
   const trialId = input.trialId ?? `workflow-trial-${randomUUID()}`;
+  const conditionId =
+    input.conditionId ??
+    `${input.executor.architecture}-${input.feedbackProvider.id.replaceAll("_", "-")}`;
+  const engineRoute =
+    input.engineRoute ??
+    (input.executor.architecture === "single"
+      ? "local-single"
+      : "all-local-team");
+  if (
+    !boundedIdentity(conditionId, 256) ||
+    ![
+      "local-single",
+      "all-local-team",
+      "codex-c-level-local-worker-team",
+    ].includes(engineRoute)
+  ) {
+    throw new Error("WORKFLOW_TRAJECTORY_CONDITION_INVALID");
+  }
+  const expectedCandidateIdentity =
+    normalizeExpectedCandidateModelIdentity(
+      input.expectedCandidateModelId,
+    );
   let setup: WorkflowOrientationResult;
   let failedSetupMetrics: WorkflowOrientationResult | null = null;
   let usage = zeroUsage();
@@ -549,15 +649,6 @@ export async function runWorkflowTrajectory(input: {
     string,
     { modelId: string; systemFingerprint: string | null }
   >();
-
-  if (
-    input.expectedCandidateModelId !== undefined &&
-    (input.expectedCandidateModelId.trim().length === 0 ||
-      input.expectedCandidateModelId.length > 1_024 ||
-      /[\0\r\n]/u.test(input.expectedCandidateModelId))
-  ) {
-    throw new Error("expectedCandidateModelId must be a bounded model id.");
-  }
 
   const beforeDeadline = async <T>(
     operation: (signal: AbortSignal) => Promise<T>,
@@ -653,7 +744,7 @@ export async function runWorkflowTrajectory(input: {
     );
     attestCandidateIdentity(
       setup,
-      input.expectedCandidateModelId,
+      expectedCandidateIdentity,
       observedCandidateIdentities,
     );
     usage = addUsage(usage, setup.usage);
@@ -752,7 +843,7 @@ export async function runWorkflowTrajectory(input: {
       );
       attestCandidateIdentity(
         execution,
-        input.expectedCandidateModelId,
+        expectedCandidateIdentity,
         observedCandidateIdentities,
       );
     } catch (error) {
@@ -1099,8 +1190,10 @@ export async function runWorkflowTrajectory(input: {
     round.protocolViolations.includes("TEAM_REVIEW_WITHOUT_HANDOFF"),
   ).length;
   return {
-    apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha2",
+    apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha3",
     trialId,
+    conditionId,
+    engineRoute,
     orderIndex: input.orderIndex ?? 0,
     taskId: input.task.id,
     family: input.task.family,
@@ -1149,6 +1242,7 @@ export async function runWorkflowTrajectory(input: {
       prematureReviewRequests,
     },
     safety,
+    engineAccounting: [],
     approvalAuthority: "synthetic_evaluator",
     productionHumanApprovalExercised: false,
   };

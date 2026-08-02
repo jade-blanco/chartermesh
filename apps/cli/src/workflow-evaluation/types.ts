@@ -1,6 +1,10 @@
 import type { ModelUsage } from "../../../../packages/adapter-sdk/src/types.ts";
 
 export type WorkflowArchitecture = "single" | "team";
+export type WorkflowEngineRoute =
+  | "local-single"
+  | "all-local-team"
+  | "codex-c-level-local-worker-team";
 export type WorkflowFeedbackPolicy =
   | "neutral_repeat"
   | "fixed_self_review"
@@ -263,9 +267,29 @@ export interface WorkflowFailureObservation {
   role: string | null;
 }
 
+export interface WorkflowEngineAccounting {
+  engineProfileId: string;
+  modelId: string;
+  calls: number;
+  succeeded: number;
+  failed: number;
+  canceled: number;
+  abandoned: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cost: number | null;
+  elapsedMs: number | null;
+  measurementStatus: "measured" | "estimated" | "unknown";
+  evidenceSource:
+    | "control_plane_invocation"
+    | "derived_feedback_proxy";
+}
+
 export interface WorkflowTrajectoryReport {
-  apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha2";
+  apiVersion: "chartermesh.dev/workflow-trajectory/v1alpha3";
   trialId: string;
+  conditionId: string;
+  engineRoute: WorkflowEngineRoute;
   orderIndex: number;
   taskId: string;
   family: WorkflowPublicTask["family"];
@@ -300,7 +324,7 @@ export interface WorkflowTrajectoryReport {
     internalModelCallCount: number;
     totalInputTokens: number | null;
     totalOutputTokens: number | null;
-    elapsedMs: number;
+    elapsedMs: number | null;
     censorReason: WorkflowCensorReason | null;
     failure: WorkflowFailureObservation | null;
   };
@@ -312,12 +336,13 @@ export interface WorkflowTrajectoryReport {
     prematureReviewRequests: number;
   };
   safety: WorkflowSafetyObservation;
+  engineAccounting: WorkflowEngineAccounting[];
   approvalAuthority: "synthetic_evaluator";
   productionHumanApprovalExercised: false;
 }
 
 export interface WorkflowStudyReport {
-  apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha2";
+  apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha3";
   studyId: string;
   approvedPlanHash: string | null;
   approvedPlanCanonicalJson: string | null;
@@ -326,9 +351,17 @@ export interface WorkflowStudyReport {
   startedAt: string;
   finishedAt: string;
   conditionOrder: string[];
+  conditionDefinitions: Array<{
+    id: string;
+    architecture: WorkflowArchitecture;
+    feedbackPolicy: WorkflowFeedbackPolicy;
+    engineRoute: WorkflowEngineRoute;
+  }>;
   taskIds: string[];
   limits: WorkflowTrajectoryLimits;
-  conditionOrdering: "seeded_williams_square_v1";
+  conditionOrdering:
+    | "seeded_williams_square_v1"
+    | "seeded_cyclic_latin_v1";
   provenance: {
     sealedSuiteHash: string;
     candidateEngine: {
@@ -342,6 +375,16 @@ export interface WorkflowStudyReport {
       providerId: string;
       executableSha256: string;
       requestedModelId: string;
+    } | null;
+    cLevelEngine: {
+      profileId: string;
+      adapter: string;
+      manifestHash: string;
+      configuredModelId: string;
+      executableSha256: string;
+      transportPolicySha256: string;
+      identityAttestation: "command_attested";
+      tokenUsageVisibility: "unknown";
     } | null;
     controlPlane: {
       mode: "isolated_evaluation_database";
@@ -395,6 +438,40 @@ export interface WorkflowStudyReport {
     bestScoreWins: number;
     bestScoreTies: number;
     bestScoreLosses: number;
+  }>;
+  conditionComparisons: Array<{
+    contrastId: string;
+    leftConditionId: string;
+    rightConditionId: string;
+    pairedTasks: number;
+    rightMinusLeftCheckpointPassRate: number;
+    rightMinusLeftFinalPassRate: number;
+    rightMinusLeftMeanBestScore: number;
+    rightMinusLeftMeanFeedbackRounds: number;
+    rightMinusLeftMeanElapsedMs: number;
+    rightMinusLeftMeanModelCalls: number;
+    bestScoreWins: number;
+    bestScoreTies: number;
+    bestScoreLosses: number;
+  }>;
+  engineAggregate: Array<{
+    conditionId: string;
+    engineProfileId: string;
+    modelId: string;
+    trials: number;
+    calls: number;
+    succeeded: number;
+    failed: number;
+    canceled: number;
+    abandoned: number;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cost: number | null;
+    elapsedMs: number | null;
+    measurementStatus: "measured" | "estimated" | "unknown";
+    evidenceSource:
+      | "control_plane_invocation"
+      | "derived_feedback_proxy";
   }>;
   stratifiedAggregate: Array<{
     dimension: "family" | "difficulty";

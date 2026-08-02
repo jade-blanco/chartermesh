@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import type {
   InferenceRequest,
@@ -14,6 +15,7 @@ import {
   WORKFLOW_RESPONSE_SCHEMA_OVERSIZED_BOUND_ACTION,
   WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
   boundedWorkflowInferenceRequest,
+  createArtifactWorkflowExecutor,
   createIdentityAttestingWorkflowEngine,
 } from "../src/workflow-evaluation/model-executors.ts";
 import {
@@ -230,6 +232,150 @@ test("single executor uses one matched orientation call and emits canonical huma
   assert.equal(output.artifact, canonicalArtifactJson(task.oracleCandidate));
   assert.match(output.humanView, /Starter Launch Kit/u);
   assert.equal(output.handoffs, 0);
+});
+
+test("three hybrid conditions reuse one hash-bound host orientation without model calls", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  const canonicalPlan =
+    "Use the fixed host-owned plan for every hybrid feedback condition.";
+  const planHash = createHash("sha256")
+    .update(canonicalPlan)
+    .digest("hex");
+  let modelCalls = 0;
+  const implementation = engine(async (request) => {
+    modelCalls += 1;
+    return result(request, JSON.stringify(task.oracleCandidate));
+  });
+
+  const setups = await Promise.all(
+    ["neutral_repeat", "fixed_self_review", "codex_generalist"].map(
+      async () => {
+        const executor = createArtifactWorkflowExecutor({
+          architecture: "team",
+          engine: implementation,
+          task,
+          maxParallelAgents: 1,
+          hostOwnedOrientation: { canonicalPlan, planHash },
+        });
+        return await executor.orient({ task: publicTask });
+      },
+    ),
+  );
+
+  assert.equal(modelCalls, 0);
+  for (const setup of setups) {
+    assert.equal(setup.planHash, planHash);
+    assert.equal(setup.modelCalls, 0);
+    assert.equal(setup.latencyMs, 0);
+    assert.deepEqual(setup.providerIdentities, []);
+    assert.deepEqual(setup.usage, {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cost: 0,
+      measurementStatus: "measured",
+    });
+  }
+});
+
+test("host-owned orientation rejects a forged plan hash before execution", () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  assert.throws(
+    () =>
+      createArtifactWorkflowExecutor({
+        architecture: "team",
+        engine: engine(async (request) =>
+          result(request, JSON.stringify(task.oracleCandidate))
+        ),
+        task,
+        maxParallelAgents: 1,
+        hostOwnedOrientation: {
+          canonicalPlan: "Trusted plan text.",
+          planHash: "0".repeat(64),
+        },
+      }),
+    /WORKFLOW_HOST_ORIENTATION_INVALID/u,
+  );
+});
+
+test("hybrid team keeps contract repair on the default local engine", async () => {
+  const task = generateReferenceArtifactSuite()[0]!;
+  const publicTask = workflowTaskFromArtifactTask(task);
+  const canonicalPlan = "Delegate once, integrate, then repair locally.";
+  const planHash = createHash("sha256")
+    .update(canonicalPlan)
+    .digest("hex");
+  const localStages: string[] = [];
+  const local = engine(async (request) => {
+    const system =
+      request.messages.find(({ role }) => role === "system")?.content ?? "";
+    if (system.includes("You are worker role")) {
+      localStages.push("specialist");
+      return result(request, "The public contract was checked.");
+    }
+    assert.match(system, /Repair only the representation/u);
+    localStages.push("repair");
+    return result(request, JSON.stringify(task.oracleCandidate));
+  });
+  let terraCalls = 0;
+  const terra = engine(async (request) => {
+    terraCalls += 1;
+    if (terraCalls === 1) {
+      return result(
+        request,
+        JSON.stringify({
+          action: "dispatch",
+          reason: "Obtain the required specialist check.",
+          recipients: [
+            {
+              role: "specialist",
+              instruction: "Check every disclosed requirement.",
+              artifactAccess: "read_only",
+            },
+          ],
+        }),
+      );
+    }
+    return {
+      ...result(
+        request,
+        JSON.stringify({
+          action: "request_review",
+          reason: "The checked artifact is ready.",
+          artifact: task.oracleCandidate,
+        }),
+      ),
+      finishReason: "length",
+    };
+  });
+  const executor = new PeerTeamArtifactWorkflowExecutor({
+    engine: local,
+    task,
+    maxParallelAgents: 1,
+    hostOwnedOrientation: { canonicalPlan, planHash },
+    engineForRole: (role) =>
+      role === "coordinator" ? terra : local,
+  });
+  const setup = await executor.orient({ task: publicTask });
+  const directive = publicTask.initialImplementationBrief;
+  const output = await executor.execute({
+    task: publicTask,
+    submission: 1,
+    feedbackRound: 0,
+    directive,
+    directiveHash: createHash("sha256").update(directive).digest("hex"),
+    remainingModelCalls: 4,
+    previousArtifact: null,
+  });
+
+  assert.equal(setup.modelCalls, 0);
+  assert.equal(terraCalls, 2);
+  assert.deepEqual(localStages, ["specialist", "repair"]);
+  assert.equal(output.modelCalls, 4);
+  assert.equal(output.contractRepairOutcome, "succeeded");
+  assert.equal(output.contractValid, true);
 });
 
 test("peer-team executor uses the fixed typed team and only returns after a command handoff", async () => {

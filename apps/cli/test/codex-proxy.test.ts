@@ -15,6 +15,9 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
   CodexCliFeedbackProvider,
+  CodexExecModelEngine,
+  CODEX_EXEC_MODEL_ENGINE_API_VERSION,
+  CODEX_EXEC_MODEL_PROTOCOL_SHA256,
   CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256,
   CODEX_PROXY_ENVIRONMENT_POLICY_VERSION,
   CodexProxyError,
@@ -57,6 +60,29 @@ function request(): SimulatedUserFeedbackRequest {
         summary: "The public smoke check completed.",
       },
     ],
+  };
+}
+
+function modelRequest() {
+  return {
+    invocationId: "attempt-1:coordinator:0:inference",
+    messages: [
+      {
+        role: "system" as const,
+        content: "Coordinate one bounded structured-output stage.",
+      },
+      {
+        role: "user" as const,
+        content: JSON.stringify({ objective: "Produce a dispatch directive." }),
+      },
+    ],
+    responseSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["action"],
+      properties: { action: { const: "dispatch" } },
+    },
+    maxOutputTokens: 1_024,
   };
 }
 
@@ -283,6 +309,10 @@ test("Codex provider attests the executable and uses the isolated exact CLI shap
   });
 
   const result = await provider.provideFeedback(request());
+  assert.equal(CodexCliFeedbackProvider.isExactInstance(provider), true);
+  assert.equal(CodexCliFeedbackProvider.isLiveAttestedInstance(provider), false);
+  assert.equal(provider.transportAttestation, "injected_test_spawn");
+  assert.equal(Object.isFrozen(provider), true);
   assert.equal(result.actorType, "simulated_user_proxy");
   assert.equal(result.mayResolveHumanApproval, false);
   assert.equal(result.providerId, "codex-cli-ordinary-user");
@@ -349,6 +379,26 @@ test("Codex provider attests the executable and uses the isolated exact CLI shap
       },
     },
   });
+  const liveProvider = new CodexCliFeedbackProvider({
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-test",
+    environment: { USERPROFILE: fixture.directory },
+  });
+  assert.equal(
+    CodexCliFeedbackProvider.isLiveAttestedInstance(liveProvider),
+    true,
+  );
+  await liveProvider.preflightExecutableAttestation();
+  assert.equal(liveProvider.transportAttestation, "default_spawn");
+  assert.equal(Object.isFrozen(CodexCliFeedbackProvider.prototype), true);
+  assert.throws(
+    () =>
+      Object.defineProperty(liveProvider, "providerId", {
+        value: "unapproved-provider",
+      }),
+    TypeError,
+  );
 });
 
 test("Codex provider fails closed when no absolute authentication home exists", async (t) => {
@@ -653,4 +703,263 @@ test("unsupported required Codex flags fail explicitly", async (t) => {
       error instanceof CodexProxyError &&
       error.code === "CODEX_PROXY_UNSUPPORTED_FLAGS",
   );
+});
+
+test("Codex exec model engine is schema-required, tool-less, transport-labelled, and usage-unknown", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const observation: SpawnObservation = { killSignals: [] };
+  const output = { action: "dispatch" };
+  const engine = new CodexExecModelEngine({
+    profileId: "codex-c-level",
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-5.6-terra",
+    environment: {
+      USERPROFILE: fixture.directory,
+      PATH: "test-path",
+    },
+    spawn: scriptedSpawn(output, observation),
+  });
+
+  const result = await engine.generate(modelRequest());
+
+  assert.equal(CodexExecModelEngine.isExactInstance(engine), true);
+  assert.equal(CodexExecModelEngine.isLiveAttestedInstance(engine), false);
+  assert.equal(
+    CodexExecModelEngine.isExactInstance({
+      ...engine,
+      manifest: engine.manifest,
+    }),
+    false,
+  );
+  assert.equal(
+    CodexExecModelEngine.isExactInstance(
+      Object.create(CodexExecModelEngine.prototype),
+    ),
+    false,
+  );
+  assert.equal(result.invocationId, modelRequest().invocationId);
+  assert.equal(result.text, JSON.stringify(output));
+  assert.deepEqual(result.toolCalls, []);
+  assert.equal(result.finishReason, "stop");
+  assert.deepEqual(result.usage, {
+    inputTokens: null,
+    outputTokens: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    cost: null,
+    measurementStatus: "unknown",
+  });
+  assert.deepEqual(result.providerIdentity, {
+    reportedModelId: "gpt-5.6-terra",
+    reportedSystemFingerprint: engine.commandAttestationFingerprint,
+  });
+  assert.match(
+    engine.commandAttestationFingerprint,
+    /^injected-test-transport:[a-f0-9]{64}$/u,
+  );
+  assert.equal(engine.transportAttestation, "injected_test_spawn");
+  const liveTransportEngine = new CodexExecModelEngine({
+    profileId: "codex-c-level-live-transport",
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-5.6-terra",
+    environment: { USERPROFILE: fixture.directory },
+  });
+  assert.equal(
+    CodexExecModelEngine.isLiveAttestedInstance(liveTransportEngine),
+    true,
+  );
+  await liveTransportEngine.preflightExecutableAttestation();
+  assert.equal(liveTransportEngine.transportAttestation, "default_spawn");
+  assert.match(
+    liveTransportEngine.commandAttestationFingerprint,
+    /^command-attested:[a-f0-9]{64}$/u,
+  );
+  assert.equal(Object.isFrozen(liveTransportEngine), true);
+  assert.equal(Object.isFrozen(liveTransportEngine.manifest), true);
+  assert.equal(Object.isFrozen(liveTransportEngine.manifest.capabilities), true);
+  assert.equal(Object.isFrozen(CodexExecModelEngine.prototype), true);
+  assert.throws(
+    () =>
+      Object.defineProperty(liveTransportEngine, "executablePath", {
+        value: "C:\\unapproved\\codex.exe",
+      }),
+    TypeError,
+  );
+  assert.throws(
+    () =>
+      Object.defineProperty(CodexExecModelEngine.prototype, "generate", {
+        value: async () => {
+          throw new Error("unapproved replacement");
+        },
+      }),
+    TypeError,
+  );
+  assert.equal(
+    CodexExecModelEngine.isLiveAttestedInstance(liveTransportEngine),
+    true,
+  );
+  const missingExecutableEngine = new CodexExecModelEngine({
+    profileId: "codex-c-level-missing-executable",
+    executablePath: join(fixture.directory, "missing-codex.exe"),
+    executableSha256: fixture.digest,
+    model: "gpt-5.6-terra",
+    environment: { USERPROFILE: fixture.directory },
+  });
+  assert.equal(
+    CodexExecModelEngine.isLiveAttestedInstance(missingExecutableEngine),
+    true,
+  );
+  await assert.rejects(
+    missingExecutableEngine.preflightExecutableAttestation(),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_EXECUTABLE_INVALID",
+  );
+  assert.equal(engine.manifest.profileId, "codex-c-level");
+  assert.equal(engine.manifest.adapter, "codex-cli-exec");
+  assert.match(CODEX_EXEC_MODEL_PROTOCOL_SHA256, /^[a-f0-9]{64}$/u);
+  assert.equal(
+    engine.manifest.capabilities.find(
+      ({ name }) => name === "model.tool_calling",
+    )?.support,
+    "unsupported",
+  );
+
+  assert.ok(observation.args);
+  const args = observation.args!;
+  assert.deepEqual(args.slice(0, 13), [
+    "exec",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "apps",
+    "--disable",
+    "shell_tool",
+  ]);
+  assert.equal(args[13], "-c");
+  assert.equal(args[14], 'web_search="disabled"');
+  assert.equal(args[15], "--model");
+  assert.equal(args[16], "gpt-5.6-terra");
+  assert.equal(args.at(-1), "-");
+  assert.deepEqual(observation.schema, modelRequest().responseSchema);
+  assert.ok(observation.cwd);
+  assert.equal(await absent(observation.cwd!), true);
+  assert.match(observation.prompt ?? "", /stateless structured-output model engine/u);
+  const payload = JSON.parse(
+    (observation.prompt ?? "").split("\n").at(-1) ?? "null",
+  );
+  assert.equal(payload.apiVersion, CODEX_EXEC_MODEL_ENGINE_API_VERSION);
+  assert.equal(payload.invocationId, modelRequest().invocationId);
+  assert.deepEqual(payload.messages, modelRequest().messages);
+});
+
+test("Codex exec model engine rejects missing schemas and every tool surface before spawn", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  let spawnCalls = 0;
+  const engine = new CodexExecModelEngine({
+    profileId: "codex-c-level",
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-5.6-terra",
+    spawn: (..._args) => {
+      spawnCalls += 1;
+      throw new Error("must not spawn");
+    },
+  });
+  const base = modelRequest();
+  await assert.rejects(
+    engine.generate({ ...base, responseSchema: undefined }),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_REQUEST_INVALID",
+  );
+  await assert.rejects(
+    engine.generate({
+      ...base,
+      tools: [
+        {
+          name: "shell",
+          description: "Forbidden tool",
+          inputSchema: { type: "object" },
+        },
+      ],
+    }),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_REQUEST_INVALID",
+  );
+  await assert.rejects(
+    engine.generate({
+      ...base,
+      messages: [{ role: "tool", content: "forbidden", toolCallId: "1" }],
+    }),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_REQUEST_INVALID",
+  );
+  assert.equal(spawnCalls, 0);
+});
+
+test("Codex exec model engine cancel terminates the exact active invocation", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const observation: SpawnObservation = { killSignals: [] };
+  const engine = new CodexExecModelEngine({
+    profileId: "codex-c-level",
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-5.6-terra",
+    timeoutMs: 10_000,
+    spawn: scriptedSpawn(
+      { action: "dispatch" },
+      observation,
+      { neverClose: true },
+    ),
+  });
+  const pending = engine.generate(modelRequest());
+  while (observation.prompt === undefined) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  await engine.cancel(modelRequest().invocationId);
+  await assert.rejects(
+    pending,
+    (error: unknown) =>
+      error instanceof CodexProxyError && error.code === "CODEX_PROXY_ABORTED",
+  );
+  assert.deepEqual(observation.killSignals, ["SIGTERM"]);
+  assert.equal(await absent(observation.cwd!), true);
+});
+
+test("Codex exec model engine re-attests its executable after every invocation", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const observation: SpawnObservation = { killSignals: [] };
+  const engine = new CodexExecModelEngine({
+    profileId: "codex-c-level",
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-5.6-terra",
+    spawn: scriptedSpawn(
+      { action: "dispatch" },
+      observation,
+      { mutateExecutable: "replaced executable\n" },
+    ),
+  });
+  await assert.rejects(
+    engine.generate(modelRequest()),
+    (error: unknown) =>
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_EXECUTABLE_HASH_MISMATCH",
+  );
+  assert.equal(await absent(observation.cwd!), true);
 });

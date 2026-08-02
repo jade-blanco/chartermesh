@@ -49,6 +49,104 @@ inference, whereas the Codex arm adds one reviewer call per feedback round.
 Team submissions can add several C-level and worker calls. The six arms compare
 workflow configurations, not equal-FLOP samples.
 
+### Three-arm hybrid C-level canary
+
+Add a separate `hybrid_c_level_canary_v1` condition set. It does not extend or
+replace the six-arm feedback study. Each selected task runs in three paired
+conditions:
+
+```text
+single-local-neutral-repeat
+team-local-neutral-repeat
+team-codex-c-level-neutral-repeat
+```
+
+The first contrast measures the existing local Team-Lite layer against the
+local single-model baseline. The second holds the team protocol constant and
+changes only the coordinator route from the local candidate engine to Codex.
+All three use neutral-repeat feedback, so this canary does not estimate a
+feedback-policy effect. A seeded cyclic Latin order balances the three
+conditions across tasks.
+
+The canary uses one deterministic host-owned orientation plan, byte-for-byte,
+for all three conditions. The executor verifies that its supplied `planHash`
+is the SHA-256 of the canonical plan and records setup with zero model calls,
+zero latency, zero token usage, and no provider identities. This removes the
+uncontrolled orientation draw that confounded the earlier six-cell canary;
+the host-owned plan is experimental setup, not a model-generated result or a
+production approval.
+
+In the hybrid team, a `codex exec` ModelEngine is available only to the
+coordinator role. Every invocation is ephemeral, read-only, structured-output
+only, and tool-less: user configuration and rules are ignored, repository
+discovery is skipped, web search is disabled, and multi-agent, app, and shell
+features are disabled. The local candidate engine remains the specialist and
+the default engine, including the bounded public-contract repair call. Codex
+therefore cannot inspect the workspace, delegate to native subagents, execute
+a tool, repair outside the peer protocol, or satisfy human approval.
+
+The condition-to-engine and role-to-engine routes are host-owned and committed
+to the approved plan. The hash binds every condition ID and engine route, the
+host-orientation hash, coordinator/specialist/repair bindings, candidate
+runtime-profile hash and configured model, Codex engine profile, executable
+SHA-256, requested model, timeout and output bound, and the complete Codex
+model-engine isolation-protocol hash. Live execution accepts this closed
+matrix only; an ad-hoc resolver, missing engine, swapped role, changed command,
+or changed policy fails before the study starts and requires a newly generated
+plan and exact approval hash.
+
+Codex identity in this path is command-attested, not an independent provider
+attestation. The adapter preflights the approved executable before the study,
+re-attests it before and after every call, fixes the requested model flag and
+isolation-policy hash, and reports a
+fingerprint derived from those commitments. The trajectory checks the expected
+model separately for each engine profile and pins each non-null fingerprint.
+The durable invocation ledger groups calls by engine profile and model so
+local and Codex stages remain distinguishable. Finalization requires the
+trajectory call count to equal the persisted invocation count plus the exact
+number of successful or terminally failed Codex-feedback proxy calls; a
+missing or duplicate invocation fails closed. Feedback-proxy calls that are
+not native Control Plane invocations receive an explicit derived accounting
+row with unknown tokens, cost, and elapsed time instead of disappearing from
+the per-engine totals.
+
+The live runner accepts only an opaque, exact `CodexExecModelEngine` instance
+using the module's default non-shell spawn transport and matching manifest
+policy. Injected test transports, subclasses, copied public fields, and
+prototype spoofs cannot satisfy `command_attested` provenance. The instance,
+its manifest, and the shared prototype are frozen at construction/module load
+so the executable, digest, model, methods, or policy cannot be swapped after
+the binding check.
+
+The standard six-condition study also commits the reserved
+`codex-cli-ordinary-user` feedback-accounting profile in its plan. A candidate
+engine using that profile is rejected while planning, rather than failing only
+after the first derived Codex feedback record. The live boundary requires that
+exact provider ID on the opaque, frozen default-spawn feedback provider and
+preflights its approved executable before any candidate trial can start;
+injected transports remain test-only and cannot satisfy a live plan.
+
+The CLI does not expose trustworthy token usage for this Codex path. Its token
+and cost fields remain `null` with measurement status `unknown`; they are never
+estimated as zero. A single unknown invocation propagates `null` to the
+corresponding engine accounting and whole-trial token totals. Consequently the
+hybrid canary rejects an explicit total-token cap at planning time and relies
+on the separately bound call, wall-clock, process-timeout, and output-size
+limits. Reports must present this missing usage alongside quality and latency.
+The request's `maxOutputTokens` is advisory for `codex exec`; this path has no
+verified CLI control that turns it into a hard generation-token ceiling. The
+hard per-call boundaries are the process timeout, trajectory and peer-stage
+call counts, required response schema, and combined process/last-message
+output-byte limit. Reports and safety claims must not describe the advisory
+token value as enforced.
+
+The initial canary is artifact-only. Code tasks and their attested-VM boundary
+are rejected rather than silently routed through an unvalidated heterogeneous
+path. Expanding the condition set to code requires a separately versioned plan
+and evidence. Like every live study, the artifact canary remains dry by
+default and can run only after the operator approves the exact regenerated
+plan hash.
+
 ### Simulated-user and approval boundary
 
 Codex feedback is recorded as `simulated_user_proxy` with
@@ -195,7 +293,9 @@ explicit large-run acknowledgement.
 
 The design seed controls task and condition ordering, not provider sampling.
 Harness `v1alpha5` does not share a model-generated orientation across feedback
-arms, so feedback-policy differences remain exploratory rather than causal.
+arms in the standard six-arm set, so feedback-policy differences remain
+exploratory rather than causal. The hybrid canary instead shares its separately
+bound host-owned orientation across all three conditions as described above.
 
 The plan also binds a versioned structured-output portability policy. The
 candidate-engine boundary clones every response schema and omits grammar
@@ -234,11 +334,13 @@ Parallel team calls reserve from one shared token budget before they start.
 Unsettled model or VM cancellation is fatal to the study. Windows Sandbox IDs
 are journaled before launch and recovered only after an attested stop.
 
-The v1 plan binds one candidate engine and configured model for all candidate
-roles. Unbound role-to-engine resolver functions are rejected during live
-execution. Heterogeneous role teams require a future versioned role-engine
-matrix whose complete mapping and runtime identities are part of the approved
-plan hash.
+The standard condition set binds one candidate engine and configured model for
+all candidate roles. Unbound role-to-engine resolver functions remain rejected
+during live execution. The hybrid canary is the narrow heterogeneous exception:
+its versioned condition/role engine matrix, command-attested Codex identity,
+local specialist and repair routes, and runtime bindings are all part of the
+approved plan hash. Other heterogeneous role layouts still require a future
+versioned matrix rather than an arbitrary callback.
 
 CharterMesh does not guarantee zero monetary cost for a live run. Provider
 pricing may be absent or unknown; the operator owns engine selection and
@@ -255,6 +357,11 @@ resource limits.
 - Team improvements must be interpreted alongside their additional compute
   and latency.
 - Codex feedback remains useful without weakening the human-approval boundary.
+- A three-arm canary can distinguish the Team-Lite architecture effect from
+  the effect of replacing only its coordinator with command-attested Codex,
+  without granting Codex tools or approval authority.
+- Hybrid results disclose unknown Codex tokens as `null`; they cannot support
+  token-efficiency or equal-compute claims.
 - Censoring prevents a stalled model or server from causing an unbounded run.
 - Provider grammar limits do not silently narrow the accepted artifact, and
   the exact portability transform is part of the approved protocol.
@@ -279,5 +386,8 @@ resource limits.
   evidence.
 - **Retry without a bound.** This permits unlimited spend and yields no honest
   failure or censoring semantics.
+- **Run Codex as a full AgentHost for the hybrid coordinator.** Native tools,
+  workspace access, apps, or subagents would change the safety and compute
+  boundary instead of isolating the coordinator model effect.
 - **Score Office files from semantic fields alone.** Semantic IR cannot support
   rendering, compatibility, or visual-quality claims.

@@ -10,6 +10,7 @@ import {
   runWorkflowStudy,
   workflowConditionId,
   workflowConditionOrderForTask,
+  WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS,
   WORKFLOW_STUDY_CONDITIONS,
 } from "../src/workflow-evaluation/study.ts";
 import type {
@@ -168,6 +169,9 @@ test("trajectory stops on the sealed pass and counts only external directives as
   assert.equal(report.outcome.userDirectiveCount, 5);
   assert.equal(report.outcome.setupApprovalCount, 1);
   assert.equal(report.outcome.finalApprovalCount, 1);
+  assert.equal(report.conditionId, "single-codex-generalist");
+  assert.equal(report.engineRoute, "local-single");
+  assert.deepEqual(report.engineAccounting, []);
   assert.equal(report.rounds.length, 3);
   assert.equal(report.feedbackDirectiveHashes.length, 2);
   assert.equal(report.feedbackDirectives.length, 2);
@@ -222,6 +226,131 @@ test("a bound live trajectory fails closed when the provider cannot attest the c
   assert.equal(
     report.outcome.censorReason,
     "provider_identity_mismatch",
+  );
+});
+
+test("trajectory attests mixed local and Terra identities in peer-stage order", async () => {
+  const hybrid = executor("team");
+  hybrid.orient = async () => ({
+    planHash: digest("shared-host-owned-plan"),
+    approvalActor: "system:synthetic-evaluator",
+    simulatedApproval: true,
+    latencyMs: 0,
+    modelCalls: 0,
+    usage: {
+      ...usage,
+      inputTokens: 0,
+      outputTokens: 0,
+    },
+    providerIdentities: [],
+  });
+  const baseExecute = hybrid.execute;
+  hybrid.execute = async (input) => ({
+    ...(await baseExecute(input)),
+    modelCalls: 3,
+    providerIdentities: [
+      {
+        engineProfileId: "terra-c-level",
+        role: "coordinator",
+        reportedModelId: "gpt-5.6-terra",
+        reportedSystemFingerprint: "terra-fixture-v1",
+      },
+      {
+        engineProfileId: "local-specialist",
+        role: "specialist",
+        reportedModelId: "gemma-4-26b-a4b-it",
+        reportedSystemFingerprint: "local-fixture-v1",
+      },
+      {
+        engineProfileId: "terra-c-level",
+        role: "coordinator",
+        reportedModelId: "gpt-5.6-terra",
+        reportedSystemFingerprint: "terra-fixture-v1",
+      },
+    ],
+  });
+
+  const report = await runWorkflowTrajectory({
+    task,
+    executor: hybrid,
+    feedbackProvider: feedbackProvider("neutral_repeat"),
+    evaluator: evaluator(1),
+    expectedCandidateModelId: {
+      "terra-c-level": "gpt-5.6-terra",
+      "local-specialist": "gemma-4-26b-a4b-it",
+    },
+    conditionId: "hybrid-neutral-repeat",
+    engineRoute: "codex-c-level-local-worker-team",
+    trialId: "trial-hybrid-stage-order",
+  });
+
+  assert.equal(report.outcome.status, "passed");
+  assert.equal(report.setup.modelCalls, 0);
+  assert.deepEqual(report.setup.providerIdentities, []);
+  assert.equal(report.conditionId, "hybrid-neutral-repeat");
+  assert.equal(
+    report.engineRoute,
+    "codex-c-level-local-worker-team",
+  );
+  assert.deepEqual(
+    report.rounds[0]?.providerIdentities.map(
+      ({ engineProfileId, role }) => `${engineProfileId}:${role}`,
+    ),
+    [
+      "terra-c-level:coordinator",
+      "local-specialist:specialist",
+      "terra-c-level:coordinator",
+    ],
+  );
+  assert.equal(report.outcome.internalModelCallCount, 3);
+  assert.deepEqual(report.engineAccounting, []);
+});
+
+test("profile-specific identity attestation fails closed on an unbound engine", async () => {
+  const unbound = executor("single");
+  unbound.orient = async () => ({
+    planHash: digest("host-owned-plan"),
+    approvalActor: "system:synthetic-evaluator",
+    simulatedApproval: true,
+    latencyMs: 0,
+    modelCalls: 0,
+    usage: {
+      ...usage,
+      inputTokens: 0,
+      outputTokens: 0,
+    },
+    providerIdentities: [],
+  });
+  const baseExecute = unbound.execute;
+  unbound.execute = async (input) => ({
+    ...(await baseExecute(input)),
+    modelCalls: 1,
+    providerIdentities: [
+      {
+        engineProfileId: "unapproved-engine",
+        role: "single-implementation",
+        reportedModelId: "otherwise-valid-model",
+        reportedSystemFingerprint: "fixture-v1",
+      },
+    ],
+  });
+
+  const report = await runWorkflowTrajectory({
+    task,
+    executor: unbound,
+    feedbackProvider: feedbackProvider("neutral_repeat"),
+    evaluator: evaluator(1),
+    expectedCandidateModelId: {
+      "approved-engine": "otherwise-valid-model",
+    },
+    trialId: "trial-unbound-profile",
+  });
+
+  assert.equal(report.outcome.status, "failed");
+  assert.equal(report.outcome.censorReason, "provider_identity_mismatch");
+  assert.equal(
+    report.outcome.failure?.code,
+    "WORKFLOW_PROVIDER_PROFILE_UNBOUND",
   );
 });
 
@@ -776,6 +905,12 @@ test("study executes the balanced 2x3 matrix and aggregates resource use", async
     evaluatorForTask: () => evaluator(1),
   });
   assert.equal(report.trials.length, 6);
+  assert.equal(
+    report.apiVersion,
+    "chartermesh.dev/collaboration-study-report/v1alpha3",
+  );
+  assert.equal(report.conditionOrdering, "seeded_williams_square_v1");
+  assert.deepEqual(report.conditionDefinitions, WORKFLOW_STUDY_CONDITIONS);
   assert.equal(report.aggregate.length, 6);
   assert.equal(
     report.aggregate.every(
@@ -790,6 +925,8 @@ test("study executes the balanced 2x3 matrix and aggregates resource use", async
   assert.match(report.suiteHash, /^[a-f0-9]{64}$/u);
   assert.match(report.interpretationBoundary.join(" "), /not a human/u);
   assert.equal(report.pairedComparisons.length, 3);
+  assert.deepEqual(report.conditionComparisons, []);
+  assert.deepEqual(report.engineAggregate, []);
   assert.equal(
     report.pairedComparisons.every(
       (comparison) => comparison.pairedTasks === 1,
@@ -807,6 +944,158 @@ test("study executes the balanced 2x3 matrix and aggregates resource use", async
   );
 });
 
+test("hybrid C-level canary keeps engine routes as distinct condition arms", async () => {
+  const executed: Array<{ conditionId: string; engineRoute: string }> = [];
+  const report = await runWorkflowStudy({
+    tasks: [task],
+    conditions: WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS,
+    seed: 7,
+    studyId: "study-hybrid-c-level-canary",
+    feedbackProviders: {
+      neutral_repeat: feedbackProvider("neutral_repeat"),
+    },
+    executorFactory: ({ condition }) => {
+      executed.push({
+        conditionId: condition.id,
+        engineRoute: condition.engineRoute,
+      });
+      return executor(condition.architecture);
+    },
+    evaluatorForTask: () => evaluator(1),
+  });
+
+  assert.equal(report.trials.length, 3);
+  assert.equal(report.conditionOrdering, "seeded_cyclic_latin_v1");
+  assert.deepEqual(
+    report.conditionOrder,
+    WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS.map(workflowConditionId),
+  );
+  assert.deepEqual(
+    report.conditionDefinitions,
+    WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS,
+  );
+  assert.deepEqual(
+    new Set(executed.map(({ conditionId }) => conditionId)),
+    new Set(report.conditionOrder),
+  );
+  assert.deepEqual(
+    report.trials.map(({ conditionId, engineRoute }) => ({
+      conditionId,
+      engineRoute,
+    })),
+    executed,
+  );
+  assert.equal(report.aggregate.length, 3);
+  assert.equal(
+    report.aggregate.every(
+      (condition) => condition.trials === 1 && condition.finalPassed === 1,
+    ),
+    true,
+  );
+  assert.deepEqual(report.pairedComparisons, []);
+  assert.deepEqual(
+    report.conditionComparisons.map(
+      ({ contrastId, pairedTasks }) => ({ contrastId, pairedTasks }),
+    ),
+    [
+      { contrastId: "all-local-team-vs-local-single", pairedTasks: 1 },
+      { contrastId: "codex-c-level-team-vs-local-single", pairedTasks: 1 },
+      {
+        contrastId: "codex-c-level-team-vs-all-local-team",
+        pairedTasks: 1,
+      },
+    ],
+  );
+  assert.deepEqual(report.engineAggregate, []);
+  assert.match(
+    report.interpretationBoundary.join(" "),
+    /external hosted model role/u,
+  );
+});
+
+test("study engine accounting preserves nullable elapsed time and measurement precedence", async () => {
+  const secondTask: WorkflowPublicTask = {
+    ...task,
+    id: "product-easy-002",
+  };
+  const report = await runWorkflowStudy({
+    tasks: [task, secondTask],
+    conditions: WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS,
+    seed: 7,
+    studyId: "study-engine-accounting",
+    feedbackProviders: {
+      neutral_repeat: feedbackProvider("neutral_repeat"),
+    },
+    executorFactory: ({ condition }) => executor(condition.architecture),
+    evaluatorForTask: () => evaluator(1),
+    onTrial(trial) {
+      const isSecondTask = trial.taskId === secondTask.id;
+      const accountingByCondition = {
+        "single-local-neutral-repeat": {
+          elapsedMs: isSecondTask ? 7 : 5,
+          measurementStatus: isSecondTask ? "estimated" : "measured",
+        },
+        "team-local-neutral-repeat": {
+          elapsedMs: isSecondTask ? null : 3,
+          measurementStatus: isSecondTask ? "unknown" : "measured",
+        },
+        "team-codex-c-level-neutral-repeat": {
+          elapsedMs: isSecondTask ? 6 : 2,
+          measurementStatus: "measured",
+        },
+      } as const;
+      const measurement = accountingByCondition[
+        trial.conditionId as keyof typeof accountingByCondition
+      ];
+      trial.engineAccounting = [{
+        engineProfileId: "fixture-engine",
+        modelId: "fixture-model",
+        calls: 1,
+        succeeded: 1,
+        failed: 0,
+        canceled: 0,
+        abandoned: 0,
+        inputTokens: 1,
+        outputTokens: 1,
+        cost: 0,
+        elapsedMs: measurement.elapsedMs,
+        measurementStatus: measurement.measurementStatus,
+        evidenceSource: "control_plane_invocation",
+      }];
+    },
+  });
+
+  const byCondition = new Map(
+    report.engineAggregate.map((entry) => [entry.conditionId, entry]),
+  );
+  assert.deepEqual(
+    {
+      elapsedMs: byCondition.get("single-local-neutral-repeat")?.elapsedMs,
+      measurementStatus: byCondition.get("single-local-neutral-repeat")
+        ?.measurementStatus,
+    },
+    { elapsedMs: 12, measurementStatus: "estimated" },
+  );
+  assert.deepEqual(
+    {
+      elapsedMs: byCondition.get("team-local-neutral-repeat")?.elapsedMs,
+      measurementStatus: byCondition.get("team-local-neutral-repeat")
+        ?.measurementStatus,
+    },
+    { elapsedMs: null, measurementStatus: "unknown" },
+  );
+  assert.deepEqual(
+    {
+      elapsedMs: byCondition.get("team-codex-c-level-neutral-repeat")
+        ?.elapsedMs,
+      measurementStatus: byCondition.get(
+        "team-codex-c-level-neutral-repeat",
+      )?.measurementStatus,
+    },
+    { elapsedMs: 8, measurementStatus: "measured" },
+  );
+});
+
 test("Williams condition rows balance every ordered first-order carryover", () => {
   const transitions = new Map<string, number>();
   for (let taskIndex = 0; taskIndex < 6; taskIndex += 1) {
@@ -821,6 +1110,33 @@ test("Williams condition rows balance every ordered first-order carryover", () =
   }
   assert.equal(transitions.size, 30);
   assert.equal([...transitions.values()].every((count) => count === 1), true);
+});
+
+test("cyclic Latin rows balance every hybrid condition across positions", () => {
+  const positions = new Map<string, number[]>();
+  const rows = new Set<string>();
+  for (let taskIndex = 0; taskIndex < 3; taskIndex += 1) {
+    const order = workflowConditionOrderForTask(
+      taskIndex,
+      -11,
+      WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS,
+    ).map(workflowConditionId);
+    rows.add(order.join("|"));
+    assert.equal(
+      new Set(order).size,
+      WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS.length,
+    );
+    order.forEach((conditionId, position) => {
+      const counts = positions.get(conditionId) ?? [0, 0, 0];
+      counts[position] = (counts[position] ?? 0) + 1;
+      positions.set(conditionId, counts);
+    });
+  }
+  assert.equal(rows.size, 3);
+  assert.deepEqual(
+    [...positions.values()],
+    WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS.map(() => [1, 1, 1]),
+  );
 });
 
 test("study rejects a provider fingerprint change between tasks", async () => {

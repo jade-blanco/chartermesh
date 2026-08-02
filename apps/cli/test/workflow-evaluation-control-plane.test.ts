@@ -108,6 +108,8 @@ test("peer-team stages, invocations, handoff hashes, and final evidence are dura
     task,
     architecture: "team",
     feedbackPolicy: "neutral_repeat",
+    conditionId: "team-neutral-repeat",
+    engineRoute: "all-local-team",
     engine: baseEngine,
   });
   const team: PeerTeamSetup = {
@@ -212,9 +214,9 @@ test("peer-team stages, invocations, handoff hashes, and final evidence are dura
     feedbackPolicy: "neutral_repeat",
     outcome: {
       feedbackRoundCount: 0,
-      internalModelCallCount: 0,
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
+      internalModelCallCount: 3,
+      totalInputTokens: 6,
+      totalOutputTokens: 9,
     },
   } as WorkflowTrajectoryReport);
   assert.equal(
@@ -231,6 +233,244 @@ test("peer-team stages, invocations, handoff hashes, and final evidence are dura
   assert.equal(evidenceValue.trial.outcome.internalModelCallCount, 3);
   assert.equal(evidenceValue.trial.outcome.totalInputTokens, 6);
   assert.equal(evidenceValue.trial.outcome.totalOutputTokens, 9);
+});
+
+test("local and Codex engines share one durable registry and produce exact per-engine accounting", async (t) => {
+  const directory = mkdtempSync(
+    join(tmpdir(), "workflow-mixed-engine-accounting-"),
+  );
+  const database = openControlPlaneDatabase(join(directory, "state.db"));
+  t.after(() => {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const controlPlane = new ControlPlane(database, join(directory, "artifacts"));
+  const localEngine: ModelEngine = {
+    manifest: {
+      kind: "model_engine",
+      profileId: "local-specialist",
+      adapter: "scripted-local",
+      contractVersion: "v1alpha1",
+      capabilities: [],
+    },
+    async generate(request) {
+      return {
+        ...result(request, "local specialist result"),
+        providerIdentity: {
+          reportedModelId: "gemma-local",
+          reportedSystemFingerprint: "local-fixture-v1",
+        },
+      };
+    },
+  };
+  const unknownUsage: InferenceResult["usage"] = {
+    inputTokens: null,
+    outputTokens: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    cost: null,
+    measurementStatus: "unknown",
+  };
+  const codexEngine: ModelEngine = {
+    manifest: {
+      kind: "model_engine",
+      profileId: "codex-c-level",
+      adapter: "scripted-codex-exec",
+      contractVersion: "v1alpha1",
+      capabilities: [],
+    },
+    async generate(request) {
+      return {
+        invocationId: request.invocationId,
+        text: "Codex C-level result",
+        toolCalls: [],
+        finishReason: request.invocationId.endsWith("canceled")
+          ? "canceled"
+          : "stop",
+        usage: unknownUsage,
+        providerIdentity: {
+          reportedModelId: "gpt-5.6-terra",
+          reportedSystemFingerprint: "codex-fixture-v1",
+        },
+      };
+    },
+  };
+  const task = generateReferenceArtifactSuite()[0]!;
+  const runtime = await createControlPlaneWorkflowStudyPersistence({
+    controlPlane,
+    configuredModelId: "gemma-local",
+    maxChildrenPerTrial: 8,
+  }).prepare({
+    studyId: "study-mixed-engine-accounting",
+    trialId: "study-mixed-engine-accounting:trial-1",
+    task,
+    architecture: "team",
+    feedbackPolicy: "neutral_repeat",
+    conditionId: "hybrid-neutral-repeat",
+    engineRoute: "codex-c-level-local-worker-team",
+    engine: localEngine,
+  });
+  const wrappedCodex = runtime.wrapEngine({
+    engine: codexEngine,
+    configuredModelId: "gpt-5.6-terra",
+  });
+  assert.equal(
+    runtime.wrapEngine({
+      engine: localEngine,
+      configuredModelId: "gemma-local",
+    }),
+    runtime.engine,
+  );
+  assert.equal(
+    runtime.wrapEngine({
+      engine: codexEngine,
+      configuredModelId: "gpt-5.6-terra",
+    }),
+    wrappedCodex,
+  );
+
+  await runtime.engine.generate({
+    invocationId: "local-success",
+    messages: [{ role: "user", content: "Run the local specialist." }],
+  });
+  await wrappedCodex.generate({
+    invocationId: "codex-success",
+    messages: [{ role: "user", content: "Run the Codex C-level." }],
+  });
+  await wrappedCodex.generate({
+    invocationId: "codex-canceled",
+    messages: [{ role: "user", content: "Record a canceled C-level call." }],
+  });
+
+  const invocations = controlPlane.listInvocations();
+  assert.equal(invocations.length, 3);
+  assert.equal(
+    invocations.every(
+      ({ attemptId }) => attemptId === runtime.runContext.attemptId,
+    ),
+    true,
+  );
+  assert.equal(invocations.every(({ status }) => status !== "running"), true);
+  assert.equal(invocations.every(({ finishedAt }) => finishedAt !== null), true);
+  assert.deepEqual(
+    invocations
+      .map(({ engineId, modelId, status }) => ({ engineId, modelId, status }))
+      .sort((left, right) =>
+        `${left.engineId}:${left.status}`.localeCompare(
+          `${right.engineId}:${right.status}`,
+        )
+      ),
+    [
+      {
+        engineId: "codex-c-level",
+        modelId: "gpt-5.6-terra",
+        status: "canceled",
+      },
+      {
+        engineId: "codex-c-level",
+        modelId: "gpt-5.6-terra",
+        status: "succeeded",
+      },
+      {
+        engineId: "local-specialist",
+        modelId: "gemma-local",
+        status: "succeeded",
+      },
+    ],
+  );
+
+  assert.throws(
+    () =>
+      runtime.finalize({
+        trialId: "study-mixed-engine-accounting:trial-1",
+        conditionId: "hybrid-neutral-repeat",
+        engineRoute: "codex-c-level-local-worker-team",
+        feedbackPolicy: "neutral_repeat",
+        engineAccounting: [],
+        outcome: {
+          feedbackRoundCount: 0,
+          internalModelCallCount: 2,
+          totalInputTokens: null,
+          totalOutputTokens: null,
+        },
+      } as WorkflowTrajectoryReport),
+    /WORKFLOW_STUDY_INVOCATION_ACCOUNTING_MISMATCH/u,
+  );
+
+  await runtime.finalize({
+    trialId: "study-mixed-engine-accounting:trial-1",
+    conditionId: "hybrid-neutral-repeat",
+    engineRoute: "codex-c-level-local-worker-team",
+    feedbackPolicy: "neutral_repeat",
+    engineAccounting: [],
+    outcome: {
+      feedbackRoundCount: 0,
+      internalModelCallCount: 3,
+      totalInputTokens: null,
+      totalOutputTokens: null,
+    },
+  } as WorkflowTrajectoryReport);
+
+  const evidence = controlPlane.latestArtifact(runtime.runContext.workItemId);
+  assert.ok(evidence);
+  const trial = (JSON.parse(evidence.content) as {
+    trial: WorkflowTrajectoryReport;
+  }).trial;
+  assert.equal(trial.outcome.internalModelCallCount, 3);
+  assert.equal(trial.outcome.totalInputTokens, null);
+  assert.equal(trial.outcome.totalOutputTokens, null);
+  const codexAccounting = trial.engineAccounting.find(
+    ({ engineProfileId }) => engineProfileId === "codex-c-level",
+  );
+  const localAccounting = trial.engineAccounting.find(
+    ({ engineProfileId }) => engineProfileId === "local-specialist",
+  );
+  assert.deepEqual(
+    codexAccounting && {
+      ...codexAccounting,
+      elapsedMs: Number(codexAccounting.elapsedMs >= 0),
+    },
+    {
+      engineProfileId: "codex-c-level",
+      modelId: "gpt-5.6-terra",
+      calls: 2,
+      succeeded: 1,
+      failed: 0,
+      canceled: 1,
+      abandoned: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cost: null,
+      elapsedMs: 1,
+      measurementStatus: "unknown",
+      evidenceSource: "control_plane_invocation",
+    },
+  );
+  assert.deepEqual(
+    localAccounting && {
+      ...localAccounting,
+      elapsedMs: Number(localAccounting.elapsedMs >= 0),
+    },
+    {
+      engineProfileId: "local-specialist",
+      modelId: "gemma-local",
+      calls: 1,
+      succeeded: 1,
+      failed: 0,
+      canceled: 0,
+      abandoned: 0,
+      inputTokens: 2,
+      outputTokens: 3,
+      cost: 0,
+      elapsedMs: 1,
+      measurementStatus: "measured",
+      evidenceSource: "control_plane_invocation",
+    },
+  );
+  assert.equal(
+    controlPlane.listInvocations().every(({ status }) => status !== "running"),
+    true,
+  );
 });
 
 test("a failed first Codex review keeps total token usage unknown", async (t) => {
@@ -258,12 +498,18 @@ test("a failed first Codex review keeps total token usage unknown", async (t) =>
     controlPlane,
     configuredModelId: "scripted-model",
     maxChildrenPerTrial: 8,
+    codexFeedbackAccounting: {
+      engineProfileId: "codex-cli-ordinary-user",
+      modelId: "gpt-feedback",
+    },
   }).prepare({
     studyId: "study-codex-accounting",
     trialId: "study-codex-accounting:trial-1",
     task,
     architecture: "single",
     feedbackPolicy: "codex_generalist",
+    conditionId: "single-codex-generalist",
+    engineRoute: "local-single",
     engine,
   });
   await runtime.engine.generate({
@@ -272,12 +518,25 @@ test("a failed first Codex review keeps total token usage unknown", async (t) =>
   });
   await runtime.finalize({
     trialId: "study-codex-accounting:trial-1",
+    conditionId: "single-codex-generalist",
+    engineRoute: "local-single",
     feedbackPolicy: "codex_generalist",
+    feedbackDirectives: [],
+    engineAccounting: [],
     outcome: {
       feedbackRoundCount: 0,
       internalModelCallCount: 2,
       totalInputTokens: null,
       totalOutputTokens: null,
+      censorReason: "execution_error",
+      failure: {
+        phase: "feedback",
+        code: "CODEX_PROXY_EXIT_NONZERO",
+        stage: null,
+        stageIndex: null,
+        cycle: null,
+        role: null,
+      },
     },
   } as WorkflowTrajectoryReport);
   const evidence = controlPlane.latestArtifact(runtime.runContext.workItemId);
@@ -288,4 +547,217 @@ test("a failed first Codex review keeps total token usage unknown", async (t) =>
   assert.equal(trial.outcome.internalModelCallCount, 2);
   assert.equal(trial.outcome.totalInputTokens, null);
   assert.equal(trial.outcome.totalOutputTokens, null);
+  assert.deepEqual(
+    trial.engineAccounting.find(
+      ({ evidenceSource }) => evidenceSource === "derived_feedback_proxy",
+    ),
+    {
+      engineProfileId: "codex-cli-ordinary-user",
+      modelId: "gpt-feedback",
+      calls: 1,
+      succeeded: 0,
+      failed: 1,
+      canceled: 0,
+      abandoned: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cost: null,
+      elapsedMs: null,
+      measurementStatus: "unknown",
+      evidenceSource: "derived_feedback_proxy",
+    },
+  );
+});
+
+test("successful Codex feedback is represented by explicit unknown-usage accounting", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "workflow-codex-success-"));
+  const database = openControlPlaneDatabase(join(directory, "state.db"));
+  t.after(() => {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const controlPlane = new ControlPlane(database, join(directory, "artifacts"));
+  const engine: ModelEngine = {
+    manifest: {
+      kind: "model_engine",
+      profileId: "scripted-local-engine",
+      adapter: "scripted-test",
+      contractVersion: "v1alpha1",
+      capabilities: [],
+    },
+    async generate(request) {
+      return result(request, "candidate");
+    },
+  };
+  const task = generateReferenceArtifactSuite()[0]!;
+  const runtime = await createControlPlaneWorkflowStudyPersistence({
+    controlPlane,
+    configuredModelId: "scripted-model",
+    maxChildrenPerTrial: 8,
+    codexFeedbackAccounting: {
+      engineProfileId: "codex-cli-ordinary-user",
+      modelId: "gpt-feedback",
+    },
+  }).prepare({
+    studyId: "study-codex-success",
+    trialId: "study-codex-success:trial-1",
+    task,
+    architecture: "single",
+    feedbackPolicy: "codex_generalist",
+    conditionId: "single-codex-generalist",
+    engineRoute: "local-single",
+    engine,
+  });
+  await runtime.engine.generate({
+    invocationId: "candidate-call",
+    messages: [{ role: "user", content: "Generate one candidate." }],
+  });
+  await runtime.finalize({
+    trialId: "study-codex-success:trial-1",
+    conditionId: "single-codex-generalist",
+    engineRoute: "local-single",
+    feedbackPolicy: "codex_generalist",
+    feedbackDirectives: [
+      { providerId: "codex-feedback" },
+      { providerId: "codex-feedback" },
+    ],
+    engineAccounting: [],
+    outcome: {
+      feedbackRoundCount: 2,
+      internalModelCallCount: 3,
+      totalInputTokens: 2,
+      totalOutputTokens: 3,
+      censorReason: null,
+      failure: null,
+    },
+  } as unknown as WorkflowTrajectoryReport);
+
+  const evidence = controlPlane.latestArtifact(runtime.runContext.workItemId);
+  assert.ok(evidence);
+  const trial = (JSON.parse(evidence.content) as {
+    trial: WorkflowTrajectoryReport;
+  }).trial;
+  assert.equal(trial.outcome.totalInputTokens, null);
+  assert.equal(trial.outcome.totalOutputTokens, null);
+  assert.deepEqual(
+    trial.engineAccounting.find(
+      ({ evidenceSource }) => evidenceSource === "derived_feedback_proxy",
+    ),
+    {
+      engineProfileId: "codex-cli-ordinary-user",
+      modelId: "gpt-feedback",
+      calls: 2,
+      succeeded: 2,
+      failed: 0,
+      canceled: 0,
+      abandoned: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cost: null,
+      elapsedMs: null,
+      measurementStatus: "unknown",
+      evidenceSource: "derived_feedback_proxy",
+    },
+  );
+});
+
+test("Codex feedback accounting fails closed for missing, colliding, or inconsistent evidence", async (t) => {
+  const cases = [
+    {
+      name: "missing metadata",
+      internalModelCallCount: 1,
+      codexFeedbackAccounting: undefined,
+    },
+    {
+      name: "primary profile collision",
+      internalModelCallCount: 1,
+      codexFeedbackAccounting: {
+        engineProfileId: "scripted-local-engine",
+        modelId: "gpt-feedback",
+      },
+    },
+    {
+      name: "excess unpersisted calls",
+      internalModelCallCount: 2,
+      codexFeedbackAccounting: {
+        engineProfileId: "codex-cli-ordinary-user",
+        modelId: "gpt-feedback",
+      },
+    },
+    {
+      name: "missing unpersisted call",
+      internalModelCallCount: 0,
+      codexFeedbackAccounting: {
+        engineProfileId: "codex-cli-ordinary-user",
+        modelId: "gpt-feedback",
+      },
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const directory = mkdtempSync(join(tmpdir(), "workflow-codex-mismatch-"));
+      const database = openControlPlaneDatabase(join(directory, "state.db"));
+      try {
+        const controlPlane = new ControlPlane(
+          database,
+          join(directory, "artifacts"),
+        );
+        const engine: ModelEngine = {
+          manifest: {
+            kind: "model_engine",
+            profileId: "scripted-local-engine",
+            adapter: "scripted-test",
+            contractVersion: "v1alpha1",
+            capabilities: [],
+          },
+          async generate(request) {
+            return result(request, "candidate");
+          },
+        };
+        const task = generateReferenceArtifactSuite()[0]!;
+        const persistence = createControlPlaneWorkflowStudyPersistence({
+          controlPlane,
+          configuredModelId: "scripted-model",
+          maxChildrenPerTrial: 8,
+          ...(fixture.codexFeedbackAccounting
+            ? { codexFeedbackAccounting: fixture.codexFeedbackAccounting }
+            : {}),
+        });
+        const runtime = await persistence.prepare({
+          studyId: "study-codex-mismatch",
+          trialId: `study-codex-mismatch:${fixture.name}`,
+          task,
+          architecture: "single",
+          feedbackPolicy: "codex_generalist",
+          conditionId: "single-codex-generalist",
+          engineRoute: "local-single",
+          engine,
+        });
+        assert.throws(
+          () =>
+            runtime.finalize({
+              trialId: `study-codex-mismatch:${fixture.name}`,
+              conditionId: "single-codex-generalist",
+              engineRoute: "local-single",
+              feedbackPolicy: "codex_generalist",
+              feedbackDirectives: [{ providerId: "codex-feedback" }],
+              engineAccounting: [],
+              outcome: {
+                feedbackRoundCount: 1,
+                internalModelCallCount: fixture.internalModelCallCount,
+                totalInputTokens: null,
+                totalOutputTokens: null,
+                censorReason: null,
+                failure: null,
+              },
+            } as unknown as WorkflowTrajectoryReport),
+          /WORKFLOW_STUDY_INVOCATION_ACCOUNTING_MISMATCH/u,
+        );
+      } finally {
+        database.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
 });

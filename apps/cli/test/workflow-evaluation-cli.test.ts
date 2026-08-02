@@ -105,6 +105,162 @@ test("dry code-only planning binds three VM tasks without launching the sandbox"
   );
 });
 
+test("hybrid C-level dry planning commits three routed conditions without invoking either engine", (t) => {
+  const target = mkdtempSync(join(tmpdir(), "workflow-hybrid-plan-"));
+  t.after(() => rmSync(target, { recursive: true, force: true }));
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "fake",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  const applied = cli([
+    ...bootstrapArgs,
+    "--approve",
+    preview.data.planHash,
+  ]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+
+  const marker = join(target, "codex-was-spawned.txt");
+  const codexExecutable = join(target, "codex-spawn-sentinel.cmd");
+  writeFileSync(
+    codexExecutable,
+    `@echo spawned>"${marker}"\r\n@exit /b 91\r\n`,
+    "utf8",
+  );
+  const codexHash = createHash("sha256")
+    .update(readFileSync(codexExecutable))
+    .digest("hex");
+  const runtime = JSON.parse(
+    readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+  );
+  const engineId = runtime.modelEngines[0].id;
+  const studyArgs = [
+    "evaluate-workflow",
+    "--target",
+    target,
+    "--fixture",
+    "product-package-easy-001",
+    "--hybrid-c-level-canary",
+    "--engine-id",
+    engineId,
+    "--codex-executable",
+    codexExecutable,
+    "--codex-sha256",
+    codexHash,
+    "--codex-model",
+    "offline-hybrid-c-level",
+    "--json",
+  ];
+
+  const planned = cli(studyArgs);
+  assert.equal(planned.status, 0, planned.stdout + planned.stderr);
+  const plan = JSON.parse(planned.stdout).data;
+  assert.equal(plan.conditionSet, "hybrid_c_level_canary_v1");
+  assert.deepEqual(plan.conditions, [
+    "single-local-neutral-repeat",
+    "team-local-neutral-repeat",
+    "team-codex-c-level-neutral-repeat",
+  ]);
+  assert.equal(plan.conditionOrdering, "seeded_cyclic_latin_v1");
+  assert.equal(plan.plannedTrajectories, 3);
+  assert.equal(plan.planGenerationModelCalls, false);
+  assert.equal(plan.liveReady, true);
+  assert.match(plan.planHash, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(plan.engineRoutingPolicy.routes, [
+    {
+      conditionId: "single-local-neutral-repeat",
+      engineRoute: "local-single",
+      orientationEngine: "host",
+      coordinatorEngine: "candidate",
+      specialistEngine: "candidate",
+      repairEngine: "candidate",
+    },
+    {
+      conditionId: "team-local-neutral-repeat",
+      engineRoute: "all-local-team",
+      orientationEngine: "host",
+      coordinatorEngine: "candidate",
+      specialistEngine: "candidate",
+      repairEngine: "candidate",
+    },
+    {
+      conditionId: "team-codex-c-level-neutral-repeat",
+      engineRoute: "codex-c-level-local-worker-team",
+      orientationEngine: "host",
+      coordinatorEngine: "codex",
+      specialistEngine: "candidate",
+      repairEngine: "candidate",
+    },
+  ]);
+  assert.equal(existsSync(marker), false);
+
+  const changedBinding = cli([
+    ...studyArgs.slice(0, -2),
+    "different-c-level-model",
+    "--json",
+  ]);
+  assert.equal(
+    changedBinding.status,
+    0,
+    changedBinding.stdout + changedBinding.stderr,
+  );
+  assert.notEqual(JSON.parse(changedBinding.stdout).data.planHash, plan.planHash);
+  assert.equal(existsSync(marker), false);
+
+  const rejected = cli([
+    ...studyArgs,
+    "--live",
+    "--approve",
+    "0".repeat(64),
+  ]);
+  assert.equal(rejected.status, 1, rejected.stdout + rejected.stderr);
+  assert.match(
+    rejected.stdout,
+    new RegExp(`requires --approve ${plan.planHash}`, "u"),
+  );
+  assert.equal(existsSync(marker), false);
+});
+
+test("hybrid C-level planning fails closed for unmeasured token budgets and code tasks", (t) => {
+  const target = mkdtempSync(join(tmpdir(), "workflow-hybrid-guard-"));
+  t.after(() => rmSync(target, { recursive: true, force: true }));
+
+  const tokenCapped = cli([
+    "evaluate-workflow",
+    "--target",
+    target,
+    "--fixture",
+    "product-package-easy-001",
+    "--hybrid-c-level-canary",
+    "--max-total-tokens",
+    "1000",
+    "--json",
+  ]);
+  assert.equal(tokenCapped.status, 1, tokenCapped.stdout + tokenCapped.stderr);
+  assert.match(
+    tokenCapped.stdout,
+    /Hybrid C-level Codex usage is unmeasured; maxTotalTokens must be null/u,
+  );
+
+  const codeTasks = cli([
+    "evaluate-workflow",
+    "--target",
+    target,
+    "--code-only",
+    "--hybrid-c-level-canary",
+    "--json",
+  ]);
+  assert.equal(codeTasks.status, 1, codeTasks.stdout + codeTasks.stderr);
+  assert.match(
+    codeTasks.stdout,
+    /The hybrid C-level canary currently supports artifact tasks only/u,
+  );
+});
+
 test("evaluate-workflow requires a hash-bound plan and persists every trial in an isolated Control Plane", (t) => {
   const target = mkdtempSync(join(tmpdir(), "workflow-cli-"));
   t.after(() => rmSync(target, { recursive: true, force: true }));

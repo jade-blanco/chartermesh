@@ -8,6 +8,8 @@ import {
 import {
   CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256,
   CodexCliFeedbackProvider,
+  CodexExecModelEngine,
+  CODEX_EXEC_MODEL_PROTOCOL_SHA256,
   FIXED_SELF_REVIEW_FEEDBACK_SHA256,
   NEUTRAL_REPEAT_FEEDBACK_SHA256,
 } from "./codex-proxy.ts";
@@ -50,6 +52,7 @@ import {
   type WorkflowProviderIdentityObservation,
 } from "./model-executors.ts";
 import {
+  WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS,
   WORKFLOW_STUDY_CONDITIONS,
   runWorkflowStudy,
   workflowConditionId,
@@ -57,6 +60,7 @@ import {
 import type { ArtifactEvaluationTask } from "./suite.ts";
 import type {
   WorkflowStudyReport,
+  WorkflowEngineRoute,
   WorkflowExecutionResult,
   WorkflowPublicTask,
   WorkflowTrajectoryLimits,
@@ -74,9 +78,26 @@ export type WorkflowStudyTaskBinding =
     };
 
 export const WORKFLOW_STUDY_PLAN_API_VERSION =
-  "chartermesh.dev/collaboration-study-plan/v1alpha5" as const;
+  "chartermesh.dev/collaboration-study-plan/v1alpha6" as const;
 export const WORKFLOW_STUDY_HARNESS_VERSION =
-  "chartermesh.dev/collaboration-study-harness/v1alpha5" as const;
+  "chartermesh.dev/collaboration-study-harness/v1alpha6" as const;
+export const WORKFLOW_STUDY_ENGINE_ROUTING_POLICY_VERSION =
+  "chartermesh.dev/workflow-engine-routing/v1alpha1" as const;
+export const WORKFLOW_CODEX_FEEDBACK_ENGINE_PROFILE_ID =
+  "codex-cli-ordinary-user" as const;
+export const WORKFLOW_HYBRID_HOST_ORIENTATION_PLAN = [
+  "Treat the public objective, context, acceptance criteria, and caller-owned response contract as the complete specification.",
+  "Cover every public acceptance criterion, verify contract completeness before requesting review, and return only contract-valid output.",
+  "Do not assume hidden requirements or perform external side effects.",
+].join("\n");
+
+export type WorkflowStudyConditionSet =
+  | "standard_v1"
+  | "hybrid_c_level_canary_v1";
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 export interface WorkflowStudyPlan {
   apiVersion: typeof WORKFLOW_STUDY_PLAN_API_VERSION;
@@ -90,8 +111,11 @@ export interface WorkflowStudyPlan {
     difficulty: WorkflowPublicTask["difficulty"];
     executionBoundary: "semantic_ir" | "attested_vm";
   }>;
+  conditionSet: WorkflowStudyConditionSet;
   conditions: string[];
-  conditionOrdering: "seeded_williams_square_v1";
+  conditionOrdering:
+    | "seeded_williams_square_v1"
+    | "seeded_cyclic_latin_v1";
   harnessVersion: typeof WORKFLOW_STUDY_HARNESS_VERSION;
   responseSchemaPolicy: {
     version: typeof WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION;
@@ -142,8 +166,31 @@ export interface WorkflowStudyPlan {
   };
   orientationSamplingPolicy: {
     designSeedPurpose: "task_and_condition_order_only";
-    inferenceSampling: "provider_default_uncontrolled";
-    sharedAcrossFeedbackPolicies: false;
+    inferenceSampling:
+      | "provider_default_uncontrolled"
+      | "host_owned_deterministic";
+    sharedAcrossConditions: boolean;
+    hostOwnedCanonicalPlanSha256: string | null;
+  };
+  engineRoutingPolicy: {
+    version: typeof WORKFLOW_STUDY_ENGINE_ROUTING_POLICY_VERSION;
+    defaultEngineBinding: "candidate";
+    codexCLevelBoundary: {
+      workspace: "ephemeral_read_only";
+      hostCapabilities: "disabled";
+      responseSchema: "required";
+      outputTokenLimit: "prompt_only_unverified";
+      hardOutputLimit: "plan_bound_bytes";
+      usage: "unknown";
+    } | null;
+    routes: Array<{
+      conditionId: string;
+      engineRoute: WorkflowEngineRoute;
+      orientationEngine: "candidate" | "host";
+      coordinatorEngine: "candidate" | "codex";
+      specialistEngine: "candidate";
+      repairEngine: "candidate";
+    }>;
   };
   feedbackAdapterVersion: typeof WORKFLOW_FEEDBACK_ADAPTER_VERSION;
   feedbackInterventionHashes: {
@@ -157,6 +204,9 @@ export interface WorkflowStudyPlan {
   maximumTotalModelCallsPerTrajectory: number;
   maximumConsecutiveContractInvalidSubmissionsPerTrajectory: number;
   codexProxyRequired: true;
+  codexExecutionPurpose:
+    | "simulated_user_feedback"
+    | "c_level_model_engine";
   planGenerationModelCalls: false;
   liveExecutionRequiresExactApproval: true;
   actualHumanApproval: false;
@@ -170,6 +220,10 @@ export interface WorkflowStudyPlan {
     codexExecutableSha256: string | null;
     codexModelId: string | null;
     codexTimeoutMs: number | null;
+    codexMaxOutputBytes: number | null;
+    codexFeedbackEngineProfileId: string | null;
+    codexEngineProfileId: string | null;
+    codexModelEngineProtocolSha256: string | null;
     codeSandboxId: string | null;
     codeSandboxProvenanceHash: string | null;
     codeSandboxLauncherCommitment: string | null;
@@ -182,6 +236,62 @@ export interface WorkflowStudyPlan {
 }
 
 export type ArtifactWorkflowStudyPlan = WorkflowStudyPlan;
+
+function workflowConditionsForSet(conditionSet: WorkflowStudyConditionSet) {
+  return conditionSet === "hybrid_c_level_canary_v1"
+    ? WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS
+    : WORKFLOW_STUDY_CONDITIONS;
+}
+
+function workflowEngineRoutingPolicy(
+  conditionSet: WorkflowStudyConditionSet,
+): WorkflowStudyPlan["engineRoutingPolicy"] {
+  return {
+    version: WORKFLOW_STUDY_ENGINE_ROUTING_POLICY_VERSION,
+    defaultEngineBinding: "candidate",
+    codexCLevelBoundary:
+      conditionSet === "hybrid_c_level_canary_v1"
+        ? {
+            workspace: "ephemeral_read_only",
+            hostCapabilities: "disabled",
+            responseSchema: "required",
+            outputTokenLimit: "prompt_only_unverified",
+            hardOutputLimit: "plan_bound_bytes",
+            usage: "unknown",
+          }
+        : null,
+    routes: workflowConditionsForSet(conditionSet).map((condition) => ({
+      conditionId: workflowConditionId(condition),
+      engineRoute: condition.engineRoute,
+      orientationEngine:
+        conditionSet === "hybrid_c_level_canary_v1"
+          ? "host" as const
+          : "candidate" as const,
+      coordinatorEngine:
+        condition.engineRoute === "codex-c-level-local-worker-team"
+          ? "codex" as const
+          : "candidate" as const,
+      specialistEngine: "candidate" as const,
+      repairEngine: "candidate" as const,
+    })),
+  };
+}
+
+function workflowOrientationSamplingPolicy(
+  conditionSet: WorkflowStudyConditionSet,
+): WorkflowStudyPlan["orientationSamplingPolicy"] {
+  const hybrid = conditionSet === "hybrid_c_level_canary_v1";
+  return {
+    designSeedPurpose: "task_and_condition_order_only",
+    inferenceSampling: hybrid
+      ? "host_owned_deterministic"
+      : "provider_default_uncontrolled",
+    sharedAcrossConditions: hybrid,
+    hostOwnedCanonicalPlanSha256: hybrid
+      ? sha256Text(WORKFLOW_HYBRID_HOST_ORIENTATION_PLAN)
+      : null,
+  };
+}
 
 function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
   const {
@@ -201,6 +311,16 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
     plan.bindings.codexExecutableSha256,
     plan.bindings.codexModelId,
     plan.bindings.codexTimeoutMs,
+    plan.bindings.codexMaxOutputBytes,
+    ...(plan.conditionSet === "standard_v1"
+      ? [plan.bindings.codexFeedbackEngineProfileId]
+      : []),
+    ...(plan.conditionSet === "hybrid_c_level_canary_v1"
+      ? [
+          plan.bindings.codexEngineProfileId,
+          plan.bindings.codexModelEngineProtocolSha256,
+        ]
+      : []),
     ...(requiresCode
       ? [
           plan.bindings.codeSandboxId,
@@ -211,8 +331,9 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
   ].every((value) => value !== null) &&
     (!requiresCode ||
       plan.bindings.codeSandboxLauncherAttestation === "file_sha256");
-  const expectedConditions =
-    WORKFLOW_STUDY_CONDITIONS.map(workflowConditionId);
+  const expectedConditions = workflowConditionsForSet(
+    plan.conditionSet,
+  ).map(workflowConditionId);
   const expectedFeedbackHashes = {
     neutralRepeat: NEUTRAL_REPEAT_FEEDBACK_SHA256,
     fixedSelfReview: FIXED_SELF_REVIEW_FEEDBACK_SHA256,
@@ -224,10 +345,16 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
   };
   if (
     recomputed !== planHash ||
+    !["standard_v1", "hybrid_c_level_canary_v1"].includes(
+      plan.conditionSet,
+    ) ||
     studyId !== `collaboration-study-${recomputed.slice(0, 16)}` ||
     plan.liveReady !== expectedLiveReady ||
     hash(plan.conditions) !== hash(expectedConditions) ||
-    plan.conditionOrdering !== "seeded_williams_square_v1" ||
+    plan.conditionOrdering !==
+      (plan.conditionSet === "hybrid_c_level_canary_v1"
+        ? "seeded_cyclic_latin_v1"
+        : "seeded_williams_square_v1") ||
     plan.apiVersion !== WORKFLOW_STUDY_PLAN_API_VERSION ||
     plan.harnessVersion !== WORKFLOW_STUDY_HARNESS_VERSION ||
     hash(plan.responseSchemaPolicy) !==
@@ -285,11 +412,28 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
         promptSha256: WORKFLOW_CONTRACT_REPAIR_PROMPT_SHA256,
       }) ||
     hash(plan.orientationSamplingPolicy) !==
-      hash({
-        designSeedPurpose: "task_and_condition_order_only",
-        inferenceSampling: "provider_default_uncontrolled",
-        sharedAcrossFeedbackPolicies: false,
-      }) ||
+      hash(workflowOrientationSamplingPolicy(plan.conditionSet)) ||
+    hash(plan.engineRoutingPolicy) !==
+      hash(workflowEngineRoutingPolicy(plan.conditionSet)) ||
+    plan.codexExecutionPurpose !==
+      (plan.conditionSet === "hybrid_c_level_canary_v1"
+        ? "c_level_model_engine"
+        : "simulated_user_feedback") ||
+    (plan.conditionSet === "hybrid_c_level_canary_v1" &&
+      (requiresCode ||
+        plan.bindings.codexFeedbackEngineProfileId !== null ||
+        plan.bindings.candidateEngineId ===
+          plan.bindings.codexEngineProfileId ||
+        plan.bindings.codexModelEngineProtocolSha256 !==
+          CODEX_EXEC_MODEL_PROTOCOL_SHA256 ||
+        plan.limits.maxTotalTokens !== null)) ||
+    (plan.conditionSet === "standard_v1" &&
+      (plan.bindings.codexFeedbackEngineProfileId !==
+          WORKFLOW_CODEX_FEEDBACK_ENGINE_PROFILE_ID ||
+        plan.bindings.candidateEngineId ===
+          plan.bindings.codexFeedbackEngineProfileId ||
+        plan.bindings.codexEngineProfileId !== null ||
+        plan.bindings.codexModelEngineProtocolSha256 !== null)) ||
     plan.feedbackAdapterVersion !== WORKFLOW_FEEDBACK_ADAPTER_VERSION ||
     hash(plan.feedbackInterventionHashes) !==
       hash(expectedFeedbackHashes) ||
@@ -302,6 +446,10 @@ function assertWorkflowStudyPlanIntegrity(plan: WorkflowStudyPlan): void {
 
 export interface WorkflowStudyTrialRuntime {
   engine: ModelEngine;
+  wrapEngine(input: {
+    engine: ModelEngine;
+    configuredModelId: string;
+  }): ModelEngine;
   runContext: {
     workItemId: string;
     runId: string;
@@ -326,6 +474,11 @@ export interface WorkflowStudyPersistence {
     task: WorkflowPublicTask;
     architecture: "single" | "team";
     feedbackPolicy: "neutral_repeat" | "fixed_self_review" | "codex_generalist";
+    conditionId: string;
+    engineRoute:
+      | "local-single"
+      | "all-local-team"
+      | "codex-c-level-local-worker-team";
     engine: ModelEngine;
   }): Promise<WorkflowStudyTrialRuntime> | WorkflowStudyTrialRuntime;
 }
@@ -388,6 +541,7 @@ export function createWorkflowStudyPlan(input: {
   taskBindings: WorkflowStudyTaskBinding[];
   limits: WorkflowTrajectoryLimits;
   seed: number;
+  conditionSet?: WorkflowStudyConditionSet;
   bindings?: Partial<WorkflowStudyPlan["bindings"]>;
 }): WorkflowStudyPlan {
   if (input.taskBindings.length === 0) {
@@ -403,6 +557,33 @@ export function createWorkflowStudyPlan(input: {
   const requiresCodeSandbox = input.taskBindings.some(
     ({ kind }) => kind === "code",
   );
+  const conditionSet = input.conditionSet ?? "standard_v1";
+  if (
+    !["standard_v1", "hybrid_c_level_canary_v1"].includes(conditionSet)
+  ) {
+    throw new Error("Unknown workflow study condition set.");
+  }
+  if (
+    conditionSet === "hybrid_c_level_canary_v1" &&
+    requiresCodeSandbox
+  ) {
+    throw new Error(
+      "The hybrid C-level canary currently supports artifact tasks only.",
+    );
+  }
+  if (
+    conditionSet === "hybrid_c_level_canary_v1" &&
+    input.limits.maxTotalTokens !== null
+  ) {
+    throw new Error(
+      "Hybrid C-level Codex usage is unmeasured; maxTotalTokens must be null.",
+    );
+  }
+  const hasCodexBinding = Boolean(
+    input.bindings?.codexExecutableSha256 &&
+      input.bindings?.codexModelId &&
+      input.bindings?.codexTimeoutMs,
+  );
   const bindings: WorkflowStudyPlan["bindings"] = {
     candidateEngineId: input.bindings?.candidateEngineId ?? null,
     candidateRuntimeProfileHash:
@@ -413,6 +594,22 @@ export function createWorkflowStudyPlan(input: {
       input.bindings?.codexExecutableSha256?.toLowerCase() ?? null,
     codexModelId: input.bindings?.codexModelId ?? null,
     codexTimeoutMs: input.bindings?.codexTimeoutMs ?? null,
+    codexMaxOutputBytes:
+      input.bindings?.codexMaxOutputBytes ??
+      (hasCodexBinding ? 1_048_576 : null),
+    codexFeedbackEngineProfileId:
+      conditionSet === "standard_v1"
+        ? input.bindings?.codexFeedbackEngineProfileId ??
+          WORKFLOW_CODEX_FEEDBACK_ENGINE_PROFILE_ID
+        : null,
+    codexEngineProfileId:
+      conditionSet === "hybrid_c_level_canary_v1"
+        ? input.bindings?.codexEngineProfileId ?? "codex-cli-c-level"
+        : null,
+    codexModelEngineProtocolSha256:
+      conditionSet === "hybrid_c_level_canary_v1"
+        ? CODEX_EXEC_MODEL_PROTOCOL_SHA256
+        : null,
     codeSandboxId: input.bindings?.codeSandboxId ?? null,
     codeSandboxProvenanceHash:
       input.bindings?.codeSandboxProvenanceHash?.toLowerCase() ?? null,
@@ -424,6 +621,10 @@ export function createWorkflowStudyPlan(input: {
   for (const [name, value] of [
     ["candidateRuntimeProfileHash", bindings.candidateRuntimeProfileHash],
     ["codexExecutableSha256", bindings.codexExecutableSha256],
+    [
+      "codexModelEngineProtocolSha256",
+      bindings.codexModelEngineProtocolSha256,
+    ],
     ["codeSandboxProvenanceHash", bindings.codeSandboxProvenanceHash],
     [
       "codeSandboxLauncherCommitment",
@@ -438,6 +639,8 @@ export function createWorkflowStudyPlan(input: {
     ["candidateEngineId", bindings.candidateEngineId],
     ["candidateConfiguredModelId", bindings.candidateConfiguredModelId],
     ["codexModelId", bindings.codexModelId],
+    ["codexFeedbackEngineProfileId", bindings.codexFeedbackEngineProfileId],
+    ["codexEngineProfileId", bindings.codexEngineProfileId],
     ["codeSandboxId", bindings.codeSandboxId],
   ] as const) {
     if (
@@ -466,6 +669,36 @@ export function createWorkflowStudyPlan(input: {
     throw new Error("codexTimeoutMs must be between 1000 and 900000.");
   }
   if (
+    bindings.codexMaxOutputBytes !== null &&
+    (!Number.isInteger(bindings.codexMaxOutputBytes) ||
+      bindings.codexMaxOutputBytes < 1 ||
+      bindings.codexMaxOutputBytes > 16_777_216)
+  ) {
+    throw new Error(
+      "codexMaxOutputBytes must be between 1 and 16777216.",
+    );
+  }
+  if (
+    conditionSet === "standard_v1" &&
+    (bindings.codexFeedbackEngineProfileId !==
+      WORKFLOW_CODEX_FEEDBACK_ENGINE_PROFILE_ID ||
+      bindings.candidateEngineId ===
+        bindings.codexFeedbackEngineProfileId)
+  ) {
+    throw new Error(
+      "Standard candidate and Codex feedback engine profile ids must be distinct.",
+    );
+  }
+  if (
+    conditionSet === "hybrid_c_level_canary_v1" &&
+    bindings.candidateEngineId !== null &&
+    bindings.candidateEngineId === bindings.codexEngineProfileId
+  ) {
+    throw new Error(
+      "Hybrid candidate and C-level engine profile ids must be distinct.",
+    );
+  }
+  if (
     !requiresCodeSandbox &&
     [
       bindings.codeSandboxId,
@@ -492,8 +725,14 @@ export function createWorkflowStudyPlan(input: {
           binding.kind === "code" ? "attested_vm" as const : "semantic_ir" as const,
       };
     }),
-    conditions: WORKFLOW_STUDY_CONDITIONS.map(workflowConditionId),
-    conditionOrdering: "seeded_williams_square_v1" as const,
+    conditionSet,
+    conditions: workflowConditionsForSet(conditionSet).map(
+      workflowConditionId,
+    ),
+    conditionOrdering:
+      conditionSet === "hybrid_c_level_canary_v1"
+        ? "seeded_cyclic_latin_v1" as const
+        : "seeded_williams_square_v1" as const,
     harnessVersion: WORKFLOW_STUDY_HARNESS_VERSION,
     responseSchemaPolicy: {
       version: WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION,
@@ -548,11 +787,9 @@ export function createWorkflowStudyPlan(input: {
       budgetBehavior: "skip_without_call" as const,
       promptSha256: WORKFLOW_CONTRACT_REPAIR_PROMPT_SHA256,
     },
-    orientationSamplingPolicy: {
-      designSeedPurpose: "task_and_condition_order_only" as const,
-      inferenceSampling: "provider_default_uncontrolled" as const,
-      sharedAcrossFeedbackPolicies: false as const,
-    },
+    orientationSamplingPolicy:
+      workflowOrientationSamplingPolicy(conditionSet),
+    engineRoutingPolicy: workflowEngineRoutingPolicy(conditionSet),
     feedbackAdapterVersion: WORKFLOW_FEEDBACK_ADAPTER_VERSION,
     feedbackInterventionHashes: {
       neutralRepeat: NEUTRAL_REPEAT_FEEDBACK_SHA256,
@@ -560,13 +797,17 @@ export function createWorkflowStudyPlan(input: {
       codexGeneralist: CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256,
     },
     plannedTrajectories:
-      input.taskBindings.length * WORKFLOW_STUDY_CONDITIONS.length,
+      input.taskBindings.length * workflowConditionsForSet(conditionSet).length,
     boundedCheckpointFeedbackRounds: input.limits.boundedCheckpoint,
     maximumFeedbackRoundsPerTrajectory: input.limits.maxFeedbackRounds,
     maximumTotalModelCallsPerTrajectory: input.limits.maxModelCalls,
     maximumConsecutiveContractInvalidSubmissionsPerTrajectory:
       input.limits.maxConsecutiveContractInvalidSubmissions,
     codexProxyRequired: true as const,
+    codexExecutionPurpose:
+      conditionSet === "hybrid_c_level_canary_v1"
+        ? "c_level_model_engine" as const
+        : "simulated_user_feedback" as const,
     planGenerationModelCalls: false as const,
     liveExecutionRequiresExactApproval: true as const,
     actualHumanApproval: false as const,
@@ -585,6 +826,16 @@ export function createWorkflowStudyPlan(input: {
     bindings.codexExecutableSha256,
     bindings.codexModelId,
     bindings.codexTimeoutMs,
+    bindings.codexMaxOutputBytes,
+    ...(conditionSet === "standard_v1"
+      ? [bindings.codexFeedbackEngineProfileId]
+      : []),
+    ...(conditionSet === "hybrid_c_level_canary_v1"
+      ? [
+          bindings.codexEngineProfileId,
+          bindings.codexModelEngineProtocolSha256,
+        ]
+      : []),
   ].every((value) => value !== null);
   const codeReady =
     !requiresCodeSandbox ||
@@ -606,12 +857,14 @@ export function createArtifactWorkflowStudyPlan(input: {
   tasks: ArtifactEvaluationTask[];
   limits: WorkflowTrajectoryLimits;
   seed: number;
+  conditionSet?: WorkflowStudyConditionSet;
   bindings?: Partial<ArtifactWorkflowStudyPlan["bindings"]>;
 }): ArtifactWorkflowStudyPlan {
   return createWorkflowStudyPlan({
     taskBindings: input.tasks.map((task) => ({ kind: "artifact", task })),
     limits: input.limits,
     seed: input.seed,
+    ...(input.conditionSet ? { conditionSet: input.conditionSet } : {}),
     ...(input.bindings ? { bindings: input.bindings } : {}),
   });
 }
@@ -622,6 +875,7 @@ export async function runBoundWorkflowStudy(input: {
   limits: WorkflowTrajectoryLimits;
   engine: ModelEngine;
   codex: CodexCliFeedbackProvider;
+  cLevelEngine?: CodexExecModelEngine;
   codeSandbox?: {
     backend: CodeSandboxBackend;
     provenanceHash: string;
@@ -660,6 +914,9 @@ export async function runBoundWorkflowStudy(input: {
   if (input.engineForRole) {
     throw new Error("WORKFLOW_STUDY_UNBOUND_ROLE_ENGINE_RESOLVER");
   }
+  const hybridCLevel =
+    input.plan.conditionSet === "hybrid_c_level_canary_v1";
+  const standardCodexFeedback = !hybridCLevel;
   const hasCode = input.taskBindings.some(({ kind }) => kind === "code");
   if (
     input.plan.bindings.candidateEngineId !==
@@ -668,9 +925,37 @@ export async function runBoundWorkflowStudy(input: {
       input.codex.executableSha256 ||
     input.plan.bindings.codexModelId !== input.codex.model ||
     input.plan.bindings.codexTimeoutMs !== input.codex.timeoutMs ||
+    input.plan.bindings.codexMaxOutputBytes !== input.codex.maxOutputBytes ||
+    (standardCodexFeedback &&
+      (!CodexCliFeedbackProvider.isLiveAttestedInstance(input.codex) ||
+        input.plan.bindings.codexFeedbackEngineProfileId !==
+          input.codex.providerId)) ||
     !input.plan.liveReady
   ) {
     throw new Error("WORKFLOW_STUDY_PLAN_BINDING_MISMATCH");
+  }
+  if (standardCodexFeedback) {
+    await input.codex.preflightExecutableAttestation();
+  }
+  if (
+    hybridCLevel !== Boolean(input.cLevelEngine) ||
+    (input.cLevelEngine &&
+      (!CodexExecModelEngine.isLiveAttestedInstance(input.cLevelEngine) ||
+        input.plan.bindings.codexEngineProfileId !==
+        input.cLevelEngine.manifest.profileId ||
+        input.plan.bindings.codexExecutableSha256 !==
+          input.cLevelEngine.executableSha256 ||
+        input.plan.bindings.codexModelId !== input.cLevelEngine.model ||
+        input.plan.bindings.codexTimeoutMs !== input.cLevelEngine.timeoutMs ||
+        input.plan.bindings.codexMaxOutputBytes !==
+          input.cLevelEngine.maxOutputBytes ||
+        input.plan.bindings.codexModelEngineProtocolSha256 !==
+          CODEX_EXEC_MODEL_PROTOCOL_SHA256))
+  ) {
+    throw new Error("WORKFLOW_STUDY_C_LEVEL_ENGINE_BINDING_MISMATCH");
+  }
+  if (input.cLevelEngine) {
+    await input.cLevelEngine.preflightExecutableAttestation();
   }
   if (
     hasCode &&
@@ -699,18 +984,36 @@ export async function runBoundWorkflowStudy(input: {
     WorkflowProviderIdentityObservation
   >();
   const attestedEngines = new WeakMap<ModelEngine, ModelEngine>();
-  const attestedEngine = (engine: ModelEngine): ModelEngine => {
+  const attestedEngine = (
+    engine: ModelEngine,
+    configuredModelId: string,
+  ): ModelEngine => {
     const existing = attestedEngines.get(engine);
     if (existing) return existing;
     const wrapped = createIdentityAttestingWorkflowEngine({
       engine,
-      expectedModelId,
+      expectedModelId: configuredModelId,
       observed: observedProviderIdentities,
     });
     attestedEngines.set(engine, wrapped);
     return wrapped;
   };
-  const primaryEngine = attestedEngine(input.engine);
+  const primaryEngine = attestedEngine(input.engine, expectedModelId);
+  const cLevelEngine = input.cLevelEngine
+    ? attestedEngine(
+        input.cLevelEngine,
+        input.plan.bindings.codexModelId!,
+      )
+    : null;
+  const expectedModelIds: Record<string, string> = {
+    [primaryEngine.manifest.profileId]: expectedModelId,
+    ...(cLevelEngine
+      ? {
+          [cLevelEngine.manifest.profileId]:
+            input.plan.bindings.codexModelId!,
+        }
+      : {}),
+  };
   const byId = new Map(
     input.taskBindings.map((binding) => [
       publicTaskForBinding(binding).id,
@@ -733,11 +1036,39 @@ export async function runBoundWorkflowStudy(input: {
             task,
             architecture: condition.architecture,
             feedbackPolicy: condition.feedbackPolicy,
+            conditionId: condition.id,
+            engineRoute: condition.engineRoute,
             engine: primaryEngine,
           })
         : null;
       if (persisted) finalizers.set(trialId, persisted.finalize);
       const selectedEngine = persisted?.engine ?? primaryEngine;
+      const selectedCLevelEngine = cLevelEngine
+        ? persisted?.wrapEngine({
+            engine: cLevelEngine,
+            configuredModelId: input.plan.bindings.codexModelId!,
+          }) ?? cLevelEngine
+        : null;
+      const hybridRoute =
+        condition.engineRoute === "codex-c-level-local-worker-team";
+      if (hybridRoute && !selectedCLevelEngine) {
+        throw new Error("WORKFLOW_STUDY_C_LEVEL_ENGINE_REQUIRED");
+      }
+      const roleEngine = hybridRoute
+        ? (role: string): ModelEngine => {
+            if (role === "coordinator") return selectedCLevelEngine!;
+            if (role === "specialist") return selectedEngine;
+            throw new Error(`WORKFLOW_STUDY_UNBOUND_ROLE:${role}`);
+          }
+        : undefined;
+      const hostOwnedOrientation = hybridCLevel
+        ? {
+            canonicalPlan: WORKFLOW_HYBRID_HOST_ORIENTATION_PLAN,
+            planHash:
+              input.plan.orientationSamplingPolicy
+                .hostOwnedCanonicalPlanSha256!,
+          }
+        : undefined;
       const executor =
         binding.kind === "artifact"
           ? createArtifactWorkflowExecutor({
@@ -745,6 +1076,8 @@ export async function runBoundWorkflowStudy(input: {
               engine: selectedEngine,
               task: binding.task,
               maxParallelAgents: input.limits.maxParallelAgents,
+              ...(hostOwnedOrientation ? { hostOwnedOrientation } : {}),
+              ...(roleEngine ? { engineForRole: roleEngine } : {}),
               ...(persisted ? { runContext: persisted.runContext } : {}),
             })
           : condition.architecture === "single"
@@ -797,8 +1130,8 @@ export async function runBoundWorkflowStudy(input: {
     sealedSuiteHash: input.plan.suiteHash,
     approvedPlanHash: input.plan.planHash,
     approvedPlanCanonicalJson: JSON.stringify(stableValue(input.plan)),
-    expectedCandidateModelId:
-      input.plan.bindings.candidateConfiguredModelId!,
+    expectedCandidateModelId: expectedModelIds,
+    conditions: workflowConditionsForSet(input.plan.conditionSet),
     provenance: {
       candidateEngine: {
         profileId: input.engine.manifest.profileId,
@@ -809,11 +1142,25 @@ export async function runBoundWorkflowStudy(input: {
         runtimeProfileHash:
           input.plan.bindings.candidateRuntimeProfileHash,
       },
-      codexProxy: {
-        providerId: input.codex.providerId,
-        executableSha256: input.codex.executableSha256,
-        requestedModelId: input.codex.model,
-      },
+      codexProxy: hybridCLevel
+        ? null
+        : {
+            providerId: input.codex.providerId,
+            executableSha256: input.codex.executableSha256,
+            requestedModelId: input.codex.model,
+          },
+      cLevelEngine: input.cLevelEngine
+        ? {
+            profileId: input.cLevelEngine.manifest.profileId,
+            adapter: input.cLevelEngine.manifest.adapter,
+            manifestHash: hash(input.cLevelEngine.manifest),
+            configuredModelId: input.cLevelEngine.model,
+            executableSha256: input.cLevelEngine.executableSha256,
+            transportPolicySha256: CODEX_EXEC_MODEL_PROTOCOL_SHA256,
+            identityAttestation: "command_attested" as const,
+            tokenUsageVisibility: "unknown" as const,
+          }
+        : null,
       controlPlane: input.persistence
         ? {
             mode: "isolated_evaluation_database",
@@ -851,6 +1198,7 @@ export async function runArtifactWorkflowStudy(input: {
   limits: WorkflowTrajectoryLimits;
   engine: ModelEngine;
   codex: CodexCliFeedbackProvider;
+  cLevelEngine?: CodexExecModelEngine;
   engineForRole?: (role: string) => ModelEngine;
   signal?: AbortSignal;
   onTrial?: (
@@ -864,6 +1212,7 @@ export async function runArtifactWorkflowStudy(input: {
     limits: input.limits,
     engine: input.engine,
     codex: input.codex,
+    ...(input.cLevelEngine ? { cLevelEngine: input.cLevelEngine } : {}),
     ...(input.engineForRole
       ? { engineForRole: input.engineForRole }
       : {}),

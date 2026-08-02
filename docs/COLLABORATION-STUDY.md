@@ -50,6 +50,44 @@ the team may invoke it repeatedly for C-level and worker stages. The study
 therefore compares complete workflow configurations, not equal-FLOP model
 samples.
 
+## Three-condition hybrid C-level canary
+
+`--hybrid-c-level-canary` selects a separate, narrower condition set. It is
+intended to answer whether replacing only the team coordinator/C-level model
+with an attested Codex exec model improves the same artifact task. It does not
+run the six feedback-policy arms above.
+
+| Condition id | Architecture | Engine route |
+|---|---|---|
+| `single-local-neutral-repeat` | single | Local candidate engine |
+| `team-local-neutral-repeat` | team | Local candidate coordinator and specialist |
+| `team-codex-c-level-neutral-repeat` | team | Codex exec coordinator/C-level; local candidate specialist |
+
+All three conditions use `neutral_repeat`. They also receive the same
+host-owned deterministic orientation plan, so orientation adds no local or
+Codex model call. The local candidate engine remains responsible for the
+specialist implementation and any public-contract repair. Only the third
+condition routes the coordinator/C-level peer-stage calls through the exact
+Codex executable, model, timeout, and output boundary committed in the plan.
+The Codex CLI is not a worker, repair engine, approver, or source of hidden
+evaluation feedback in this canary.
+
+The three conditions use `seeded_cyclic_latin_v1` ordering. This rotates order
+across tasks but does not equalize computation. The local team can make more
+candidate calls than the single condition, while the hybrid team adds an
+external hosted model with different hardware, latency, and unknown token or
+cost reporting. This canary therefore compares routed systems, not equal
+tokens, equal FLOPs, or local-versus-local models. A quality gain cannot by
+itself be attributed solely to the team protocol or C-level role.
+
+The current canary is artifact-only. Select one or more artifact fixtures or
+use `--artifacts-only`; a code fixture, `--code-only`, or `--full` fails closed
+before live execution. Because Codex exec does not provide trusted token usage,
+the plan also requires `limits.maxTotalTokens: null`. In CLI terms, omit
+`--max-total-tokens`. Supplying any finite value fails closed rather than
+claiming a total-token guarantee the harness cannot enforce. Wall-clock,
+model-call, feedback-round, output-size, and other limits still apply.
+
 ## Task matrix
 
 The intended reference matrix has one easy, medium, and hard task in each
@@ -354,6 +392,41 @@ Separate family and difficulty strata make composition effects visible. These
 are descriptive pilot statistics, not confidence intervals or a substitute
 for repeated independent seeds.
 
+For the hybrid canary, `pairedComparisons` is empty and
+`conditionComparisons` contains three task-paired contrasts:
+
+- all-local team versus local single;
+- Codex-C-level team versus local single; and
+- Codex-C-level team versus all-local team.
+
+Every `rightMinusLeft...` field is calculated as the named right condition
+minus the named left condition over matched tasks. Positive pass-rate and
+score differences favor the right condition. Positive feedback-round,
+elapsed-time, or model-call differences mean the right condition consumed
+more of that resource, not that it performed better. `pairedTasks` is the
+actual denominator, and `bestScoreWins`, `bestScoreTies`, and
+`bestScoreLosses` describe the right condition.
+
+`engineAggregate` groups accounting by condition, engine profile, and reported
+model id. It exposes distinct trial and call counts, terminal invocation
+states, nullable elapsed time, provider-reported token and cost totals,
+`measurementStatus`, and whether evidence came from a Control Plane invocation
+or a derived feedback-proxy record. A hybrid
+team should therefore show local-candidate and Codex-C-level entries
+separately. Unknown token or cost observations propagate as `null`; they are
+not zero and must not be imputed. The aggregate attributes observed calls but
+does not measure FLOPs, accelerator class, memory bandwidth, energy, or hidden
+provider work. A derived Codex-feedback row has unknown tokens, cost, and
+elapsed time; it is explicit rather than silently omitted from per-engine call
+totals.
+
+Always read `conditionComparisons` and `engineAggregate` together. In
+particular, `--codex-max-output-bytes` and schema validation constrain
+transport, not inference compute. Codex `maxOutputTokens` is advisory and its
+usage can remain unknown. A hybrid win with more calls or elapsed time is a
+system-level quality/resource tradeoff, not evidence of a compute-matched
+architectural effect.
+
 The unit of comparison is a task trajectory, not an individual round. Ten
 correlated feedback loops are not ten independent samples. Results should be paired
 by task and seed, report all six conditions, preserve censored observations,
@@ -375,15 +448,30 @@ responsible for any account, energy, or API cost and should set a finite token
 cap whenever usage is measurable. A missing provider price means monetary cost
 is unknown, not zero.
 
-One approved plan currently binds one candidate engine and configured model
-for every candidate role. An ad-hoc `engineForRole` resolver is rejected at the
-live boundary because its role-to-model choices are not committed by the plan
-hash. To compare heterogeneous teams, create separate approved plans for the
-model combinations until a versioned, hash-bound role-engine matrix is added.
+The hybrid C-level canary is the explicit exception to the finite-token-cap
+recommendation: its Codex exec usage is unmeasured, so the CLI requires
+`maxTotalTokens: null` and rejects `--max-total-tokens`. This does not make the
+run free or unbounded in every dimension; timeout, call-count, feedback-round,
+schema, and output-byte gates remain active while monetary cost stays unknown.
 
-The Codex feedback arm additionally requires an explicit absolute executable
-path and expected SHA-256. It is never discovered or launched as an offline
-test side effect.
+The standard condition set binds one candidate engine and configured model for
+every candidate role. The hybrid canary is the narrow exception: harness
+`v1alpha6` binds its complete condition/role-engine matrix and Codex transport
+policy into the plan. An ad-hoc `engineForRole` resolver remains rejected at
+the live boundary; any other heterogeneous model combination needs its own
+versioned, hash-bound condition set.
+
+The standard plan also reserves and commits the
+`codex-cli-ordinary-user` profile for derived feedback accounting; a candidate
+engine cannot reuse it. The live standard runner accepts only the exact frozen
+default-spawn feedback provider with that ID and preflights its executable
+before any candidate starts. For the hybrid route, the Codex adapter freezes
+its instance, manifest, and prototype and verifies the approved executable
+before the study as well as before and after each call.
+
+The Codex feedback arm and hybrid C-level route additionally require an
+explicit absolute executable path and expected SHA-256. The process is never
+discovered or launched as an offline test side effect.
 
 ## Run the CLI study
 
@@ -434,12 +522,79 @@ node bin/chartermesh.mjs evaluate-workflow `
   --json
 ```
 
+### Run the hybrid C-level canary
+
+Choose an artifact fixture and include `--hybrid-c-level-canary` in the dry
+plan. Do not pass `--max-total-tokens`:
+
+```powershell
+node bin/chartermesh.mjs evaluate-workflow `
+  --target TARGET `
+  --fixture product-package-easy-001 `
+  --hybrid-c-level-canary `
+  --engine-id LOCAL_CANDIDATE_ENGINE_ID `
+  --codex-executable C:\absolute\path\to\codex.exe `
+  --codex-sha256 LOWERCASE_SHA256 `
+  --codex-model CODEX_MODEL_ID `
+  --codex-timeout-ms 120000 `
+  --codex-max-output-bytes 1048576 `
+  --checkpoint-feedback-rounds 10 `
+  --max-feedback-rounds 50 `
+  --max-model-calls 512 `
+  --max-wall-clock-minutes 480 `
+  --max-parallel-agents 1 `
+  --json
+```
+
+The dry response must contain `conditionSet: hybrid_c_level_canary_v1`,
+`codexExecutionPurpose: c_level_model_engine`, the three condition IDs
+documented above, `liveReady: true`, and a 64-character `planHash`. Review the
+routing and bindings. Then repeat the same plan-defining options exactly and
+add only the live authorization:
+
+```powershell
+node bin/chartermesh.mjs evaluate-workflow `
+  --target TARGET `
+  --fixture product-package-easy-001 `
+  --hybrid-c-level-canary `
+  --engine-id LOCAL_CANDIDATE_ENGINE_ID `
+  --codex-executable C:\absolute\path\to\codex.exe `
+  --codex-sha256 LOWERCASE_SHA256 `
+  --codex-model CODEX_MODEL_ID `
+  --codex-timeout-ms 120000 `
+  --codex-max-output-bytes 1048576 `
+  --checkpoint-feedback-rounds 10 `
+  --max-feedback-rounds 50 `
+  --max-model-calls 512 `
+  --max-wall-clock-minutes 480 `
+  --max-parallel-agents 1 `
+  --live `
+  --approve PLAN_HASH `
+  --json
+```
+
+`--codex-max-output-bytes` defaults to 1,048,576 bytes and accepts 1 through
+16,777,216. It hard-bounds combined Codex process output and the structured
+last-message file. It is not a token limit. The per-call `maxOutputTokens`
+sent to Codex exec is prompt-only and advisory because this CLI transport
+cannot prove the provider enforced it. The hard boundaries are the process
+timeout, call-count limits, required response schema, and output-byte limit.
+Codex token and cost usage remain unknown when the CLI does not report them.
+
+Changing the executable digest, model, timeout, output-byte bound, candidate
+profile, selected task, limit, seed, routing policy, or any other committed
+field produces a different plan hash. A previous approval cannot authorize
+the changed command, and a mismatched `--approve` is rejected before either
+engine is started.
+
 The plan hash commits the selected task hashes and execution boundaries,
-condition matrix, `seeded_williams_square_v1` ordering, harness and feedback
+condition matrix, the applicable `seeded_williams_square_v1` or
+`seeded_cyclic_latin_v1` ordering, harness and feedback
 adapter versions, the exact neutral/fixed intervention hashes, the Codex
 review protocol hash, seed, every trajectory limit, candidate runtime profile,
 the versioned structured-output portability policy and its affected keywords,
-Codex executable/model/timeout, and—when code is selected—the sandbox backend
+Codex executable/model/timeout/output-byte bound, and, when code is selected,
+the sandbox backend
 id, collected code-provenance hash, launcher commitment, and launcher
 attestation mode. The live runner rechecks the
 entire limits object and all applicable bindings. It fails if the approval
@@ -448,11 +603,15 @@ token differs from the regenerated plan hash.
 Harness `v1alpha5` additionally commits the fixed-team manifest hashes, exact
 Team-Lite controller bounds, contract-repair prompt and limits, and the
 orientation-sampling disclosure. Changing any of these requires a new approval
-hash.
+hash. Harness `v1alpha6` additionally commits the selected condition set,
+closed role-engine routes, host-owned orientation hash, Codex model-engine
+protocol, and output-byte boundary.
 
-A full run uses `--full --acknowledge-large-run`; 18 tasks by six conditions
-means 108 trajectories and can make many candidate and Codex calls. Live
-`--artifacts-only` and `--code-only` runs also require
+A standard full run uses `--full --acknowledge-large-run`; 18 tasks by six
+conditions means 108 trajectories and can make many candidate and Codex calls.
+The hybrid canary rejects `--full`; its largest supported selection is 15
+artifact tasks by three conditions, or 45 trajectories. Live
+`--artifacts-only` and standard `--code-only` runs also require
 `--acknowledge-large-run`. Start with one fixture.
 
 Code selection uses the current Node executable by default and locates
@@ -515,8 +674,9 @@ aborts the study before a mixed-provenance final report is written.
 The current implementation provides:
 
 - `runWorkflowTrajectory` for one longitudinal condition;
-- `runWorkflowStudy` for the six-condition matrix, seeded Williams ordering,
-  paired deltas, and family/difficulty strata;
+- `runWorkflowStudy` for the six-condition standard matrix or three-condition
+  hybrid C-level canary, their committed orderings, paired contrasts, and
+  family/difficulty strata;
 - fixed, neutral, and attested Codex simulated-feedback providers;
 - an 18-task mixed suite: 15 sealed semantic-IR tasks and three attested-VM
   code reference tasks;

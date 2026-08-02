@@ -56,6 +56,11 @@ export interface WorkflowProviderIdentityObservation {
   systemFingerprint: string | null;
 }
 
+export interface WorkflowHostOwnedOrientation {
+  canonicalPlan: string;
+  planHash: string;
+}
+
 export const WORKFLOW_RESPONSE_SCHEMA_POLICY_VERSION =
   "chartermesh.dev/workflow-response-schema-portability/v1alpha1" as const;
 export const WORKFLOW_RESPONSE_SCHEMA_MAX_REPETITION = 1_000 as const;
@@ -340,6 +345,49 @@ const ROLE_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function validateHostOwnedOrientation(
+  value: WorkflowHostOwnedOrientation | undefined,
+): WorkflowHostOwnedOrientation | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    typeof value.canonicalPlan !== "string" ||
+    value.canonicalPlan.trim().length === 0 ||
+    value.canonicalPlan.length > 10_000 ||
+    typeof value.planHash !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.planHash) ||
+    sha256(value.canonicalPlan) !== value.planHash
+  ) {
+    throw new Error("WORKFLOW_HOST_ORIENTATION_INVALID");
+  }
+  return Object.freeze({
+    canonicalPlan: value.canonicalPlan,
+    planHash: value.planHash,
+  });
+}
+
+function hostOwnedOrientationResult(
+  value: WorkflowHostOwnedOrientation,
+): WorkflowOrientationResult {
+  return {
+    planHash: value.planHash,
+    approvalActor: "system:synthetic-evaluator",
+    simulatedApproval: true,
+    latencyMs: 0,
+    modelCalls: 0,
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cost: 0,
+      measurementStatus: "measured",
+    },
+    providerIdentities: [],
+  };
 }
 
 export function emptySafety(): WorkflowSafetyObservation {
@@ -1011,12 +1059,20 @@ abstract class ArtifactWorkflowExecutorBase implements WorkflowExecutor {
   protected readonly engine: ModelEngine;
   protected readonly task: ArtifactEvaluationTask;
   protected readonly publicTask: PublicArtifactEvaluationTask;
+  protected readonly hostOwnedOrientation?: WorkflowHostOwnedOrientation;
   protected orientationPlan: string | null = null;
 
-  constructor(input: { engine: ModelEngine; task: ArtifactEvaluationTask }) {
+  constructor(input: {
+    engine: ModelEngine;
+    task: ArtifactEvaluationTask;
+    hostOwnedOrientation?: WorkflowHostOwnedOrientation;
+  }) {
     this.engine = input.engine;
     this.task = input.task;
     this.publicTask = projectPublicArtifactTask(input.task);
+    this.hostOwnedOrientation = validateHostOwnedOrientation(
+      input.hostOwnedOrientation,
+    );
   }
 
   abstract orient(input: {
@@ -1066,6 +1122,10 @@ export class SingleArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBase
     assertTask(this.task, input.task);
     if (this.orientationPlan !== null) {
       throw new Error("WORKFLOW_ORIENTATION_ALREADY_COMPLETED");
+    }
+    if (this.hostOwnedOrientation) {
+      this.orientationPlan = this.hostOwnedOrientation.canonicalPlan;
+      return hostOwnedOrientationResult(this.hostOwnedOrientation);
     }
     const result = await infer(
       this.engine,
@@ -1227,6 +1287,7 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
     engine: ModelEngine;
     task: ArtifactEvaluationTask;
     maxParallelAgents: number;
+    hostOwnedOrientation?: WorkflowHostOwnedOrientation;
     engineForRole?: (role: string) => ModelEngine;
     runContext?: {
       workItemId: string;
@@ -1257,6 +1318,11 @@ export class PeerTeamArtifactWorkflowExecutor extends ArtifactWorkflowExecutorBa
     assertTask(this.task, input.task);
     if (this.orientationPlan !== null || this.#team !== null) {
       throw new Error("WORKFLOW_ORIENTATION_ALREADY_COMPLETED");
+    }
+    if (this.hostOwnedOrientation) {
+      this.orientationPlan = this.hostOwnedOrientation.canonicalPlan;
+      this.#team = fixedWorkflowTeam("artifact");
+      return hostOwnedOrientationResult(this.hostOwnedOrientation);
     }
     const result = await infer(
       this.engine,
@@ -1497,6 +1563,7 @@ export function createArtifactWorkflowExecutor(input: {
   engine: ModelEngine;
   task: ArtifactEvaluationTask;
   maxParallelAgents: number;
+  hostOwnedOrientation?: WorkflowHostOwnedOrientation;
   engineForRole?: (role: string) => ModelEngine;
   runContext?: {
     workItemId: string;
@@ -1510,11 +1577,17 @@ export function createArtifactWorkflowExecutor(input: {
     ? new SingleArtifactWorkflowExecutor({
         engine: input.engine,
         task: input.task,
+        ...(input.hostOwnedOrientation
+          ? { hostOwnedOrientation: input.hostOwnedOrientation }
+          : {}),
       })
     : new PeerTeamArtifactWorkflowExecutor({
         engine: input.engine,
         task: input.task,
         maxParallelAgents: input.maxParallelAgents,
+        ...(input.hostOwnedOrientation
+          ? { hostOwnedOrientation: input.hostOwnedOrientation }
+          : {}),
         ...(input.engineForRole
           ? { engineForRole: input.engineForRole }
           : {}),

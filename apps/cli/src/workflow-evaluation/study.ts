@@ -3,6 +3,7 @@ import { runWorkflowTrajectory } from "./trajectory.ts";
 import type {
   SealedWorkflowEvaluator,
   WorkflowArchitecture,
+  WorkflowEngineRoute,
   WorkflowExecutor,
   WorkflowFeedbackPolicy,
   WorkflowFeedbackProvider,
@@ -13,30 +14,117 @@ import type {
 } from "./types.ts";
 
 export interface WorkflowStudyCondition {
+  id: string;
   architecture: WorkflowArchitecture;
   feedbackPolicy: WorkflowFeedbackPolicy;
+  engineRoute: WorkflowEngineRoute;
 }
 
 export const WORKFLOW_STUDY_CONDITIONS: WorkflowStudyCondition[] = [
-  { architecture: "single", feedbackPolicy: "neutral_repeat" },
-  { architecture: "team", feedbackPolicy: "neutral_repeat" },
-  { architecture: "single", feedbackPolicy: "fixed_self_review" },
-  { architecture: "team", feedbackPolicy: "fixed_self_review" },
-  { architecture: "single", feedbackPolicy: "codex_generalist" },
-  { architecture: "team", feedbackPolicy: "codex_generalist" },
+  {
+    id: "single-neutral-repeat",
+    architecture: "single",
+    feedbackPolicy: "neutral_repeat",
+    engineRoute: "local-single",
+  },
+  {
+    id: "team-neutral-repeat",
+    architecture: "team",
+    feedbackPolicy: "neutral_repeat",
+    engineRoute: "all-local-team",
+  },
+  {
+    id: "single-fixed-self-review",
+    architecture: "single",
+    feedbackPolicy: "fixed_self_review",
+    engineRoute: "local-single",
+  },
+  {
+    id: "team-fixed-self-review",
+    architecture: "team",
+    feedbackPolicy: "fixed_self_review",
+    engineRoute: "all-local-team",
+  },
+  {
+    id: "single-codex-generalist",
+    architecture: "single",
+    feedbackPolicy: "codex_generalist",
+    engineRoute: "local-single",
+  },
+  {
+    id: "team-codex-generalist",
+    architecture: "team",
+    feedbackPolicy: "codex_generalist",
+    engineRoute: "all-local-team",
+  },
 ];
+
+export const WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS:
+  WorkflowStudyCondition[] = [
+    {
+      id: "single-local-neutral-repeat",
+      architecture: "single",
+      feedbackPolicy: "neutral_repeat",
+      engineRoute: "local-single",
+    },
+    {
+      id: "team-local-neutral-repeat",
+      architecture: "team",
+      feedbackPolicy: "neutral_repeat",
+      engineRoute: "all-local-team",
+    },
+    {
+      id: "team-codex-c-level-neutral-repeat",
+      architecture: "team",
+      feedbackPolicy: "neutral_repeat",
+      engineRoute: "codex-c-level-local-worker-team",
+    },
+  ];
 
 export function workflowConditionId(
   condition: WorkflowStudyCondition,
 ): string {
-  return `${condition.architecture}-${condition.feedbackPolicy.replaceAll("_", "-")}`;
+  return condition.id;
+}
+
+function validateConditionSet(
+  conditions: readonly WorkflowStudyCondition[],
+): void {
+  if (![3, 6].includes(conditions.length)) {
+    throw new Error("Workflow study condition sets must contain 3 or 6 conditions.");
+  }
+  const ids = new Set<string>();
+  for (const condition of conditions) {
+    if (
+      !/^[a-z][a-z0-9-]{0,127}$/u.test(condition.id) ||
+      ids.has(condition.id) ||
+      !["single", "team"].includes(condition.architecture) ||
+      ![
+        "neutral_repeat",
+        "fixed_self_review",
+        "codex_generalist",
+      ].includes(condition.feedbackPolicy) ||
+      ![
+        "local-single",
+        "all-local-team",
+        "codex-c-level-local-worker-team",
+      ].includes(condition.engineRoute) ||
+      (condition.architecture === "single") !==
+        (condition.engineRoute === "local-single")
+    ) {
+      throw new Error("Workflow study condition set is invalid or ambiguous.");
+    }
+    ids.add(condition.id);
+  }
 }
 
 export function workflowConditionOrderForTask(
   taskIndex: number,
   seed: number,
+  conditions: readonly WorkflowStudyCondition[] = WORKFLOW_STUDY_CONDITIONS,
 ): WorkflowStudyCondition[] {
-  const conditionCount = WORKFLOW_STUDY_CONDITIONS.length;
+  validateConditionSet(conditions);
+  const conditionCount = conditions.length;
   if (
     !Number.isSafeInteger(taskIndex) ||
     taskIndex < 0 ||
@@ -44,19 +132,21 @@ export function workflowConditionOrderForTask(
   ) {
     throw new Error("taskIndex and seed must be safe integers.");
   }
+  const seedOffset = ((seed % conditionCount) + conditionCount) % conditionCount;
+  const row = (taskIndex + seedOffset) % conditionCount;
+  if (conditionCount === 3) {
+    return Array.from(
+      { length: conditionCount },
+      (_unused, position) => conditions[(position + row) % conditionCount]!,
+    );
+  }
   // This first row of an even Williams square contains each non-zero
   // adjacent difference exactly once. Shifting it across six task rows
   // balances both condition position and first-order carryover, including
   // single -> team and team -> single directions.
   const williamsRow = [0, 1, 5, 2, 4, 3];
-  if (williamsRow.length !== conditionCount) {
-    throw new Error("Williams order must match the study condition count.");
-  }
-  const seedOffset = ((seed % conditionCount) + conditionCount) % conditionCount;
-  const row = (taskIndex + seedOffset) % conditionCount;
   return williamsRow.map(
-    (conditionIndex) =>
-      WORKFLOW_STUDY_CONDITIONS[(conditionIndex + row) % conditionCount]!,
+    (conditionIndex) => conditions[(conditionIndex + row) % conditionCount]!,
   );
 }
 
@@ -118,13 +208,12 @@ function median(values: number[]): number | null {
 
 function aggregate(
   trials: WorkflowTrajectoryReport[],
+  conditions: readonly WorkflowStudyCondition[],
 ): WorkflowStudyReport["aggregate"] {
-  return WORKFLOW_STUDY_CONDITIONS.map((condition) => {
+  return conditions.map((condition) => {
     const conditionId = workflowConditionId(condition);
     const selected = trials.filter(
-      (trial) =>
-        trial.architecture === condition.architecture &&
-        trial.feedbackPolicy === condition.feedbackPolicy,
+      (trial) => trial.conditionId === conditionId,
     );
     const tokenValues = selected.map((trial) =>
       trial.outcome.totalInputTokens === null ||
@@ -223,24 +312,48 @@ function aggregate(
 
 function pairedComparisons(
   trials: WorkflowTrajectoryReport[],
+  conditions: readonly WorkflowStudyCondition[],
 ): WorkflowStudyReport["pairedComparisons"] {
+  const standardIds = new Set(
+    WORKFLOW_STUDY_CONDITIONS.map(workflowConditionId),
+  );
+  if (
+    conditions.length !== standardIds.size ||
+    conditions.some((condition) => !standardIds.has(condition.id))
+  ) {
+    return [];
+  }
   return ([
     "neutral_repeat",
     "fixed_self_review",
     "codex_generalist",
   ] as const).map((feedbackPolicy) => {
-    const policyTrials = trials.filter(
-      (trial) => trial.feedbackPolicy === feedbackPolicy,
+    const singleConditionId = WORKFLOW_STUDY_CONDITIONS.find(
+      (condition) =>
+        condition.architecture === "single" &&
+        condition.feedbackPolicy === feedbackPolicy,
+    )!.id;
+    const teamConditionId = WORKFLOW_STUDY_CONDITIONS.find(
+      (condition) =>
+        condition.architecture === "team" &&
+        condition.feedbackPolicy === feedbackPolicy,
+    )!.id;
+    const conditionTrials = trials.filter(
+      (trial) =>
+        trial.conditionId === singleConditionId ||
+        trial.conditionId === teamConditionId,
     );
-    const pairs = [...new Set(policyTrials.map(({ taskId }) => taskId))]
+    const pairs = [...new Set(conditionTrials.map(({ taskId }) => taskId))]
       .map((taskId) => ({
-        single: policyTrials.find(
+        single: conditionTrials.find(
           (trial) =>
-            trial.taskId === taskId && trial.architecture === "single",
+            trial.taskId === taskId &&
+            trial.conditionId === singleConditionId,
         ),
-        team: policyTrials.find(
+        team: conditionTrials.find(
           (trial) =>
-            trial.taskId === taskId && trial.architecture === "team",
+            trial.taskId === taskId &&
+            trial.conditionId === teamConditionId,
         ),
       }))
       .filter(
@@ -289,20 +402,213 @@ function pairedComparisons(
   });
 }
 
+function compareConditions(
+  trials: WorkflowTrajectoryReport[],
+  contrastId: string,
+  leftConditionId: string,
+  rightConditionId: string,
+): WorkflowStudyReport["conditionComparisons"][number] {
+  const conditionTrials = trials.filter(
+    (trial) =>
+      trial.conditionId === leftConditionId ||
+      trial.conditionId === rightConditionId,
+  );
+  const pairs = [...new Set(conditionTrials.map(({ taskId }) => taskId))]
+    .map((taskId) => ({
+      left: conditionTrials.find(
+        (trial) =>
+          trial.taskId === taskId && trial.conditionId === leftConditionId,
+      ),
+      right: conditionTrials.find(
+        (trial) =>
+          trial.taskId === taskId && trial.conditionId === rightConditionId,
+      ),
+    }))
+    .filter(
+      (pair): pair is {
+        left: WorkflowTrajectoryReport;
+        right: WorkflowTrajectoryReport;
+      } => Boolean(pair.left && pair.right),
+    );
+  const difference = (
+    selector: (trial: WorkflowTrajectoryReport) => number,
+  ): number =>
+    mean(
+      pairs.map(({ left, right }) =>
+        Number((selector(right) - selector(left)).toFixed(6)),
+      ),
+    );
+  const scoreDifferences = pairs.map(({ left, right }) =>
+    Number((right.outcome.bestScore - left.outcome.bestScore).toFixed(6)),
+  );
+  return {
+    contrastId,
+    leftConditionId,
+    rightConditionId,
+    pairedTasks: pairs.length,
+    rightMinusLeftCheckpointPassRate: Number(
+      difference((trial) => Number(trial.outcome.passedByCheckpoint)).toFixed(4),
+    ),
+    rightMinusLeftFinalPassRate: Number(
+      difference((trial) => Number(trial.outcome.status === "passed")).toFixed(4),
+    ),
+    rightMinusLeftMeanBestScore: Number(
+      mean(scoreDifferences).toFixed(4),
+    ),
+    rightMinusLeftMeanFeedbackRounds: Number(
+      difference((trial) => trial.outcome.feedbackRoundCount).toFixed(4),
+    ),
+    rightMinusLeftMeanElapsedMs: Math.round(
+      difference((trial) => trial.outcome.elapsedMs),
+    ),
+    rightMinusLeftMeanModelCalls: Number(
+      difference((trial) => trial.outcome.internalModelCallCount).toFixed(4),
+    ),
+    bestScoreWins: scoreDifferences.filter((value) => value > 0).length,
+    bestScoreTies: scoreDifferences.filter((value) => value === 0).length,
+    bestScoreLosses: scoreDifferences.filter((value) => value < 0).length,
+  };
+}
+
+function conditionComparisons(
+  trials: WorkflowTrajectoryReport[],
+  conditions: readonly WorkflowStudyCondition[],
+): WorkflowStudyReport["conditionComparisons"] {
+  const hybridIds = new Set(
+    WORKFLOW_HYBRID_C_LEVEL_CANARY_CONDITIONS.map(workflowConditionId),
+  );
+  if (
+    conditions.length !== hybridIds.size ||
+    conditions.some((condition) => !hybridIds.has(condition.id))
+  ) {
+    return [];
+  }
+  return [
+    compareConditions(
+      trials,
+      "all-local-team-vs-local-single",
+      "single-local-neutral-repeat",
+      "team-local-neutral-repeat",
+    ),
+    compareConditions(
+      trials,
+      "codex-c-level-team-vs-local-single",
+      "single-local-neutral-repeat",
+      "team-codex-c-level-neutral-repeat",
+    ),
+    compareConditions(
+      trials,
+      "codex-c-level-team-vs-all-local-team",
+      "team-local-neutral-repeat",
+      "team-codex-c-level-neutral-repeat",
+    ),
+  ];
+}
+
+function nullableAdd(
+  left: number | null,
+  right: number | null,
+): number | null {
+  return left === null || right === null ? null : left + right;
+}
+
+function engineAggregate(
+  trials: WorkflowTrajectoryReport[],
+  conditions: readonly WorkflowStudyCondition[],
+): WorkflowStudyReport["engineAggregate"] {
+  type Aggregate = WorkflowStudyReport["engineAggregate"][number] & {
+    trialIds: Set<string>;
+  };
+  const grouped = new Map<string, Aggregate>();
+  for (const trial of trials) {
+    for (const accounting of trial.engineAccounting) {
+      const key = JSON.stringify([
+        trial.conditionId,
+        accounting.engineProfileId,
+        accounting.modelId,
+        accounting.evidenceSource,
+      ]);
+      const current = grouped.get(key);
+      if (current === undefined) {
+        grouped.set(key, {
+          conditionId: trial.conditionId,
+          engineProfileId: accounting.engineProfileId,
+          modelId: accounting.modelId,
+          trials: 1,
+          calls: accounting.calls,
+          succeeded: accounting.succeeded,
+          failed: accounting.failed,
+          canceled: accounting.canceled,
+          abandoned: accounting.abandoned,
+          inputTokens: accounting.inputTokens,
+          outputTokens: accounting.outputTokens,
+          cost: accounting.cost,
+          elapsedMs: accounting.elapsedMs,
+          measurementStatus: accounting.measurementStatus,
+          evidenceSource: accounting.evidenceSource,
+          trialIds: new Set([trial.trialId]),
+        });
+        continue;
+      }
+      current.trialIds.add(trial.trialId);
+      current.trials = current.trialIds.size;
+      current.calls += accounting.calls;
+      current.succeeded += accounting.succeeded;
+      current.failed += accounting.failed;
+      current.canceled += accounting.canceled;
+      current.abandoned += accounting.abandoned;
+      current.inputTokens = nullableAdd(
+        current.inputTokens,
+        accounting.inputTokens,
+      );
+      current.outputTokens = nullableAdd(
+        current.outputTokens,
+        accounting.outputTokens,
+      );
+      current.cost = nullableAdd(current.cost, accounting.cost);
+      current.elapsedMs = nullableAdd(
+        current.elapsedMs,
+        accounting.elapsedMs,
+      );
+      current.measurementStatus =
+        current.measurementStatus === "unknown" ||
+        accounting.measurementStatus === "unknown"
+          ? "unknown"
+          : current.measurementStatus === "estimated" ||
+              accounting.measurementStatus === "estimated"
+            ? "estimated"
+            : "measured";
+    }
+  }
+  const conditionRanks = new Map(
+    conditions.map((condition, index) => [condition.id, index]),
+  );
+  return [...grouped.values()]
+    .sort(
+      (left, right) =>
+        (conditionRanks.get(left.conditionId) ?? Number.MAX_SAFE_INTEGER) -
+          (conditionRanks.get(right.conditionId) ?? Number.MAX_SAFE_INTEGER) ||
+        left.engineProfileId.localeCompare(right.engineProfileId) ||
+        left.modelId.localeCompare(right.modelId) ||
+        left.evidenceSource.localeCompare(right.evidenceSource),
+    )
+    .map(({ trialIds: _trialIds, ...entry }) => entry);
+}
+
 function stratifiedAggregate(
   trials: WorkflowTrajectoryReport[],
+  conditions: readonly WorkflowStudyCondition[],
 ): WorkflowStudyReport["stratifiedAggregate"] {
   const dimensions = ["family", "difficulty"] as const;
   return dimensions.flatMap((dimension) =>
     [...new Set(trials.map((trial) => String(trial[dimension])))]
       .sort()
       .flatMap((value) =>
-        WORKFLOW_STUDY_CONDITIONS.map((condition) => {
+        conditions.map((condition) => {
           const selected = trials.filter(
             (trial) =>
               String(trial[dimension]) === value &&
-              trial.architecture === condition.architecture &&
-              trial.feedbackPolicy === condition.feedbackPolicy,
+              trial.conditionId === condition.id,
           );
           return {
             dimension,
@@ -344,16 +650,17 @@ function stratifiedAggregate(
 
 export async function runWorkflowStudy(input: {
   tasks: WorkflowPublicTask[];
+  conditions?: readonly WorkflowStudyCondition[];
   executorFactory: (input: {
     task: WorkflowPublicTask;
     condition: WorkflowStudyCondition;
     trialId: string;
     orderIndex: number;
   }) => Promise<WorkflowExecutor> | WorkflowExecutor;
-  feedbackProviders: Record<
+  feedbackProviders: Partial<Record<
     WorkflowFeedbackPolicy,
     WorkflowFeedbackProvider
-  >;
+  >>;
   evaluatorForTask: (
     task: WorkflowPublicTask,
   ) => Promise<SealedWorkflowEvaluator> | SealedWorkflowEvaluator;
@@ -363,10 +670,11 @@ export async function runWorkflowStudy(input: {
   sealedSuiteHash?: string;
   approvedPlanHash?: string;
   approvedPlanCanonicalJson?: string;
-  expectedCandidateModelId?: string;
+  expectedCandidateModelId?: string | Readonly<Record<string, string>>;
   provenance?: {
     candidateEngine: WorkflowStudyReport["provenance"]["candidateEngine"];
     codexProxy: WorkflowStudyReport["provenance"]["codexProxy"];
+    cLevelEngine: WorkflowStudyReport["provenance"]["cLevelEngine"];
     controlPlane: WorkflowStudyReport["provenance"]["controlPlane"];
     codeSandbox: WorkflowStudyReport["provenance"]["codeSandbox"];
   };
@@ -382,13 +690,17 @@ export async function runWorkflowStudy(input: {
   if (new Set(ids).size !== ids.length) {
     throw new Error("Workflow study task ids must be unique.");
   }
-  for (const policy of [
-    "neutral_repeat",
-    "fixed_self_review",
-    "codex_generalist",
-  ] as const) {
+  const conditions = (input.conditions ?? WORKFLOW_STUDY_CONDITIONS).map(
+    (condition) => ({ ...condition }),
+  );
+  validateConditionSet(conditions);
+  const requiredPolicies = new Set(
+    conditions.map(({ feedbackPolicy }) => feedbackPolicy),
+  );
+  for (const policy of requiredPolicies) {
     const provider = input.feedbackProviders[policy];
     if (
+      provider === undefined ||
       provider.id !== policy ||
       typeof provider.providerId !== "string" ||
       provider.providerId.trim().length === 0 ||
@@ -441,7 +753,7 @@ export async function runWorkflowStudy(input: {
       ),
   );
   for (const [taskIndex, task] of orderedTasks.entries()) {
-    const order = workflowConditionOrderForTask(taskIndex, seed);
+    const order = workflowConditionOrderForTask(taskIndex, seed, conditions);
     for (const [orderIndex, condition] of order.entries()) {
       if (input.signal?.aborted) {
         throw input.signal.reason ?? new Error("WORKFLOW_STUDY_CANCELED");
@@ -458,19 +770,34 @@ export async function runWorkflowStudy(input: {
       }
       const evaluator = await input.evaluatorForTask(task);
       evaluatorIds.add(evaluator.id);
+      const feedbackProvider =
+        input.feedbackProviders[condition.feedbackPolicy];
+      if (feedbackProvider === undefined) {
+        throw new Error(
+          `Missing feedback provider for '${condition.feedbackPolicy}'.`,
+        );
+      }
       const trial = await runWorkflowTrajectory({
         task,
         executor,
-        feedbackProvider: input.feedbackProviders[condition.feedbackPolicy],
+        feedbackProvider,
         evaluator,
         ...(input.limits ? { limits: input.limits } : {}),
         trialId,
+        conditionId: condition.id,
+        engineRoute: condition.engineRoute,
         orderIndex,
         ...(input.expectedCandidateModelId
           ? { expectedCandidateModelId: input.expectedCandidateModelId }
           : {}),
         ...(input.signal ? { signal: input.signal } : {}),
       });
+      if (
+        trial.conditionId !== condition.id ||
+        trial.engineRoute !== condition.engineRoute
+      ) {
+        throw new Error("Workflow trajectory condition attestation mismatch.");
+      }
       trials.push(trial);
       await input.onTrial?.(trial);
       // Persist the completed trial first, then fail the study before another
@@ -494,7 +821,7 @@ export async function runWorkflowStudy(input: {
     maxParallelAgents: input.limits?.maxParallelAgents ?? 1,
   };
   return {
-    apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha2",
+    apiVersion: "chartermesh.dev/collaboration-study-report/v1alpha3",
     studyId,
     approvedPlanHash: input.approvedPlanHash ?? null,
     approvedPlanCanonicalJson: input.approvedPlanCanonicalJson ?? null,
@@ -502,28 +829,55 @@ export async function runWorkflowStudy(input: {
     seed,
     startedAt,
     finishedAt: new Date().toISOString(),
-    conditionOrder: WORKFLOW_STUDY_CONDITIONS.map(workflowConditionId),
+    conditionOrder: conditions.map(workflowConditionId),
+    conditionDefinitions: conditions.map((condition) => ({
+      id: condition.id,
+      architecture: condition.architecture,
+      feedbackPolicy: condition.feedbackPolicy,
+      engineRoute: condition.engineRoute,
+    })),
     taskIds: ids,
     limits,
-    conditionOrdering: "seeded_williams_square_v1",
+    conditionOrdering:
+      conditions.length === 3
+        ? "seeded_cyclic_latin_v1"
+        : "seeded_williams_square_v1",
     provenance: {
       sealedSuiteHash,
       candidateEngine: input.provenance?.candidateEngine ?? null,
       codexProxy: input.provenance?.codexProxy ?? null,
+      cLevelEngine: input.provenance?.cLevelEngine ?? null,
       controlPlane: input.provenance?.controlPlane ?? null,
       codeSandbox: input.provenance?.codeSandbox ?? null,
       evaluatorIds: [...evaluatorIds].sort(),
     },
     trials,
-    aggregate: aggregate(trials),
-    pairedComparisons: pairedComparisons(trials),
-    stratifiedAggregate: stratifiedAggregate(trials),
+    aggregate: aggregate(trials, conditions),
+    pairedComparisons: pairedComparisons(trials, conditions),
+    conditionComparisons: conditionComparisons(trials, conditions),
+    engineAggregate: engineAggregate(trials, conditions),
+    stratifiedAggregate: stratifiedAggregate(trials, conditions),
     interpretationBoundary: [
-      "Codex feedback is a simulated_user_proxy, not a human approval.",
+      ...(conditions.some(
+        ({ feedbackPolicy }) => feedbackPolicy === "codex_generalist",
+      )
+        ? [
+            "Codex feedback is a simulated_user_proxy, not a human approval.",
+          ]
+        : []),
       "Feedback rounds within one trajectory are correlated and are not independent samples.",
       "Team versus single effects must be reported with calls, tokens, and elapsed time; directive matching is not compute matching.",
       "Office-family v1 tasks evaluate bounded semantic IR, not OOXML creation or visual fidelity.",
       "Code-family pass results require an attested VM sandbox preflight; generated code is never executed on the host by this study runner.",
+      ...(conditions.some(
+        ({ engineRoute }) =>
+          engineRoute === "codex-c-level-local-worker-team",
+      )
+        ? [
+            "A Codex C-level route is an external hosted model role, not a local model or human approval; it is not compute matched.",
+            "Codex exec usage is unknown and its requested output-token limit is advisory; the harness enforces timeout, call-count, schema, and output-byte bounds instead.",
+          ]
+        : []),
       "A finite pilot cannot establish general autonomous company-operation readiness.",
     ],
   };

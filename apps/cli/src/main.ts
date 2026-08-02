@@ -71,7 +71,10 @@ import {
   SandboxContainmentError,
   WindowsSandboxCodeBackend,
 } from "./code-evaluation/windows-sandbox.ts";
-import { CodexCliFeedbackProvider } from "./workflow-evaluation/codex-proxy.ts";
+import {
+  CodexCliFeedbackProvider,
+  CodexExecModelEngine,
+} from "./workflow-evaluation/codex-proxy.ts";
 import {
   generateReferenceCodeWorkflowSuite,
   preflightCodeWorkflowSandbox,
@@ -2851,6 +2854,7 @@ async function evaluateWorkflowCommand(
           ? codeBindings
           : allTasks;
   const limits = workflowTrajectoryLimits(args);
+  const hybridCLevelCanary = has(args, "--hybrid-c-level-canary");
   const seed = boundedIntegerOption(
     args,
     "--seed",
@@ -2868,6 +2872,13 @@ async function evaluateWorkflowCommand(
     120_000,
     1_000,
     900_000,
+  );
+  const codexMaxOutputBytes = boundedIntegerOption(
+    args,
+    "--codex-max-output-bytes",
+    1_048_576,
+    1,
+    16_777_216,
   );
   let runtime: RuntimeConfig | undefined;
   let engineProfile: RuntimeConfig["modelEngines"][number] | undefined;
@@ -2968,6 +2979,9 @@ async function evaluateWorkflowCommand(
     taskBindings: tasks,
     limits,
     seed,
+    conditionSet: hybridCLevelCanary
+      ? "hybrid_c_level_canary_v1"
+      : "standard_v1",
     bindings: {
       candidateEngineId: manifestProfileId,
       candidateRuntimeProfileHash: runtimeProfileHash,
@@ -2978,6 +2992,13 @@ async function evaluateWorkflowCommand(
         codexExecutable && codexSha256 && codexModel
           ? codexTimeoutMs
           : null,
+      codexMaxOutputBytes:
+        codexExecutable && codexSha256 && codexModel
+          ? codexMaxOutputBytes
+          : null,
+      codexEngineProfileId: hybridCLevelCanary
+        ? "codex-cli-c-level"
+        : null,
       codeSandboxId: hasCodeTasks
         ? "windows-sandbox-protected-client"
         : null,
@@ -3046,7 +3067,18 @@ async function evaluateWorkflowCommand(
     executableSha256: codexSha256,
     model: codexModel,
     timeoutMs: codexTimeoutMs,
+    maxOutputBytes: codexMaxOutputBytes,
   });
+  const cLevelEngine = hybridCLevelCanary
+    ? new CodexExecModelEngine({
+        profileId: "codex-cli-c-level",
+        executablePath: codexExecutable,
+        executableSha256: codexSha256,
+        model: codexModel,
+        timeoutMs: codexTimeoutMs,
+        maxOutputBytes: codexMaxOutputBytes,
+      })
+    : undefined;
   const codeSandbox = codeProvenance
     ? {
         backend: new WindowsSandboxCodeBackend({
@@ -3135,12 +3167,22 @@ async function evaluateWorkflowCommand(
           limits,
           engine,
           codex,
+          ...(cLevelEngine ? { cLevelEngine } : {}),
           ...(codeSandbox ? { codeSandbox } : {}),
           signal: studyAbort.signal,
           persistence: createControlPlaneWorkflowStudyPersistence({
             controlPlane: evaluationControlPlane,
             configuredModelId: configuredModelId!,
             maxChildrenPerTrial: Math.min(1_000, limits.maxModelCalls),
+            ...(plan.bindings.codexFeedbackEngineProfileId
+              ? {
+                  codexFeedbackAccounting: {
+                    engineProfileId:
+                      plan.bindings.codexFeedbackEngineProfileId,
+                    modelId: codexModel,
+                  },
+                }
+              : {}),
           }),
           onTrial(trial) {
             completedTrials.push(trial);
@@ -3334,6 +3376,7 @@ Commands:
     [--engine-id ID] [--repetitions 1] [--json]
   chartermesh evaluate-workflow --target PATH
     [--fixture ID | --full | --artifacts-only | --code-only]
+    [--hybrid-c-level-canary]
     [--checkpoint-feedback-rounds 10] [--max-feedback-rounds 50]
     [--max-model-calls 512] [--max-total-tokens N]
     [--max-consecutive-contract-invalid-submissions 3]
@@ -3343,6 +3386,7 @@ Commands:
     --codex-executable ABSOLUTE_PATH --codex-sha256 SHA256 --codex-model MODEL \
     --approve PLAN_HASH
     [--codex-timeout-ms 120000]
+    [--codex-max-output-bytes 1048576]
     [--acknowledge-large-run]
     [--restart-checkpoint]
   chartermesh capabilities list|recommend [--kind KIND] [--json]
