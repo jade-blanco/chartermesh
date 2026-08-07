@@ -75,6 +75,20 @@ const installed = join(
 );
 const executable = join(installed, "bin", "chartermesh.mjs");
 assert.equal(existsSync(executable), true);
+for (const packagedContract of [
+  "CHANGELOG.md",
+  "SECURITY.md",
+  join("docs", "USER-GUIDE.ko.md"),
+  join("docs", "DECISION-REVIEW-PROXY-BENCHMARK.md"),
+  join("schemas", "decision-packet-v1alpha2.schema.json"),
+  join("schemas", "artifact-producer-report-v1alpha1.schema.json"),
+]) {
+  assert.equal(
+    existsSync(join(installed, packagedContract)),
+    true,
+    `packed contract is missing: ${packagedContract}`,
+  );
+}
 assert.equal(
   existsSync(
     join(installed, "scripts", "run-execution-evaluation.mjs"),
@@ -135,7 +149,7 @@ const version = JSON.parse(
     cwd: target,
   }),
 );
-assert.equal(version.data.currentVersion, "0.0.7-alpha.1");
+assert.equal(version.data.currentVersion, "0.0.8-alpha.1");
 
 for (const script of [codeGenerationScript, codeEvaluationScript]) {
   const result = spawnSync(
@@ -220,6 +234,6 @@ assert.equal(
       "utf8",
     ),
   ).charterMeshVersion,
-  "0.0.7-alpha.1",
+  "0.0.8-alpha.1",
 );
 console.log(`Package install check passed: ${packed[0].filename}`);

@@ -18,12 +18,53 @@ before start and share durable CLI/dashboard/signal cancellation. Work lists
 support cursors and archive, audit export streams, outbox delivery retries and
 dead-letters, and optional local schedules are disabled by default and start
 zero models on an empty queue.
+Decision Packet v1alpha2 separately binds exact artifact bytes/media type and
+the canonical producer-report sidecar. Producer-reported checks remain
+claimed, including in experimental runtime_compiled mode. Human decision
+surfaces must show the exact bounded artifact preview as well as the packet;
+the projection is not a substitute for the deliverable. SQLite schema v12
+stores report JSON, hash, and byte size. runtime_compiled is currently a
+BuiltInManagedRunner API option, not a CLI/runtime.json setting.
 Approved bootstrap plans also install four provider-neutral Apache-2.0 Agent
 Skills. External MCP servers remain uninstalled and disabled. Optional
 SearXNG web.search requires a reviewed HTTPS/loopback endpoint, a tool-calling
 engine, an OrgSpec allowlist entry, and exact per-query human approval.
 
+The evaluate-decision-review command is dry by default. Its live mode requires
+the exact plan hash and an attested Codex executable/model binding for 20
+stateless calls over the fixed ten-case raw/decision_review suite. The plan
+also binds the exact local harness-source digest and the live runner compares
+the complete regenerated plan before starting. Fatal identity, executable, or
+unsettled-process failures stop the study. The result is descriptive proxy
+regression evidence only, never human, causal, statistical, approval, or
+autonomy evidence.
+Quota/rate capacity and authentication boundaries pause this benchmark after
+the child settles, without scoring the attempted call. An operator signal is
+resumable only between calls; Ctrl+C during an active model call leaves an
+unknown outcome and fails closed. Each invocation is durably marked before
+launch, and running, failed, active, or unknown attempts are never retried
+automatically. A clean paused checkpoint lives only under
+`.chartermesh/evaluations/<benchmarkId>/checkpoint.json`; the final report
+alone is written to exports. Resume is a dry
+`--resume --account-context same|changed|unknown` plan followed by a fresh
+exact `RESUME_PLAN_HASH` approval. The completed prefix is immutable and the
+model, executable/hash, limits, suite, protocols, and source digest must still
+match. No account/email/auth-path/credential fingerprint is stored; context is
+operator-declared and unverified. Every resume creates a new segment and
+confounds a strict uninterrupted reviewer-benefit claim; changed or unknown
+also discloses account-continuity uncertainty. Source changes invalidate old
+plan hashes.
+Each resumed segment binds its source checkpoint, prior segment chain, attempt
+count, and approval hash; an exclusive used-approval receipt is written before
+the next model process. Dead-owner stale-lock recovery is allowed only for the
+exact clean paused state. State-path symlink/junction components are rejected.
+These are single-user local hash controls, not signatures or protection from a
+malicious local writer or whole-directory rollback.
+
 Project architecture: docs/PRODUCT-DESIGN.md
 CLI and first run: docs/FIRST-RUN.md
 Model connections: docs/LLM-CONNECTIONS.md
 Operating workflow: docs/USAGE.md
+Decision review benchmark: docs/DECISION-REVIEW-PROXY-BENCHMARK.md
+Decision Packet v1alpha2 schema: schemas/decision-packet-v1alpha2.schema.json
+Producer report schema: schemas/artifact-producer-report-v1alpha1.schema.json

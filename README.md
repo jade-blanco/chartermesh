@@ -37,7 +37,12 @@ executable that implements CharterMesh's neutral stdin/stdout JSON contract.
 Provider-specific features enter through adapter capability manifests, never
 through the core OrgSpec schema.
 
-## 0.0.7-alpha.1 runnable slice
+`model_json` remains the normal artifact mode. The experimental
+`runtime_compiled` mode is currently available only through the
+`BuiltInManagedRunner` API; there is no CLI or `runtime.json` selector for it
+in this slice.
+
+## 0.0.8-alpha.1 runnable slice
 
 - Project-aware `lean`, `balanced`, and `controlled` proposals
 - Exact plan-hash approval and crash-recoverable journaled apply
@@ -54,6 +59,11 @@ through the core OrgSpec schema.
   one-use Control Plane/runtime receipts, hash-only evidence, and bounded
   iterations
 - Structured artifacts with one bounded repair turn and cancellation
+- Decision Packet v1alpha2 with exact artifact/media-type identity, a
+  separately hashed producer-report sidecar, and model-reported checks kept as
+  `claimed` even when the runtime compiles the envelope
+- SQLite schema v12 persistence for producer-report JSON, hash, and byte size;
+  migrated v11 artifacts remain valid with no report
 - Fake, generic OpenAI-compatible, and shell-free, executable-hash-pinned
   command-process engines with dedicated working directories
 - Rate-limited local dashboard APIs and keyboard/mobile accessibility flow
@@ -67,7 +77,10 @@ through the core OrgSpec schema.
   no-redirect HTTP model responses
 - Versioned `--json` CLI output for coding agents and automation
 - Decision Desk with one primary human decision, separate agent/wait/history
-  queues, claimed-vs-verified evidence, exact tool rejection, and input requests
+  queues, claimed-vs-verified evidence, exact artifact preview, exact tool
+  rejection, and input requests
+- Dry-by-default ten-case/20-call Codex proxy regression for comparing raw and
+  Decision Packet review presentations under an exact live plan hash
 - Synthetic local-model evaluation for comparing small models
 - Buildable dependency-free npm package and clean-install verification
 - Four bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan
@@ -139,15 +152,30 @@ On a machine with Node.js 24 or newer, a human, coding agent, or shell can run
 CharterMesh without manually checking out this source tree:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh propose --target C:\path\to\project --profile balanced --json
-npx --yes github:jade-blanco/chartermesh bootstrap --target C:\path\to\project --profile balanced --engine fake --json
+npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 propose --target C:\path\to\project --profile balanced --json
+npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 bootstrap --target C:\path\to\project --profile balanced --engine fake --json
 ```
+
+The tag-pinned form above is the reproducible friend-trial path. Omit
+`#v0.0.8-alpha.1` only when you intentionally want the latest `main` branch.
 
 `bootstrap` returns the exact plan hash and still performs no target writes.
 After a human approves that value, repeat the same command with
 `--approve PLAN_HASH`. The GitHub package path builds dependency-free
 JavaScript before execution. Downloading the package requires network access
 and should be explicitly authorized in managed agent environments.
+
+For a first trial, give a coding agent the target project and this repository
+URL, then say:
+
+> Apply CharterMesh to this project. Read `BOOTSTRAP.md`, use the `balanced`
+> profile and the free offline `fake` engine first, show me the exact plan hash
+> before any target writes, and apply only after I approve that same hash. Then
+> run `doctor`, `seed-demo`, and show me the local dashboard.
+
+This is a pre-alpha evaluation path. Use a disposable branch or project copy,
+inspect the plan, and do not grant deployment, payment, credential, or important
+data-changing authority during the first trial.
 
 ## Five-minute offline source start
 
@@ -177,7 +205,7 @@ The fake engine is deterministic, free, and offline.
 `doctor` automatically compares the target's pinned installation version with
 the running CLI and recovers any incomplete apply journal. Use
 `chartermesh version --check` for an explicit network check of the latest
-GitHub release.
+published GitHub release, including prereleases.
 
 ## Connect a local or remote model
 
@@ -330,6 +358,83 @@ bounds, while Codex token/cost usage remains unknown. Hybrid results are not
 compute matched; interpret `conditionComparisons` beside `engineAggregate`
 calls, known token/cost fields, and elapsed time.
 
+## Evaluate the decision-review projection
+
+The fixed review regression compares ten fictional cases under `raw` and
+`decision_review` presentations. Each presentation includes the same exact
+bounded artifact, tool-call, or user-input subject; artifact cases also carry
+the same separately labelled producer report. The second presentation adds
+the bound Decision Packet projection. The dry command starts no Codex process:
+
+```powershell
+node bin/chartermesh.mjs evaluate-decision-review --target TARGET `
+  --suite decision-review-fixed-10-v1 `
+  --codex-executable C:\absolute\path\to\codex.exe `
+  --codex-sha256 SHA256 --codex-model CODEX_MODEL --json
+```
+
+Review `data.planHash`, then repeat every plan-defining option and approve that
+exact value to run all 20 stateless calls:
+
+```powershell
+node bin/chartermesh.mjs evaluate-decision-review --target TARGET `
+  --suite decision-review-fixed-10-v1 `
+  --codex-executable C:\absolute\path\to\codex.exe `
+  --codex-sha256 SHA256 --codex-model CODEX_MODEL `
+  --live --approve PLAN_HASH --json
+```
+
+If Codex reports quota/rate capacity exhaustion or an authentication boundary,
+the run pauses after preserving its completed prefix. An operator signal is
+also resumable only when it is observed between calls, before the next flushed
+invocation record is created. Ctrl+C during an active model call leaves that
+call's outcome unknown, so the checkpoint fails closed and cannot be resumed
+automatically. The checkpoint is local at
+`.chartermesh/evaluations/<benchmarkId>/checkpoint.json`; only a completed
+report is written under `.chartermesh/exports/`. Plan a resume without calling
+the model, declaring only whether the account context is the same, changed, or
+unknown:
+
+```powershell
+node bin/chartermesh.mjs evaluate-decision-review --target TARGET `
+  --suite decision-review-fixed-10-v1 `
+  --codex-executable C:\absolute\path\to\codex.exe `
+  --codex-sha256 SHA256 --codex-model CODEX_MODEL `
+  --resume --account-context changed --json
+```
+
+Review the new resume-plan hash, then repeat the same command with
+`--live --approve RESUME_PLAN_HASH`. Every resume needs its own exact approval;
+the completed trial prefix is immutable, and the model, executable digest,
+limits, suite, protocol, and harness-source digest must still match the base
+plan. A model invocation is durably marked before it starts. A running, failed,
+active, or otherwise unknown attempt is never retried automatically; only a
+clean paused checkpoint can be resumed. CharterMesh stores no account name,
+email, authentication path, credential, or credential hash. `account-context`
+is an operator declaration, not an attestation. Every resume creates a new
+execution segment and therefore prevents a strict uninterrupted
+single-reviewer benefit claim; `changed` or `unknown` additionally records the
+declared account-continuity uncertainty. Any benchmark source change
+invalidates earlier base and resume plan hashes.
+
+Each resumed segment binds the exact source checkpoint and prior segment chain,
+and live continuation creates an exclusive used-approval receipt before the
+next model process. A dead-owner stale lock is recovered only for that exact
+clean paused state. State-path symlinks and junctions are rejected. These are
+single-user local integrity controls, not digital signatures or protection
+against a malicious local writer or whole-directory rollback.
+
+The executable digest, model, suite, presentation order, renderer, prompt,
+response schema, harness-source digest, per-call timeout, output-byte bound,
+oracle commitment, and engineering thresholds are plan-bound. The reviewer
+runs read-only with tools disabled and can never satisfy a production
+`human:*` approval. Results are paired descriptive regression evidence for
+this fixed suite and reviewer—not a human study, causal estimate, statistical
+result, or autonomy claim. See
+[`docs/DECISION-REVIEW-PROXY-BENCHMARK.md`](docs/DECISION-REVIEW-PROXY-BENCHMARK.md)
+and
+[`ADR 0021`](docs/adr/0021-artifact-report-binding-and-decision-review-benchmark.md).
+
 ## Operate from the CLI
 
 ```powershell
@@ -424,6 +529,7 @@ Key documents:
 - [`docs/LLM-CONNECTIONS.md`](docs/LLM-CONNECTIONS.md) — model connection guide
 - [`docs/MODEL-EVALUATION.md`](docs/MODEL-EVALUATION.md) — small-model experiment
 - [`docs/COLLABORATION-STUDY.md`](docs/COLLABORATION-STUDY.md) — longitudinal single/team validation
+- [`docs/DECISION-REVIEW-PROXY-BENCHMARK.md`](docs/DECISION-REVIEW-PROXY-BENCHMARK.md) — fixed raw/Decision Packet review regression
 - [`docs/USAGE.md`](docs/USAGE.md) — operating workflow
 - [`docs/PRODUCT-DESIGN.md`](docs/PRODUCT-DESIGN.md) — architecture source of truth
 - [`SECURITY.md`](SECURITY.md) — security and vulnerability reporting

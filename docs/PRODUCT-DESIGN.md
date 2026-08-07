@@ -40,25 +40,36 @@ CharterMesh의 우선 제품 목적은 “AI가 회사를 사람 없이 자율 �
 사람 대기열의 첫 항목은 cursor-bounded 최신 작업 페이지와 독립적으로
 전역 투영한다.
 
-### Decision Packet v1alpha1
+### Decision Packet v1alpha2
 
 Control Plane은 사람의 artifact 결정, 정확한 tool-call 승인·거부, 사용자 입력
-요청마다 `chartermesh.dev/decision-packet/v1alpha1`을 모델 호출 없이 만든다.
+요청마다 `chartermesh.dev/decision-packet/v1alpha2`를 모델 호출 없이 만든다.
 패킷에는 다음이 들어간다.
 
 - 사람이 답해야 할 한 문장 질문
 - 정확한 artifact/call/input subject hash
 - 제작자가 보고한 요약·확인·위험·자체 신뢰도
 - Control Plane과 Tool Runtime이 확인한 근거. `host_validator`는 계약에
-  예약되어 있지만 v1alpha1 수집 경로는 아직 구현되지 않았다.
+  예약되어 있지만 v1alpha2 수집 경로는 아직 구현되지 않았다.
 - 완료 기준별 `satisfied | failed | unverified` 판정
 - 차단 예외와 경고, 해소 방법
 - 결정을 내리면 발생하는 다음 상태
 
+실제 artifact와 제작자 보고서는 서로 다른 불변 입력이다. artifact의
+`artifactHash`는 정확한 deliverable bytes의 SHA-256이고, artifact subject
+identity는 그 digest와 media type을 함께 canonical 결박한다. 제작자 보고서는
+`chartermesh.dev/artifact-producer-report/v1alpha1` 스키마로 제한된 sidecar이며
+별도의 `producerReportHash`를 가진다. Decision Packet은 두 identity를 모두
+결박하므로 artifact bytes, media type 또는 보고서 중 하나라도 바뀌면 이전
+packet과 approval은 재사용할 수 없다. SQLite schema v12는 보고서 JSON, hash,
+byte size를 artifact row에 저장하며 v11 row는 보고서가 없는 상태로 호환한다.
+
 `model_reported` 근거는 항상 `claimed`다. 모델이 “테스트 통과”라고 썼다는
-사실만으로 `verified`가 될 수 없다. `verified`는 Tool Runtime 또는 명시적
-validator가 남긴 hash-bound evidence에만 사용한다. 현재 구현에서는 실행 전에
-Control Plane이 exact call/tool/input과 run/attempt를 등록해 발급한 1회용
+사실만으로 `verified`가 될 수 없다. `runtime_compiled`가 envelope 형식과 한계를
+소유하더라도 제작자가 보고한 check는 여전히 `claimed`다. `verified`는 Tool
+Runtime 또는 명시적 validator가 남긴 hash-bound evidence에만 사용한다. 현재
+구현에서는 실행 전에 Control Plane이 exact call/tool/input과 run/attempt를
+등록해 발급한 1회용
 준비 영수증과, 실제 Tool Runtime이 실행 뒤 같은 프로세스에서 봉인한
 비직렬화 capability를 모두 확인한 evidence만 자동 판정에 사용한다. 단순
 `runner:*` actor 문자열, 직접 만든 성공 레코드, 소비된 영수증 재사용, v11 이전의
@@ -67,9 +78,16 @@ Control Plane이 exact call/tool/input과 run/attempt를 등록해 발급한 1�
 
 결정은 subject hash뿐 아니라 contract hash, evidence-set hash, criterion
 results, exception codes/severity/owner를 canonical하게 결박한 `packetHash`도
-정확히 일치해야 한다. 새 artifact 또는 새 결정 경계가 생기면 이전 packet과
-approval은 superseded된다. 브라우저는 raw artifact를 파싱해 검증 상태나
-요약을 발명하지 않고 서버가 만든 packet을 표시한다.
+정확히 일치해야 한다. 새 artifact, media type, producer report 또는 새 결정
+경계가 생기면 이전 packet과 approval은 superseded된다. 브라우저는 raw
+artifact를 파싱해 검증 상태나 요약을 발명하지 않고 서버가 만든 packet을
+표시한다.
+
+`DecisionReviewView`는 기준·근거·예외를 읽기 좋게 묶는 순수 projection이지
+artifact 대체물이 아니다. 사람에게 artifact 결정을 요청하는 모든 화면은
+packet이 결박한 **정확한 bounded artifact preview**도 함께 표시해야 하며,
+packet 또는 해당 artifact를 가져오지 못하면 결정 버튼을 활성화하지 않는다.
+제작자 보고서 역시 artifact와 구분해 표시한다.
 
 모든 artifact 결정과 tool 승인·거부는 `human:*` actor만 내릴 수 있다. artifact
 승인은 외부 쓰기·배포·네트워크 실행 승인을 대신하지 않는다. 사용자 입력
@@ -80,8 +98,34 @@ Control Plane에 기록한 뒤에만 재개된다.
 추정치이며 완료된 결정에만 남는 값이다. 로컬 audit export에 포함될 수 있으므로
 일반 운영 시간이나 판단 정확도로 해석하지 않는다. 정답이 없는 운영 기록으로
 결정 정확도나 품질 향상을 만들지 않는다.
-그 주장은 raw view와 Decision Packet을 블라인드 비교하고 sealed oracle을
-사후 결합하는 별도 인간 이해도 실험에서만 평가한다.
+현재의 `evaluate-decision-review`는 열 개의 고정 fictional case를 raw view와
+Decision Packet view로 한 번씩 비교하는 20-call Codex proxy 회귀 시험이다.
+기본은 dry plan이며 실제 호출에는 실행 파일 digest·model·limits·suite를 결박한
+정확한 plan hash 승인이 필요하다. 이 결과는 해당 고정 suite와 reviewer에 대한
+설명적 개발 신호일 뿐 사람의 이해도, 인과효과, 통계적 유의성 또는 운영 승인을
+증명하지 않는다. 세부 계약은
+`docs/DECISION-REVIEW-PROXY-BENCHMARK.md`와 ADR 0021에 기록한다.
+
+이 시험의 재개도 새 권한 부여다. quota/rate capacity 또는 인증 경계는 child가
+종료된 뒤 clean pause로 기록할 수 있다. 운영자 signal은 다음 invocation 기록 전,
+즉 호출 사이에서 관찰됐을 때만 재개 가능하다. active model call 중 Ctrl+C는
+결과 불명으로 fail-closed 처리한다. 완료된 schedule prefix만 불변으로 봉인하고,
+다음 model call 전에 invocation을 먼저 flush해 기록한다. `running`, `failed`, active
+invocation 보유 또는 종료 여부가 불명인 checkpoint는 자동 재시도하지 않는다.
+정상 `paused` checkpoint만 `.chartermesh/evaluations/<benchmarkId>/checkpoint.json`
+에서 읽어 `--resume --account-context same|changed|unknown` dry plan을 만들고,
+남은 호출 전에는 새 `RESUME_PLAN_HASH`를 정확히 승인받는다. model, executable
+digest, limits, suite, protocol, source digest가 바뀌면 재개할 수 없으며 source
+변경 뒤 이전 plan hash는 폐기된다. 계정명·email·auth path·credential 또는
+credential hash는 저장하지 않는다. account context는 운영자 선언일 뿐 검증된
+identity가 아니다. 모든 resume은 새 실행 segment이므로 `same` 선언이어도 strict
+uninterrupted single-reviewer benefit 주장을 금지하고, `changed`나 `unknown`은
+계정 연속성 불확실성도 추가로 표시한다. 각 segment는 source checkpoint, 앞선
+segment chain, process-attempt 수, resume approval hash를 결박하고 새 호출 전
+exclusive used-approval receipt를 만든다. 최종 완료 report만 exports에 쓰며
+checkpoint와 receipt는 공개 산출물이 아니다. 이 로컬 hash chain은 디지털 서명이
+아니며 악의적인 동시 로컬 writer나 전체 상태 디렉터리 rollback 방어를 주장하지
+않는다.
 
 ## 범용 적용·팀 콘솔 갱신 — 2026-07-29
 
@@ -1850,7 +1894,10 @@ the default artifact mode:
   artifact mode. The model supplies bounded human-readable content; the
   runtime deterministically owns the versioned envelope, required fields,
   canonical JSON, and size limits. The existing `model_json` mode remains the
-  default.
+  default. In this slice `runtime_compiled` is exposed through the
+  `BuiltInManagedRunner` API only; there is no user-facing CLI or runtime JSON
+  switch yet. Documentation must not imply that ordinary `chartermesh run`
+  selects it.
 - Empty model content compiles to an explicit low-confidence artifact and
   risk. It is structurally valid but must not be counted as successful work.
 - The opt-in execution evaluator creates isolated temporary Git repositories,

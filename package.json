@@ -1,6 +1,6 @@
 {
   "name": "chartermesh",
-  "version": "0.0.7-alpha.1",
+  "version": "0.0.8-alpha.1",
   "private": false,
   "description": "Provider-neutral organization-as-code control plane for AI work",
   "license": "Apache-2.0",
@@ -23,9 +23,13 @@
     "scripts/windows-sandbox/*.mjs",
     "BOOTSTRAP.md",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE",
     "llms.txt",
     "AGENTS.md",
+    "docs/",
+    "schemas/",
     "skills/"
   ],
   "bin": {
@@ -41,7 +45,7 @@
     "chartermesh": "node bin/chartermesh.mjs",
     "build:package": "node scripts/build-package.mjs",
     "lint": "node scripts/check-boundaries.mjs",
-    "test": "node --test packages/adapter-sdk/test/negotiate.test.ts packages/orgspec/test/validator.test.ts packages/compiler/test/plan.test.ts packages/compiler/test/file-transaction.test.ts packages/control-plane/test/control-plane.test.ts packages/control-plane/test/backup.test.ts packages/control-plane/test/multiprocess.test.ts packages/runtime/test/runtime-config.test.ts packages/runtime/test/scheduler.test.ts packages/runtime/test/managed-runner.test.ts packages/runtime/test/artifact-compiler.test.ts packages/runtime/test/tool-runtime.test.ts packages/runtime/test/web-search.test.ts packages/runtime/test/portable-skills.test.ts packages/runtime/test/peer-team-controller.test.ts adapters/model-engines/openai-compatible/test/adapter.test.ts adapters/model-engines/command-process/test/adapter.test.ts apps/cli/test/code-evaluation-suite.test.ts apps/cli/test/code-evaluation-sandbox.test.ts apps/cli/test/code-evaluation-evaluator.test.ts apps/cli/test/evaluate-collaboration.test.ts apps/cli/test/evaluate-execution.test.ts apps/cli/test/codex-proxy.test.ts apps/cli/test/workflow-evaluation-suite.test.ts apps/cli/test/workflow-evaluation-trajectory.test.ts apps/cli/test/workflow-evaluation-model-executors.test.ts apps/cli/test/workflow-evaluation-code-adapters.test.ts apps/cli/test/workflow-evaluation-control-plane.test.ts apps/cli/test/workflow-evaluation-runner.test.ts apps/cli/test/workflow-evaluation-cli.test.ts apps/cli/test/cli-e2e.test.ts apps/dashboard/test/server.test.ts",
+    "test": "node --test packages/adapter-sdk/test/negotiate.test.ts packages/orgspec/test/validator.test.ts packages/compiler/test/plan.test.ts packages/compiler/test/file-transaction.test.ts packages/control-plane/test/control-plane.test.ts packages/control-plane/test/backup.test.ts packages/control-plane/test/multiprocess.test.ts packages/runtime/test/runtime-config.test.ts packages/runtime/test/scheduler.test.ts packages/runtime/test/managed-runner.test.ts packages/runtime/test/artifact-compiler.test.ts packages/runtime/test/tool-runtime.test.ts packages/runtime/test/web-search.test.ts packages/runtime/test/portable-skills.test.ts packages/runtime/test/peer-team-controller.test.ts adapters/model-engines/openai-compatible/test/adapter.test.ts adapters/model-engines/command-process/test/adapter.test.ts apps/cli/test/code-evaluation-suite.test.ts apps/cli/test/code-evaluation-sandbox.test.ts apps/cli/test/code-evaluation-evaluator.test.ts apps/cli/test/evaluate-collaboration.test.ts apps/cli/test/evaluate-execution.test.ts apps/cli/test/codex-proxy.test.ts apps/cli/test/workflow-evaluation-suite.test.ts apps/cli/test/workflow-evaluation-trajectory.test.ts apps/cli/test/workflow-evaluation-model-executors.test.ts apps/cli/test/workflow-evaluation-code-adapters.test.ts apps/cli/test/workflow-evaluation-control-plane.test.ts apps/cli/test/workflow-evaluation-runner.test.ts apps/cli/test/workflow-evaluation-cli.test.ts apps/cli/test/decision-review-evaluation-suite.test.ts apps/cli/test/decision-review-evaluation-runner.test.ts apps/cli/test/decision-review-evaluation-resume.test.ts apps/cli/test/decision-review-evaluation-cli.test.ts apps/cli/test/cli-e2e.test.ts apps/dashboard/test/server.test.ts",
     "evaluate:execution": "node scripts/run-execution-evaluation.mjs",
     "evaluate:code:generate": "node scripts/run-code-generation-stage.mjs",
     "evaluate:code:run": "node scripts/run-code-sandbox-evaluation.mjs",

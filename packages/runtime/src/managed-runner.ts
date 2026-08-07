@@ -17,6 +17,20 @@ export interface ManagedRunResult {
   hostRunId: string;
   inference: InferenceResult;
   toolEvidence: ToolExecutionEvidence[];
+  artifactSubmission: {
+    content: string;
+    mediaType: string;
+    producerReport: {
+      apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1";
+      source: "model_reported" | "runtime_compiled";
+      summary: string;
+      deliverable: string;
+      reportedChecks: string[];
+      reportedRisks: string[];
+      nextActions: string[];
+      confidence: "low" | "medium" | "high";
+    };
+  };
 }
 
 export interface StructuredArtifact {
@@ -100,7 +114,17 @@ export function parseStructuredArtifact(
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
+  const allowedKeys = new Set([
+    "apiVersion",
+    "summary",
+    "deliverable",
+    "checks",
+    "risks",
+    "nextActions",
+    "confidence",
+  ]);
   if (
+    Object.keys(record).some((key) => !allowedKeys.has(key)) ||
     record.apiVersion !== "chartermesh.dev/structured-artifact/v1alpha1" ||
     typeof record.summary !== "string" ||
     record.summary.trim().length === 0 ||
@@ -115,7 +139,15 @@ export function parseStructuredArtifact(
   ) {
     return null;
   }
-  return record as unknown as StructuredArtifact;
+  return {
+    apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+    summary: record.summary.trim(),
+    deliverable: record.deliverable.trim(),
+    checks: record.checks.map((entry) => entry.trim()),
+    risks: record.risks.map((entry) => entry.trim()),
+    nextActions: record.nextActions.map((entry) => entry.trim()),
+    confidence: record.confidence as StructuredArtifact["confidence"],
+  };
 }
 
 function addUsage(
@@ -212,6 +244,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
       promise: Promise<{
         inference: InferenceResult;
         toolEvidence: ToolExecutionEvidence[];
+        artifactSubmission: ManagedRunResult["artifactSubmission"];
       }>;
       cleanup: () => void;
     }
@@ -360,6 +393,20 @@ export class BuiltInManagedRunner implements ManagedRunner {
             text: compiled.canonicalText,
           },
           toolEvidence: toolLoop?.evidence ?? [],
+          artifactSubmission: {
+            content: compiled.artifact.deliverable,
+            mediaType: "text/plain",
+            producerReport: {
+              apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
+              source: "runtime_compiled",
+              summary: compiled.artifact.summary,
+              deliverable: compiled.artifact.deliverable,
+              reportedChecks: compiled.artifact.checks,
+              reportedRisks: compiled.artifact.risks,
+              nextActions: compiled.artifact.nextActions,
+              confidence: compiled.artifact.confidence,
+            },
+          },
         };
       }
       let artifact = parseStructuredArtifact(first.text);
@@ -370,6 +417,20 @@ export class BuiltInManagedRunner implements ManagedRunner {
             text: `${JSON.stringify(artifact, null, 2)}\n`,
           },
           toolEvidence: toolLoop?.evidence ?? [],
+          artifactSubmission: {
+            content: `${JSON.stringify(artifact, null, 2)}\n`,
+            mediaType: "text/plain",
+            producerReport: {
+              apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
+              source: "model_reported",
+              summary: artifact.summary,
+              deliverable: artifact.deliverable,
+              reportedChecks: artifact.checks,
+              reportedRisks: artifact.risks,
+              nextActions: artifact.nextActions,
+              confidence: artifact.confidence,
+            },
+          },
         };
       }
       const repair = await options.engine.generate(
@@ -404,6 +465,20 @@ export class BuiltInManagedRunner implements ManagedRunner {
           usage: addUsage(first.usage, repair.usage),
         },
         toolEvidence: toolLoop?.evidence ?? [],
+        artifactSubmission: {
+          content: `${JSON.stringify(artifact, null, 2)}\n`,
+          mediaType: "text/plain",
+          producerReport: {
+            apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
+            source: "model_reported",
+            summary: artifact.summary,
+            deliverable: artifact.deliverable,
+            reportedChecks: artifact.checks,
+            reportedRisks: artifact.risks,
+            nextActions: artifact.nextActions,
+            confidence: artifact.confidence,
+          },
+        },
       };
     })();
     this.pending.set(hostRunId, { controller, promise, cleanup });

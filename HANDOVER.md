@@ -7,7 +7,7 @@
   projection boundaries.
 - OrgSpec, the SQLite Control Plane, the safe Tool Runtime, recoverable apply,
   operational backup/audit controls, the reviewed-work dashboard, and a
-  dependency-free package build are present at `0.0.6-alpha.1`.
+  dependency-free package build are present at `0.0.8-alpha.1`.
 - `ModelEngine`, `AgentHost`, and `ManagedRunner` are separate contracts;
   generic and fake engines are the primary foundation, while Codex and Claude
   Code remain optional host adapters.
@@ -42,6 +42,11 @@ git status --short
 10. Runtime schema validation, durable invocation start/finish and shared
     cancellation, cursor pagination/archive, streaming audit export, retryable
     outbox delivery, and an opt-in no-work-safe local scheduler.
+11. Decision Packet v1alpha2, artifact-producer sidecars, decision-centered
+    operator queues, and the fixed decision-review proxy benchmark.
+12. Checkpointed benchmark resume with exact plan/suite/config hashes, segment
+    lineage, invocation-prefix verification, and fail-closed interruption
+    handling.
 
 ## Next implementation slice
 
@@ -57,8 +62,8 @@ git status --short
 
 ## Rollback
 
-Database migration 7 marks the durable-runtime slice; older known schemas
-receive an automatic SQLite snapshot before migration. File transactions
+Database migration 12 marks the decision-centered review slice; older known
+schemas receive an automatic SQLite snapshot before migration. File transactions
 recover automatically from `.chartermesh/.transactions`; use
 `chartermesh recover` rather than deleting journal or backup files. Revert
 future source changes with a new commit; do not delete user files or rewrite

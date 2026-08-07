@@ -23,7 +23,10 @@ private paths, or user data.
 - Loopback-only dashboard with Host, Origin, JSON media-type, body-size,
   per-process session-token, and request-rate checks
 - Generation fencing for runner artifact submission
-- Human review bound to the exact immutable artifact hash
+- Human decisions bound to the exact immutable Decision Packet hash. For an
+  artifact review, that packet separately binds the artifact bytes and media
+  type, producer-report hash, evidence-set hash, WorkItem version, and
+  projection version.
 - OrgSpec tool allowlists, project-relative workspace roots, symbolic-link
   rejection, and hard iteration bounds
 - Exact-call human approval for every built-in workspace write

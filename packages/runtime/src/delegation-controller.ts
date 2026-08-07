@@ -172,6 +172,9 @@ export class DelegationController {
     };
     const stages: DelegatedStage[] = [];
     const toolEvidence: DelegatedRunResult["toolEvidence"] = [];
+    let finalArtifactSubmission:
+      | DelegatedRunResult["artifactSubmission"]
+      | undefined;
     for (const [index, role] of roles.entries()) {
       if (options.signal?.aborted) {
         throw options.signal.reason ?? new Error("RUN_CANCELED");
@@ -214,6 +217,7 @@ export class DelegationController {
         };
         stages.push(stage);
         toolEvidence.push(...result.toolEvidence);
+        finalArtifactSubmission = result.artifactSubmission;
         await options.lifecycle?.finishStage({
           role,
           attemptId,
@@ -232,11 +236,14 @@ export class DelegationController {
       }
     }
     const final = stages.at(-1);
-    if (!final) throw new Error("DELEGATION_PRODUCED_NO_RESULT");
+    if (!final || !finalArtifactSubmission) {
+      throw new Error("DELEGATION_PRODUCED_NO_RESULT");
+    }
     return {
       hostRunId: `delegated-${randomUUID()}`,
       inference: final.inference,
       toolEvidence,
+      artifactSubmission: finalArtifactSubmission,
       stages,
       generationBudget: {
         maxStageCalls: roles.length,

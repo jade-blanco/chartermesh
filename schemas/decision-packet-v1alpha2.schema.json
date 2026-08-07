@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chartermesh.dev/schemas/decision-packet-v1alpha2.schema.json",
+  "title": "CharterMesh Decision Packet v1alpha2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "workItemId",
+    "kind",
+    "question",
+    "subject",
+    "producerReport",
+    "criteria",
+    "evidence",
+    "exceptions",
+    "requestedDecision",
+    "binding"
+  ],
+  "properties": {
+    "apiVersion": { "const": "chartermesh.dev/decision-packet/v1alpha2" },
+    "workItemId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "kind": { "enum": ["artifact_review", "tool_execution", "user_input"] },
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "pattern": "\\S",
+      "not": { "pattern": "\\u0000" }
+    },
+    "subject": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "artifactId", "artifactHash", "mediaType"],
+          "properties": {
+            "kind": { "const": "artifact" },
+            "artifactId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160,
+              "pattern": "\\S",
+              "not": { "pattern": "\\u0000" }
+            },
+            "artifactHash": { "$ref": "#/$defs/sha256" },
+            "mediaType": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "\\S",
+              "not": { "pattern": "\\u0000" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "callHash", "toolName"],
+          "properties": {
+            "kind": { "const": "tool_call" },
+            "callHash": { "$ref": "#/$defs/sha256" },
+            "toolName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "\\S",
+              "not": { "pattern": "\\u0000" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference"],
+          "properties": {
+            "kind": { "const": "user_input" },
+            "reference": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4000,
+              "pattern": "\\S",
+              "not": { "pattern": "\\u0000" }
+            }
+          }
+        }
+      ]
+    },
+    "producerReport": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "apiVersion",
+        "source",
+        "summary",
+        "deliverable",
+        "reportedChecks",
+        "reportedRisks",
+        "nextActions",
+        "confidence"
+      ],
+      "properties": {
+        "apiVersion": { "const": "chartermesh.dev/artifact-producer-report/v1alpha1" },
+        "source": { "enum": ["model_reported", "runtime_compiled"] },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S",
+          "not": { "pattern": "\\u0000" }
+        },
+        "deliverable": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000,
+          "pattern": "\\S",
+          "not": { "pattern": "\\u0000" }
+        },
+        "reportedChecks": { "$ref": "#/$defs/stringList" },
+        "reportedRisks": { "$ref": "#/$defs/stringList" },
+        "nextActions": { "$ref": "#/$defs/stringList" },
+        "confidence": { "enum": ["low", "medium", "high", "unknown"] }
+      }
+    },
+    "criteria": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterionId", "status", "evidenceRefs", "explanation"],
+        "properties": {
+          "criterionId": { "type": "string", "maxLength": 96 },
+          "status": { "enum": ["satisfied", "failed", "unverified"] },
+          "evidenceRefs": { "$ref": "#/$defs/idList" },
+          "explanation": { "type": "string", "maxLength": 4000 }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "source", "status", "description", "createdAt"],
+        "properties": {
+          "id": { "type": "string", "maxLength": 160 },
+          "source": { "enum": ["control_plane", "tool_runtime", "host_validator", "model_reported"] },
+          "status": { "enum": ["verified", "failed", "unknown", "claimed"] },
+          "description": { "type": "string", "maxLength": 4000 },
+          "runId": { "type": "string", "maxLength": 160 },
+          "attemptId": { "type": "string", "maxLength": 160 },
+          "receiptId": { "type": "string", "maxLength": 160 },
+          "provenance": { "const": "control_plane_receipt" },
+          "toolName": { "type": "string", "maxLength": 256 },
+          "validatorId": { "type": "string", "maxLength": 256 },
+          "inputHash": { "$ref": "#/$defs/sha256" },
+          "outputHash": { "$ref": "#/$defs/sha256" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "severity", "owner", "message", "resolution", "evidenceRefs"],
+        "properties": {
+          "code": {
+            "enum": [
+              "CONTRACT_INCOMPLETE",
+              "ARTIFACT_UNSTRUCTURED",
+              "EVIDENCE_MISSING",
+              "EVIDENCE_FAILED",
+              "MODEL_REPORTED_ONLY",
+              "LOW_CONFIDENCE",
+              "UNRESOLVED_RISK"
+            ]
+          },
+          "severity": { "enum": ["info", "warning", "blocking"] },
+          "owner": { "enum": ["human", "role", "system"] },
+          "message": { "type": "string", "maxLength": 4000 },
+          "resolution": { "type": "string", "maxLength": 4000 },
+          "evidenceRefs": { "$ref": "#/$defs/idList" }
+        }
+      }
+    },
+    "requestedDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor", "options", "cta"],
+      "properties": {
+        "actor": { "const": "human" },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["approve", "changes_requested", "reject", "provide_input"] }
+        },
+        "cta": { "type": "string", "maxLength": 4000 }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractHash",
+        "subjectHash",
+        "producerReportHash",
+        "evidenceSetHash",
+        "workItemVersion",
+        "projectionVersion",
+        "packetHash"
+      ],
+      "properties": {
+        "contractHash": { "$ref": "#/$defs/sha256" },
+        "subjectHash": { "$ref": "#/$defs/sha256" },
+        "producerReportHash": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "evidenceSetHash": { "$ref": "#/$defs/sha256" },
+        "workItemVersion": { "type": "integer", "minimum": 1 },
+        "projectionVersion": { "const": "v1alpha2" },
+        "packetHash": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "producerReport": { "type": "null" } } },
+      "then": {
+        "properties": {
+          "binding": {
+            "properties": { "producerReportHash": { "type": "null" } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "producerReport": { "type": "object" } } },
+      "then": {
+        "properties": {
+          "binding": {
+            "properties": {
+              "producerReportHash": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "artifact_review" } } },
+      "then": {
+        "properties": {
+          "subject": { "properties": { "kind": { "const": "artifact" } } },
+          "requestedDecision": {
+            "properties": {
+              "options": { "const": ["approve", "changes_requested", "reject"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "tool_execution" } } },
+      "then": {
+        "properties": {
+          "subject": { "properties": { "kind": { "const": "tool_call" } } },
+          "producerReport": { "type": "null" },
+          "requestedDecision": {
+            "properties": { "options": { "const": ["approve", "reject"] } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "user_input" } } },
+      "then": {
+        "properties": {
+          "subject": { "properties": { "kind": { "const": "user_input" } } },
+          "producerReport": { "type": "null" },
+          "requestedDecision": {
+            "properties": { "options": { "const": ["provide_input"] } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "stringList": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000,
+        "pattern": "\\S",
+        "not": { "pattern": "\\u0000" }
+      }
+    },
+    "idList": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "type": "string", "maxLength": 160 }
+    }
+  }
+}

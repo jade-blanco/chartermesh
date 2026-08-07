@@ -199,7 +199,7 @@ export function createWebSearchTools(
             headers: {
               accept: "application/json",
               "content-type": "application/x-www-form-urlencoded",
-              "user-agent": "CharterMesh/0.0.7",
+              "user-agent": "CharterMesh/0.0.8-alpha.1",
             },
             body,
             signal: controller.signal,

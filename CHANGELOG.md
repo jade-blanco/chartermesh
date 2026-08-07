@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.0.8-alpha.1 — 2026-08-07
+
+- Reframed the primary product surface around verifiable human decisions and
+  separate human, role, waiting, and history attention queues.
+- Added Decision Packet v1alpha2 with exact artifact/media-type identity, a
+  separately hashed producer-report sidecar, completion-criterion results,
+  explicit exceptions, and claimed-versus-verified evidence provenance.
+- Migrated the SQLite Control Plane to schema v12 with safety backups while
+  preserving v11 artifacts that have no producer report.
+- Added a dry-by-default fixed Decision Packet review benchmark whose plan
+  binds the suite, reviewer executable/model, protocols, limits, and harness
+  source before any live Codex call.
+- Added fail-closed decision-review checkpoints and exact resume approvals for
+  settled quota, rate-limit, and authentication pauses. Completed prefixes,
+  execution segments, process attempts, used approvals, and final reports are
+  hash chained; active or unknown calls are never replayed automatically.
+- Hardened decision-review state files against reparse-point escapes, bounded
+  reads, stale-lock ambiguity, executable drift, unsupported isolation flags,
+  and accidental stderr or account-identifier disclosure.
+- Kept resumed or account-switched benchmark results useful as resilience
+  evidence while preventing an uninterrupted single-reviewer benefit claim.
+
 ## 0.0.7-alpha.1 — 2026-07-30
 
 - Bundled four Apache-2.0, provider-neutral Agent Skills and installed them

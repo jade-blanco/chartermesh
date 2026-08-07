@@ -30,6 +30,20 @@ const manifest: ModelEngine["manifest"] = {
   ],
 };
 
+test("structured artifacts reject unknown fields instead of persisting them", () => {
+  const value = {
+    apiVersion: "chartermesh.dev/structured-artifact/v1alpha1",
+    summary: "Bounded",
+    deliverable: "Visible result",
+    checks: [],
+    risks: [],
+    nextActions: [],
+    confidence: "high",
+    hiddenPayload: "must not survive",
+  };
+  assert.equal(parseStructuredArtifact(JSON.stringify(value)), null);
+});
+
 test("built-in managed runner executes an arbitrary model engine", async () => {
   const runner = new BuiltInManagedRunner();
   const handle = await runner.start(
@@ -51,6 +65,10 @@ test("built-in managed runner executes an arbitrary model engine", async () => {
   assert.equal(handle.status, "running");
   assert.match(result.inference.text, /Simulated CharterMesh result/u);
   assert.equal(result.inference.usage.cost, 0);
+  assert.equal(
+    result.artifactSubmission.producerReport.source,
+    "model_reported",
+  );
 });
 
 test("small-model prompt separates performed checks from proposed checks", async () => {
@@ -192,6 +210,15 @@ test("runtime artifact compiler owns the final envelope", async () => {
     artifact?.deliverable,
     "A human-readable bounded deliverable.",
   );
+  assert.equal(
+    result.artifactSubmission.producerReport.source,
+    "runtime_compiled",
+  );
+  assert.equal(
+    result.artifactSubmission.content,
+    "A human-readable bounded deliverable.",
+  );
+  assert.notEqual(result.artifactSubmission.content, result.inference.text);
 });
 
 test("runner cancellation aborts the active model request", async () => {

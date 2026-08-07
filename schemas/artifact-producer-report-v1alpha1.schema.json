@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chartermesh.dev/schemas/artifact-producer-report-v1alpha1.schema.json",
+  "title": "CharterMesh Artifact Producer Report v1alpha1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "source",
+    "summary",
+    "deliverable",
+    "reportedChecks",
+    "reportedRisks",
+    "nextActions",
+    "confidence"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "chartermesh.dev/artifact-producer-report/v1alpha1"
+    },
+    "source": {
+      "enum": ["model_reported", "runtime_compiled"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "pattern": "\\S",
+      "not": { "pattern": "\\u0000" }
+    },
+    "deliverable": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20000,
+      "pattern": "\\S",
+      "not": { "pattern": "\\u0000" }
+    },
+    "reportedChecks": { "$ref": "#/$defs/stringList" },
+    "reportedRisks": { "$ref": "#/$defs/stringList" },
+    "nextActions": { "$ref": "#/$defs/stringList" },
+    "confidence": {
+      "enum": ["low", "medium", "high", "unknown"]
+    }
+  },
+  "$defs": {
+    "stringList": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000,
+        "pattern": "\\S",
+        "not": { "pattern": "\\u0000" }
+      }
+    }
+  }
+}

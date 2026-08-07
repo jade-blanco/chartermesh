@@ -34,7 +34,7 @@ export function openControlPlaneDatabase(
         )
         .get() as { version: number };
       const priorVersion = Number(row.version);
-      if (priorVersion > 0 && priorVersion < 11) {
+      if (priorVersion > 0 && priorVersion < 12) {
         createControlPlaneBackup(
           database,
           join(dirname(path), "backups"),
@@ -141,6 +141,9 @@ export function openControlPlaneDatabase(
       storage_name TEXT NOT NULL,
       media_type TEXT NOT NULL,
       byte_size INTEGER NOT NULL,
+      producer_report_json TEXT,
+      producer_report_hash TEXT,
+      producer_report_byte_size INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       UNIQUE(run_id, sha256),
       FOREIGN KEY(work_item_id) REFERENCES work_items(id),
@@ -537,6 +540,38 @@ export function openControlPlaneDatabase(
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (11, ?)
+    `)
+    .run(new Date().toISOString());
+  const artifactReportColumns = database
+    .prepare("PRAGMA table_info(artifacts)")
+    .all() as Array<{ name: string }>;
+  if (
+    !artifactReportColumns.some(
+      ({ name }) => name === "producer_report_json",
+    )
+  ) {
+    database.exec("ALTER TABLE artifacts ADD COLUMN producer_report_json TEXT");
+  }
+  if (
+    !artifactReportColumns.some(
+      ({ name }) => name === "producer_report_hash",
+    )
+  ) {
+    database.exec("ALTER TABLE artifacts ADD COLUMN producer_report_hash TEXT");
+  }
+  if (
+    !artifactReportColumns.some(
+      ({ name }) => name === "producer_report_byte_size",
+    )
+  ) {
+    database.exec(
+      "ALTER TABLE artifacts ADD COLUMN producer_report_byte_size INTEGER NOT NULL DEFAULT 0",
+    );
+  }
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (12, ?)
     `)
     .run(new Date().toISOString());
   return database;

@@ -1,7 +1,7 @@
 # Implementation roadmap
 
-Current milestone: `0.0.7-alpha.1`, portable skills, evidence-grounded local
-models, and approval-gated optional search.
+Current milestone: `0.0.8-alpha.1`, verifiable Decision Packets, safe
+decision-review resume, and provider-neutral local operations.
 
 ## Completed foundation
 

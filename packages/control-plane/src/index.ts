@@ -18,6 +18,9 @@ export {
   buildDecisionPacket,
   canonicalHash,
   createDecisionContract,
+  normalizeArtifactProducerReport,
+  parseLegacyArtifactProducerReport,
+  projectDecisionReviewView,
 } from "./decision-packet.ts";
 export {
   dispatchOutboxBatch,
@@ -28,6 +31,7 @@ export type {
   AuditRecord,
   AcceptanceCriterion,
   ArtifactReviewDecision,
+  ArtifactProducerReport,
   ArtifactEvidence,
   AttemptRecord,
   ModelInvocationRecord,
@@ -43,6 +47,7 @@ export type {
   DecisionKind,
   DecisionPacket,
   DecisionPacketEvidence,
+  DecisionReviewView,
   DecisionSubject,
   EvidenceRequirement,
   EvidenceSource,

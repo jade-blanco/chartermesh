@@ -124,6 +124,17 @@ export interface DecisionPacketEvidence {
   createdAt: string;
 }
 
+export interface ArtifactProducerReport {
+  apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1";
+  source: "model_reported" | "runtime_compiled";
+  summary: string;
+  deliverable: string;
+  reportedChecks: string[];
+  reportedRisks: string[];
+  nextActions: string[];
+  confidence: "low" | "medium" | "high" | "unknown";
+}
+
 export interface DecisionCriterionResult {
   criterionId: string;
   status: "satisfied" | "failed" | "unverified";
@@ -165,20 +176,12 @@ export type DecisionSubject =
     };
 
 export interface DecisionPacket {
-  apiVersion: "chartermesh.dev/decision-packet/v1alpha1";
+  apiVersion: "chartermesh.dev/decision-packet/v1alpha2";
   workItemId: string;
   kind: DecisionKind;
   question: string;
   subject: DecisionSubject;
-  producerReport: {
-    source: "model_reported" | "runtime_compiled";
-    summary: string;
-    deliverable: string;
-    reportedChecks: string[];
-    reportedRisks: string[];
-    nextActions: string[];
-    confidence: "low" | "medium" | "high" | "unknown";
-  } | null;
+  producerReport: ArtifactProducerReport | null;
   criteria: DecisionCriterionResult[];
   evidence: DecisionPacketEvidence[];
   exceptions: DecisionException[];
@@ -192,11 +195,35 @@ export interface DecisionPacket {
   binding: {
     contractHash: string;
     subjectHash: string;
+    producerReportHash: string | null;
     evidenceSetHash: string;
     workItemVersion: number;
-    projectionVersion: "v1alpha1";
+    projectionVersion: "v1alpha2";
     packetHash: string;
   };
+}
+
+export interface DecisionReviewView {
+  apiVersion: "chartermesh.dev/decision-review-view/v1alpha1";
+  workItemId: string;
+  kind: DecisionKind;
+  question: string;
+  subject: DecisionSubject;
+  result: ArtifactProducerReport | null;
+  criteria: DecisionCriterionResult[];
+  evidence: {
+    verified: DecisionPacketEvidence[];
+    claimed: DecisionPacketEvidence[];
+    failed: DecisionPacketEvidence[];
+    unknown: DecisionPacketEvidence[];
+  };
+  exceptions: {
+    blocking: DecisionException[];
+    warnings: DecisionException[];
+    informational: DecisionException[];
+  };
+  requestedDecision: DecisionPacket["requestedDecision"];
+  binding: DecisionPacket["binding"];
 }
 
 export interface DashboardProjection {
@@ -243,6 +270,9 @@ export interface ArtifactEvidence {
   mediaType: string;
   byteSize: number;
   content: string;
+  producerReport?: ArtifactProducerReport;
+  producerReportHash?: string;
+  producerReportByteSize?: number;
   createdAt: string;
 }
 

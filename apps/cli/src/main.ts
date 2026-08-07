@@ -3,15 +3,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, resolve, join, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FakeModelEngine } from "../../../adapters/model-engines/fake/src/index.ts";
 import {
@@ -74,6 +81,7 @@ import {
 import {
   CodexCliFeedbackProvider,
   CodexExecModelEngine,
+  CodexProxyError,
 } from "./workflow-evaluation/codex-proxy.ts";
 import {
   generateReferenceCodeWorkflowSuite,
@@ -95,9 +103,29 @@ import type {
   WorkflowTrajectoryLimits,
   WorkflowTrajectoryReport,
 } from "./workflow-evaluation/types.ts";
+import {
+  DECISION_REVIEW_BENCHMARK_SUITE_ID,
+  DecisionReviewPauseError,
+  createDecisionReviewEvaluationPlan,
+  runDecisionReviewEvaluation,
+  type DecisionReviewExecutionDisclosure,
+  type DecisionReviewRunSegment,
+} from "./decision-review-evaluation/runner.ts";
+import {
+  assertDecisionReviewResumePlan,
+  createDecisionReviewActiveInvocation,
+  createDecisionReviewResumeExecutionSegment,
+  createDecisionReviewResumePlan,
+  createInitialDecisionReviewCheckpoint,
+  decisionReviewCompletedPrefixHash,
+  parseDecisionReviewCheckpoint,
+  type DecisionReviewAccountContext,
+  type DecisionReviewCheckpoint,
+  type DecisionReviewResumePlan,
+} from "./decision-review-evaluation/resume.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
-const CHARTERMESH_VERSION = "0.0.7-alpha.1";
+const CHARTERMESH_VERSION = "0.0.8-alpha.1";
 
 interface BootstrapFile {
   path: string;
@@ -211,6 +239,26 @@ export function compareVersions(left: string, right: string): number {
     return leftPart.localeCompare(rightPart);
   }
   return 0;
+}
+
+export function selectLatestPublishedVersion(payload: unknown): string | null {
+  if (!Array.isArray(payload)) return null;
+  let latest: string | null = null;
+  for (const candidate of payload) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const release = candidate as { draft?: unknown; tag_name?: unknown };
+    if (release.draft === true || typeof release.tag_name !== "string") {
+      continue;
+    }
+    const version = release.tag_name.trim().replace(/^v/u, "");
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u.test(version)) {
+      continue;
+    }
+    if (latest === null || compareVersions(version, latest) > 0) {
+      latest = version;
+    }
+  }
+  return latest;
 }
 
 function targetOf(args: string[]): string {
@@ -994,7 +1042,7 @@ async function version(args: string[]): Promise<number> {
     );
     try {
       const response = await fetch(
-        "https://api.github.com/repos/jade-blanco/chartermesh/releases/latest",
+        "https://api.github.com/repos/jade-blanco/chartermesh/releases?per_page=100",
         {
           headers: {
             accept: "application/vnd.github+json",
@@ -1004,8 +1052,10 @@ async function version(args: string[]): Promise<number> {
         },
       );
       if (!response.ok) throw new Error(`GitHub returned ${response.status}.`);
-      const payload = (await response.json()) as { tag_name?: string };
-      latestVersion = payload.tag_name?.replace(/^v/u, "") ?? null;
+      latestVersion = selectLatestPublishedVersion(await response.json());
+      if (latestVersion === null) {
+        throw new Error("GitHub returned no published semantic-version release.");
+      }
       updateCheck =
         latestVersion &&
         compareVersions(latestVersion, CHARTERMESH_VERSION) > 0
@@ -1761,7 +1811,9 @@ export async function runWork(
       }
       const submission = controlPlane.submitArtifact({
         id: candidate.id,
-        content: result.inference.text,
+        content: result.artifactSubmission.content,
+        mediaType: result.artifactSubmission.mediaType,
+        producerReport: result.artifactSubmission.producerReport,
         generation: claim.generation,
         actor: "runner:local",
         idempotencyKey: `cli:submit:${candidate.id}:${claim.generation}`,
@@ -2816,13 +2868,25 @@ function writeWorkflowStudyCheckpoint(
 ): void {
   mkdirSync(dirname(output), { recursive: true });
   const temporary = `${output}.${process.pid}.${randomUUID()}.tmp`;
+  let descriptor: number | undefined;
   try {
-    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-    });
+    descriptor = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+    writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
     renameSync(temporary, output);
+    let directoryDescriptor: number | undefined;
+    try {
+      directoryDescriptor = openSync(dirname(output), constants.O_RDONLY);
+      fsyncSync(directoryDescriptor);
+    } catch {
+      // Directory fsync is not available on every supported Windows filesystem.
+    } finally {
+      if (directoryDescriptor !== undefined) closeSync(directoryDescriptor);
+    }
   } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
     rmSync(temporary, { force: true });
   }
 }
@@ -2841,6 +2905,11 @@ function acquireWorkflowStudyLock(input: {
   path: string;
   planHash: string;
   recoverStale: boolean;
+  staleError?: string;
+  authorizeStaleRecovery?: (owner: {
+    planHash?: unknown;
+    pid?: unknown;
+  }) => void;
 }): { release(): void; recoveredStale: boolean } {
   mkdirSync(dirname(input.path), { recursive: true });
   const nonce = randomUUID();
@@ -2893,10 +2962,13 @@ function acquireWorkflowStudyLock(input: {
       }
       if (!input.recoverStale) {
         throw new Error(
-          "WORKFLOW_STUDY_STALE_LOCK: repeat with --restart-checkpoint only after confirming the earlier process stopped.",
+          input.staleError ??
+            "WORKFLOW_STUDY_STALE_LOCK: repeat with --restart-checkpoint only after confirming the earlier process stopped.",
         );
       }
-      if (owner.planHash !== input.planHash) {
+      if (input.authorizeStaleRecovery) {
+        input.authorizeStaleRecovery(owner);
+      } else if (owner.planHash !== input.planHash) {
         throw new Error("WORKFLOW_STUDY_STALE_LOCK_PLAN_MISMATCH");
       }
       renameSync(
@@ -2907,6 +2979,189 @@ function acquireWorkflowStudyLock(input: {
     }
   }
   throw new Error("WORKFLOW_STUDY_LOCK_ACQUISITION_FAILED");
+}
+
+const DECISION_REVIEW_MAX_STATE_BYTES = 16 * 1024 * 1024;
+
+function decisionReviewPathIsInside(root: string, candidate: string): boolean {
+  const rest = relative(root, candidate);
+  return (
+    rest === "" ||
+    (!isAbsolute(rest) && rest !== ".." && !rest.startsWith(`..${sep}`))
+  );
+}
+
+function assertDecisionReviewPathComponents(
+  target: string,
+  candidate: string,
+): void {
+  const lexicalTarget = resolve(target);
+  const lexicalCandidate = resolve(candidate);
+  if (!decisionReviewPathIsInside(lexicalTarget, lexicalCandidate)) {
+    throw new Error("DECISION_REVIEW_STATE_PATH_ESCAPE");
+  }
+  let canonicalTarget: string;
+  try {
+    canonicalTarget = realpathSync(lexicalTarget);
+  } catch {
+    throw new Error("DECISION_REVIEW_TARGET_INVALID");
+  }
+  const rest = relative(lexicalTarget, lexicalCandidate);
+  let cursor = lexicalTarget;
+  for (const component of rest === "" ? [] : rest.split(sep)) {
+    cursor = join(cursor, component);
+    if (!existsSync(cursor)) break;
+    const info = lstatSync(cursor);
+    if (info.isSymbolicLink()) {
+      throw new Error("DECISION_REVIEW_STATE_REPARSE_POINT_REJECTED");
+    }
+    const canonical = realpathSync(cursor);
+    if (!decisionReviewPathIsInside(canonicalTarget, canonical)) {
+      throw new Error("DECISION_REVIEW_STATE_PATH_ESCAPE");
+    }
+  }
+}
+
+function ensureDecisionReviewDirectory(
+  target: string,
+  directory: string,
+): void {
+  assertDecisionReviewPathComponents(target, directory);
+  mkdirSync(directory, { recursive: true });
+  assertDecisionReviewPathComponents(target, directory);
+  const info = lstatSync(directory);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("DECISION_REVIEW_STATE_DIRECTORY_INVALID");
+  }
+}
+
+function decisionReviewEvaluationPaths(target: string, benchmarkId: string) {
+  const directory = join(
+    statePaths(target).root,
+    "evaluations",
+    benchmarkId,
+  );
+  return {
+    directory,
+    approvals: join(directory, "used-approvals"),
+    plan: join(directory, "plan.json"),
+    checkpoint: join(directory, "checkpoint.json"),
+    lock: join(directory, "lock.json"),
+    output: join(statePaths(target).exports, `${benchmarkId}.json`),
+  };
+}
+
+function readBoundedRegularJson(
+  target: string,
+  path: string,
+  code: string,
+): unknown {
+  assertDecisionReviewPathComponents(target, path);
+  let before;
+  try {
+    before = lstatSync(path);
+  } catch {
+    throw new Error(`${code}: state file is unavailable`);
+  }
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    before.size < 2 ||
+    before.size > DECISION_REVIEW_MAX_STATE_BYTES
+  ) {
+    throw new Error(`${code}: state file is not a bounded regular file`);
+  }
+  let descriptor: number | undefined;
+  let contents: string;
+  try {
+    const noFollow =
+      typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+    descriptor = openSync(path, constants.O_RDONLY | noFollow);
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile() ||
+      opened.size < 2 ||
+      opened.size > DECISION_REVIEW_MAX_STATE_BYTES ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      throw new Error(`${code}: state file changed while opening`);
+    }
+    contents = readFileSync(descriptor, "utf8");
+  } catch {
+    throw new Error(`${code}: state file cannot be read safely`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+  try {
+    return JSON.parse(contents) as unknown;
+  } catch {
+    throw new Error(`${code}: state file is not valid JSON`);
+  }
+}
+
+function writeExclusiveJson(
+  target: string,
+  path: string,
+  value: unknown,
+): void {
+  assertDecisionReviewPathComponents(target, path);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+    );
+    writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fsyncSync(descriptor);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function persistDecisionReviewCheckpoint(
+  target: string,
+  path: string,
+  checkpoint: DecisionReviewCheckpoint,
+): DecisionReviewCheckpoint {
+  assertDecisionReviewPathComponents(target, path);
+  const parsed = parseDecisionReviewCheckpoint(checkpoint);
+  writeWorkflowStudyCheckpoint(path, parsed);
+  assertDecisionReviewPathComponents(target, path);
+  return parsed;
+}
+
+function decisionReviewExecutionDisclosure(
+  checkpoint: DecisionReviewCheckpoint,
+): DecisionReviewExecutionDisclosure {
+  return {
+    segments: structuredClone(checkpoint.segments),
+    processAttemptsBeforeRun: checkpoint.processAttempts,
+    nonScoringPauses: structuredClone(checkpoint.nonScoringPauses),
+  };
+}
+
+function decisionReviewFailureCode(error: unknown): string {
+  if (error instanceof CodexProxyError) return error.code;
+  if (error instanceof DecisionReviewPauseError) return error.code;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.match(/^([A-Z][A-Z0-9_]{2,80})/u)?.[1] ??
+    "DECISION_REVIEW_EXECUTION_FAILED";
+}
+
+function startDecisionReviewResume(
+  checkpoint: DecisionReviewCheckpoint,
+  resumePlan: DecisionReviewResumePlan,
+): DecisionReviewCheckpoint {
+  assertDecisionReviewResumePlan(resumePlan, checkpoint);
+  const next = structuredClone(checkpoint);
+  next.status = "running";
+  next.resumeGeneration = resumePlan.resumeGeneration;
+  next.segments.push(createDecisionReviewResumeExecutionSegment(resumePlan));
+  next.activeInvocation = null;
+  next.pause = null;
+  next.failure = null;
+  return parseDecisionReviewCheckpoint(next);
 }
 
 function assertRestartableWorkflowCheckpoint(
@@ -3398,6 +3653,491 @@ async function evaluateWorkflowCommand(
   }
 }
 
+async function evaluateDecisionReviewCommand(
+  target: string,
+  args: string[],
+): Promise<number> {
+  const requestedSuite =
+    option(args, "--suite") ?? DECISION_REVIEW_BENCHMARK_SUITE_ID;
+  if (requestedSuite !== DECISION_REVIEW_BENCHMARK_SUITE_ID) {
+    throw new Error(`Unknown decision-review suite '${requestedSuite}'.`);
+  }
+  const resumeRequested = has(args, "--resume");
+  const accountContextOption = option(args, "--account-context");
+  if (resumeRequested && !accountContextOption) {
+    throw new Error(
+      "Decision-review resume requires --account-context same, changed, or unknown.",
+    );
+  }
+  if (!resumeRequested && accountContextOption) {
+    throw new Error("--account-context is valid only together with --resume.");
+  }
+  if (
+    accountContextOption &&
+    !["same", "changed", "unknown"].includes(accountContextOption)
+  ) {
+    throw new Error(
+      "--account-context must be exactly same, changed, or unknown.",
+    );
+  }
+  const accountContext = accountContextOption as
+    | DecisionReviewAccountContext
+    | undefined;
+  const codexExecutable = option(args, "--codex-executable");
+  const codexSha256 = option(args, "--codex-sha256")?.toLowerCase() ?? null;
+  const codexModel = option(args, "--codex-model") ?? null;
+  const codexTimeoutMs = boundedIntegerOption(
+    args,
+    "--codex-timeout-ms",
+    120_000,
+    1_000,
+    900_000,
+  );
+  const codexMaxOutputBytes = boundedIntegerOption(
+    args,
+    "--codex-max-output-bytes",
+    1_048_576,
+    1,
+    16_777_216,
+  );
+  const anyReviewerBinding = Boolean(
+    codexExecutable || codexSha256 || codexModel,
+  );
+  const completeReviewerBinding = Boolean(
+    codexExecutable && codexSha256 && codexModel,
+  );
+  if (anyReviewerBinding && !completeReviewerBinding) {
+    throw new Error(
+      "Bind --codex-executable, --codex-sha256, and --codex-model together.",
+    );
+  }
+  if (resumeRequested && !completeReviewerBinding) {
+    throw new Error(
+      "Decision-review resume requires the exact original Codex executable, SHA-256, and model binding.",
+    );
+  }
+  const plan = createDecisionReviewEvaluationPlan({
+    reviewer: completeReviewerBinding
+      ? {
+          executableSha256: codexSha256,
+          modelId: codexModel,
+          timeoutMs: codexTimeoutMs,
+          maxOutputBytes: codexMaxOutputBytes,
+          engineProfileId: "codex-cli-decision-review",
+        }
+      : {
+          executableSha256: null,
+          modelId: null,
+          timeoutMs: null,
+          maxOutputBytes: null,
+          engineProfileId: null,
+        },
+  });
+  const paths = decisionReviewEvaluationPaths(target, plan.benchmarkId);
+  let resumePlan: DecisionReviewResumePlan | undefined;
+  let dryResumeCheckpoint: DecisionReviewCheckpoint | undefined;
+  if (resumeRequested) {
+    assertDecisionReviewPathComponents(target, paths.directory);
+    assertDecisionReviewPathComponents(target, dirname(paths.output));
+    if (existsSync(paths.output)) {
+      throw new Error("DECISION_REVIEW_ALREADY_COMPLETED");
+    }
+    dryResumeCheckpoint = parseDecisionReviewCheckpoint(
+      readBoundedRegularJson(
+        target,
+        paths.checkpoint,
+        "DECISION_REVIEW_CHECKPOINT_INVALID",
+      ),
+    );
+    const storedPlan = readBoundedRegularJson(
+      target,
+      paths.plan,
+      "DECISION_REVIEW_PLAN_INVALID",
+    );
+    if (
+      dryResumeCheckpoint.plan.planHash !== plan.planHash ||
+      JSON.stringify(storedPlan) !== JSON.stringify(dryResumeCheckpoint.plan)
+    ) {
+      throw new Error(
+        "DECISION_REVIEW_RESUME_BASE_PLAN_MISMATCH: source, model, executable hash, or limits changed",
+      );
+    }
+    resumePlan = createDecisionReviewResumePlan(
+      dryResumeCheckpoint,
+      accountContext!,
+    );
+  }
+
+  if (!has(args, "--live")) {
+    if (has(args, "--json")) {
+      writeJsonEnvelope(
+        resumeRequested
+          ? "evaluate-decision-review resume-plan"
+          : "evaluate-decision-review plan",
+        resumePlan ?? plan,
+      );
+    } else {
+      if (resumePlan) {
+        console.log(
+          `Decision-review resume plan ${resumePlan.benchmarkId}: ${resumePlan.completedCount}/20 scored calls sealed; sequence ${resumePlan.nextSequence} is next.`,
+        );
+        console.log(
+          `Account context: ${resumePlan.accountContext} (operator-declared, not identity-attested). No model was called.`,
+        );
+        console.log(`Resume approval token: ${resumePlan.resumePlanHash}`);
+      } else {
+        console.log(
+          `Decision-review plan ${plan.benchmarkId}: 10 fixed cases x 2 presentations = ${plan.plannedCalls} stateless calls.`,
+        );
+        console.log(
+          "No model was called. This is a Codex proxy product regression, not human or causal evidence.",
+        );
+        console.log(`Approval token: ${plan.planHash}`);
+      }
+    }
+    return 0;
+  }
+  if (!completeReviewerBinding || !codexExecutable || !plan.liveReady) {
+    throw new Error(
+      "Live decision review requires --codex-executable ABSOLUTE_PATH, --codex-sha256 SHA256, and --codex-model MODEL.",
+    );
+  }
+  const approvalHash = resumePlan?.resumePlanHash ?? plan.planHash;
+  if (option(args, "--approve") !== approvalHash) {
+    throw new Error(
+      `Live decision review requires --approve ${approvalHash}.`,
+    );
+  }
+  if (!resumeRequested) {
+    assertDecisionReviewPathComponents(target, paths.directory);
+    assertDecisionReviewPathComponents(target, dirname(paths.output));
+    if (existsSync(paths.output) || existsSync(paths.directory)) {
+      throw new Error(
+        "DECISION_REVIEW_STATE_ALREADY_EXISTS: refusing to overwrite an earlier execution",
+      );
+    }
+  }
+  ensureDecisionReviewDirectory(target, paths.directory);
+  ensureDecisionReviewDirectory(target, dirname(paths.output));
+  const lock = acquireWorkflowStudyLock({
+    path: paths.lock,
+    planHash: approvalHash,
+    recoverStale: resumeRequested,
+    staleError:
+      "DECISION_REVIEW_STALE_LOCK: automatic resume is forbidden because child settlement cannot be proven from a stale lock.",
+    ...(resumePlan
+      ? {
+          authorizeStaleRecovery(owner: {
+            planHash?: unknown;
+            pid?: unknown;
+          }): void {
+            const current = parseDecisionReviewCheckpoint(
+              readBoundedRegularJson(
+                target,
+                paths.checkpoint,
+                "DECISION_REVIEW_CHECKPOINT_INVALID",
+              ),
+            );
+            const storedPlan = readBoundedRegularJson(
+              target,
+              paths.plan,
+              "DECISION_REVIEW_PLAN_INVALID",
+            );
+            const expectedLockHashes = new Set([
+              current.segments.at(-1)?.authorizationHash,
+              resumePlan.resumePlanHash,
+            ]);
+            if (
+              current.status !== "paused" ||
+              current.activeInvocation !== null ||
+              current.plan.planHash !== plan.planHash ||
+              JSON.stringify(storedPlan) !== JSON.stringify(current.plan) ||
+              typeof owner.planHash !== "string" ||
+              !expectedLockHashes.has(owner.planHash)
+            ) {
+              throw new Error(
+                "DECISION_REVIEW_STALE_LOCK_NOT_SAFE_TO_RECOVER",
+              );
+            }
+            assertDecisionReviewResumePlan(resumePlan, current);
+          },
+        }
+      : {}),
+  });
+  const abortController = new AbortController();
+  const cancel = (source: "SIGINT" | "SIGTERM"): void => {
+    if (!abortController.signal.aborted) {
+      abortController.abort(new Error(`DECISION_REVIEW_CANCELED_${source}`));
+    }
+  };
+  const onSigint = (): void => cancel("SIGINT");
+  const onSigterm = (): void => cancel("SIGTERM");
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+  let retainDecisionReviewLock = false;
+  let checkpoint: DecisionReviewCheckpoint;
+  try {
+    if (existsSync(paths.output)) {
+      throw new Error("DECISION_REVIEW_ALREADY_COMPLETED");
+    }
+    if (resumePlan) {
+      const current = parseDecisionReviewCheckpoint(
+        readBoundedRegularJson(
+          target,
+          paths.checkpoint,
+          "DECISION_REVIEW_CHECKPOINT_INVALID",
+        ),
+      );
+      const storedPlan = readBoundedRegularJson(
+        target,
+        paths.plan,
+        "DECISION_REVIEW_PLAN_INVALID",
+      );
+      if (
+        current.plan.planHash !== plan.planHash ||
+        JSON.stringify(storedPlan) !== JSON.stringify(current.plan)
+      ) {
+        throw new Error("DECISION_REVIEW_RESUME_BASE_PLAN_MISMATCH");
+      }
+      assertDecisionReviewResumePlan(resumePlan, current);
+      ensureDecisionReviewDirectory(target, paths.approvals);
+      const receiptPath = join(
+        paths.approvals,
+        `${resumePlan.resumePlanHash}.json`,
+      );
+      const receipt = {
+        apiVersion:
+          "chartermesh.dev/decision-review-used-approval/v1alpha1",
+        benchmarkId: plan.benchmarkId,
+        basePlanHash: plan.planHash,
+        resumePlanHash: resumePlan.resumePlanHash,
+        sourceCheckpointHash: resumePlan.sourceCheckpointHash,
+        resumeGeneration: resumePlan.resumeGeneration,
+      };
+      if (existsSync(receiptPath)) {
+        const existingReceipt = readBoundedRegularJson(
+          target,
+          receiptPath,
+          "DECISION_REVIEW_USED_APPROVAL_INVALID",
+        );
+        if (JSON.stringify(existingReceipt) !== JSON.stringify(receipt)) {
+          throw new Error("DECISION_REVIEW_USED_APPROVAL_CONFLICT");
+        }
+      } else {
+        writeExclusiveJson(target, receiptPath, receipt);
+      }
+      checkpoint = persistDecisionReviewCheckpoint(
+        target,
+        paths.checkpoint,
+        startDecisionReviewResume(current, resumePlan),
+      );
+    } else {
+      writeExclusiveJson(target, paths.plan, plan);
+      checkpoint = persistDecisionReviewCheckpoint(
+        target,
+        paths.checkpoint,
+        createInitialDecisionReviewCheckpoint(plan, plan.planHash),
+      );
+    }
+
+    let report;
+    try {
+      const engine = new CodexExecModelEngine({
+        profileId: "codex-cli-decision-review",
+        executablePath: codexExecutable,
+        executableSha256: codexSha256!,
+        model: codexModel!,
+        timeoutMs: codexTimeoutMs,
+        maxOutputBytes: codexMaxOutputBytes,
+      });
+      await engine.preflightExecutableAttestation();
+      const segment = checkpoint.segments.at(-1)!;
+      const runSegment: DecisionReviewRunSegment = {
+        index: segment.index,
+        segmentIdHash: segment.segmentIdHash,
+      };
+      report = await runDecisionReviewEvaluation({
+        plan,
+        engine,
+        signal: abortController.signal,
+        priorTrials: checkpoint.completedTrials,
+        segment: runSegment,
+        execution: decisionReviewExecutionDisclosure(checkpoint),
+        onInvocationStart(record) {
+          const expected = createDecisionReviewActiveInvocation(checkpoint);
+          if (JSON.stringify(record) !== JSON.stringify(expected)) {
+            throw new Error("DECISION_REVIEW_INVOCATION_BINDING_MISMATCH");
+          }
+          const next = structuredClone(checkpoint);
+          next.activeInvocation = structuredClone(record);
+          next.processAttempts += 1;
+          checkpoint = persistDecisionReviewCheckpoint(
+            target,
+            paths.checkpoint,
+            next,
+          );
+        },
+        onInvocationPause(pause) {
+          const expectedSequence =
+            checkpoint.plan.schedule[checkpoint.completedTrials.length]
+              ?.sequence ?? checkpoint.plan.plannedCalls + 1;
+          if (
+            pause.sequence !== expectedSequence ||
+            pause.segmentIndex !== checkpoint.segments.at(-1)?.index ||
+            (pause.reasonCode === "operator_requested"
+              ? checkpoint.activeInvocation !== null
+              : checkpoint.activeInvocation?.sequence !== pause.sequence)
+          ) {
+            throw new Error("DECISION_REVIEW_PAUSE_BINDING_MISMATCH");
+          }
+          const next = structuredClone(checkpoint);
+          next.status = "paused";
+          next.activeInvocation = null;
+          next.pause = {
+            reasonCode: pause.reasonCode,
+            sequence: pause.sequence,
+          };
+          next.failure = null;
+          next.nonScoringPauses.push(structuredClone(pause));
+          checkpoint = persistDecisionReviewCheckpoint(
+            target,
+            paths.checkpoint,
+            next,
+          );
+        },
+        onTrial(trial) {
+          if (
+            checkpoint.activeInvocation?.sequence !== trial.sequence ||
+            checkpoint.activeInvocation.segmentIndex !== trial.segmentIndex ||
+            checkpoint.activeInvocation.segmentIdHash !== trial.segmentIdHash
+          ) {
+            throw new Error("DECISION_REVIEW_TRIAL_BINDING_MISMATCH");
+          }
+          const next = structuredClone(checkpoint);
+          next.completedTrials.push(structuredClone(trial));
+          next.completedPrefixHash = decisionReviewCompletedPrefixHash(
+            next.plan,
+            next.completedTrials,
+          );
+          next.segments.at(-1)!.completedThroughSequence = trial.sequence;
+          next.activeInvocation = null;
+          checkpoint = persistDecisionReviewCheckpoint(
+            target,
+            paths.checkpoint,
+            next,
+          );
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof CodexProxyError &&
+        error.code === "CODEX_PROXY_TERMINATION_UNSETTLED"
+      ) {
+        retainDecisionReviewLock = true;
+      }
+      if (error instanceof DecisionReviewPauseError) {
+        if (
+          checkpoint.status !== "paused" ||
+          checkpoint.pause?.reasonCode !== error.reasonCode ||
+          checkpoint.pause.sequence !== error.sequence ||
+          checkpoint.activeInvocation !== null
+        ) {
+          throw new Error("DECISION_REVIEW_PAUSE_NOT_DURABLE");
+        }
+        if (has(args, "--json")) {
+          writeJsonEnvelope("evaluate-decision-review paused", {
+            benchmarkId: plan.benchmarkId,
+            status: "paused",
+            completedTrials: checkpoint.completedTrials.length,
+            nextSequence: error.sequence,
+            processAttempts: checkpoint.processAttempts,
+            reasonCode: error.reasonCode,
+            resumeRequiresNewApproval: true,
+          });
+        } else {
+          console.log(
+            `Decision-review benchmark ${plan.benchmarkId} paused safely after ${checkpoint.completedTrials.length}/20 scored calls.`,
+          );
+          console.log(
+            `Next sequence: ${error.sequence}; reason: ${error.reasonCode}. Generate a new --resume plan before continuing.`,
+          );
+        }
+        return 3;
+      }
+      const next = structuredClone(checkpoint);
+      next.status = "failed";
+      next.pause = null;
+      next.failure = {
+        reasonCode: decisionReviewFailureCode(error),
+        sequence:
+          next.plan.schedule[next.completedTrials.length]?.sequence ??
+          next.plan.plannedCalls + 1,
+      };
+      checkpoint = persistDecisionReviewCheckpoint(
+        target,
+        paths.checkpoint,
+        next,
+      );
+      throw error;
+    }
+    if (
+      checkpoint.completedTrials.length !== plan.plannedCalls ||
+      checkpoint.activeInvocation !== null ||
+      report.execution.processAttempts !== checkpoint.processAttempts ||
+      JSON.stringify(report.trials) !==
+        JSON.stringify(checkpoint.completedTrials)
+    ) {
+      throw new Error("DECISION_REVIEW_FINALIZATION_MISMATCH");
+    }
+    writeWorkflowStudyCheckpoint(paths.output, report);
+    rmSync(paths.checkpoint, { force: true });
+    if (has(args, "--json")) {
+      writeJsonEnvelope("evaluate-decision-review", {
+        qualityGatePassed: report.gates.packetStrictPass,
+        benefitGatePassed: report.gates.demonstratedPilotBenefit,
+        exitCodeMeaning: "packet_quality_gate_only",
+        report,
+      });
+    } else {
+      const raw = report.aggregate.find(
+        ({ presentation }) => presentation === "raw",
+      )!;
+      const packet = report.aggregate.find(
+        ({ presentation }) => presentation === "decision_review",
+      )!;
+      console.log(
+        `Decision-review benchmark ${report.benchmarkId} completed (${report.trials.length}/20 calls accounted).`,
+      );
+      console.log(
+        `- raw: ${raw.exactDecisions}/10 decisions, ${raw.requiredFindings}/20 findings`,
+      );
+      console.log(
+        `- packet: ${packet.exactDecisions}/10 decisions, ${packet.requiredFindings}/20 findings`,
+      );
+      console.log(
+        `Packet quality gate: ${report.gates.packetStrictPass ? "pass" : "fail"}`,
+      );
+      console.log(
+        `Demonstrated fixed-suite pilot benefit: ${report.gates.demonstratedPilotBenefit ? "yes" : "no"}`,
+      );
+      console.log(`Report: ${paths.output}`);
+    }
+    return report.gates.packetStrictPass ? 0 : 2;
+  } catch (error) {
+    if (
+      error instanceof CodexProxyError &&
+      error.code === "CODEX_PROXY_TERMINATION_UNSETTLED"
+    ) {
+      retainDecisionReviewLock = true;
+    }
+    throw error;
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    if (!retainDecisionReviewLock) lock.release();
+  }
+}
+
 function capabilitiesCommand(args: string[]): void {
   const subcommand = args[1] ?? "list";
   if (!["list", "recommend"].includes(subcommand)) {
@@ -3534,6 +4274,16 @@ Commands:
     [--codex-max-output-bytes 1048576]
     [--acknowledge-large-run]
     [--restart-checkpoint]
+  chartermesh evaluate-decision-review --target PATH \
+    [--suite decision-review-fixed-10-v1] \
+    [--codex-executable ABSOLUTE_PATH --codex-sha256 SHA256 \
+     --codex-model MODEL] [--json]
+  chartermesh evaluate-decision-review ... --live --approve PLAN_HASH \
+    [--codex-timeout-ms 120000] [--codex-max-output-bytes 1048576]
+  chartermesh evaluate-decision-review ... --resume \
+    --account-context same|changed|unknown [--json]
+  chartermesh evaluate-decision-review ... --resume \
+    --account-context same|changed|unknown --live --approve RESUME_PLAN_HASH
   chartermesh capabilities list|recommend [--kind KIND] [--json]
   chartermesh skills list [--json]
   chartermesh skills show --id SKILL [--json]
@@ -3686,6 +4436,9 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   }
   if (command === "evaluate-workflow") {
     return evaluateWorkflowCommand(target, args);
+  }
+  if (command === "evaluate-decision-review") {
+    return evaluateDecisionReviewCommand(target, args);
   }
   if (command === "dashboard") {
     const { startDashboard } = await import("../../dashboard/src/server.ts");

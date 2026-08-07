@@ -15,6 +15,7 @@ import {
 import type {
   AuditRecord,
   AcceptanceCriterion,
+  ArtifactProducerReport,
   ArtifactReviewDecision,
   ArtifactEvidence,
   AttemptRecord,
@@ -41,7 +42,10 @@ import type {
 import { assertMaintenanceInactive } from "./maintenance.ts";
 import {
   buildDecisionPacket,
+  canonicalHash,
   createDecisionContract,
+  normalizeArtifactProducerReport,
+  parseLegacyArtifactProducerReport,
 } from "./decision-packet.ts";
 
 type Row = Record<string, unknown>;
@@ -246,6 +250,7 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "cycle",
   "stageKind",
   "packetHash",
+  "producerReportHash",
   "activeReviewMs",
   "detailsOpenCount",
   "reviewMeasurementStatus",
@@ -1262,6 +1267,8 @@ export class ControlPlane {
         packet.kind === projected.kind &&
         packet.binding.subjectHash === projected.binding.subjectHash &&
         packet.binding.contractHash === projected.binding.contractHash &&
+        packet.binding.producerReportHash ===
+          projected.binding.producerReportHash &&
         packet.binding.evidenceSetHash === projected.binding.evidenceSetHash &&
         packet.binding.workItemVersion === item.version &&
         packet.binding.packetHash === projected.binding.packetHash
@@ -1288,6 +1295,9 @@ export class ControlPlane {
           mediaType: artifact.mediaType,
         },
         artifactContent: artifact.content,
+        ...(artifact.producerReport
+          ? { producerReport: artifact.producerReport }
+          : {}),
         toolEvidence: toolEvidence.filter(
           ({ runId }) => runId === artifact.runId,
         ),
@@ -1371,6 +1381,25 @@ export class ControlPlane {
       );
   }
 
+  private ensureDecisionPacketStored(
+    packet: DecisionPacket,
+    createdAt: string,
+  ): void {
+    const active = this.database
+      .prepare(`
+        SELECT packet_hash
+        FROM decision_packets
+        WHERE work_item_id = ? AND superseded_at IS NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(packet.workItemId) as Row | undefined;
+    if (active && String(active.packet_hash) === packet.binding.packetHash) {
+      return;
+    }
+    this.replaceDecisionPacket(packet, createdAt);
+  }
+
   latestUserInput(id: string): UserInputRecord | null {
     this.get(id);
     const row = this.database
@@ -1425,6 +1454,7 @@ export class ControlPlane {
       const response = assertText(input.response, "user input response");
       const responseHash = createHash("sha256").update(response).digest("hex");
       const createdAt = now();
+      this.ensureDecisionPacketStored(packet, createdAt);
       const record: UserInputRecord = {
         id: this.nextId("user-input"),
         workItemId: input.id,
@@ -2461,11 +2491,17 @@ export class ControlPlane {
     id: string;
     content: string;
     mediaType?: string;
+    producerReport?: ArtifactProducerReport;
     generation: number;
     actor: string;
     idempotencyKey: string;
-  }): { workItem: WorkItem; artifactId: string; sha256: string } {
-    return this.command(input.idempotencyKey, "artifact.submit", () => {
+  }): {
+    workItem: WorkItem;
+    artifactId: string;
+    sha256: string;
+    producerReportHash: string | null;
+  } {
+    const result = this.command(input.idempotencyKey, "artifact.submit", () => {
       const current = this.get(input.id);
       if (current.status !== "in_progress") {
         throw new Error("Only in-progress work can submit an artifact.");
@@ -2473,22 +2509,46 @@ export class ControlPlane {
       this.assertActiveGeneration(input.id, input.generation);
       const content = input.content;
       if (!content.trim()) throw new Error("artifact content is required.");
+      const mediaType = (input.mediaType ?? "text/plain").trim();
+      if (
+        !mediaType ||
+        mediaType.length > 256 ||
+        mediaType.includes("\0") ||
+        /[\r\n]/u.test(mediaType)
+      ) {
+        throw new Error("ARTIFACT_MEDIA_TYPE_INVALID");
+      }
+      const producerReport = input.producerReport
+        ? normalizeArtifactProducerReport(input.producerReport)
+        : (parseLegacyArtifactProducerReport(content) ?? undefined);
+      const producerReportJson = producerReport
+        ? JSON.stringify(producerReport)
+        : null;
+      const producerReportHash = producerReport
+        ? canonicalHash(producerReport)
+        : null;
+      const producerReportByteSize = producerReportJson
+        ? Buffer.byteLength(producerReportJson)
+        : 0;
       const byteSize = Buffer.byteLength(content);
       const maxArtifactBytes =
         this.budgets?.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
-      if (byteSize > maxArtifactBytes) {
+      if (byteSize + producerReportByteSize > maxArtifactBytes) {
         throw new Error("ARTIFACT_SIZE_LIMIT_EXCEEDED");
       }
       const priorBytes = this.database
         .prepare(
-          `SELECT COALESCE(SUM(byte_size), 0) AS bytes
+          `SELECT COALESCE(SUM(byte_size + producer_report_byte_size), 0) AS bytes
            FROM artifacts WHERE work_item_id = ?`,
         )
         .get(input.id) as Row;
       const maxWorkItemArtifactBytes =
         this.budgets?.maxWorkItemArtifactBytes ??
         DEFAULT_MAX_WORK_ITEM_ARTIFACT_BYTES;
-      if (Number(priorBytes.bytes) + byteSize > maxWorkItemArtifactBytes) {
+      if (
+        Number(priorBytes.bytes) + byteSize + producerReportByteSize >
+        maxWorkItemArtifactBytes
+      ) {
         throw new Error("WORK_ITEM_ARTIFACT_BUDGET_EXCEEDED");
       }
       const run = this.database
@@ -2513,8 +2573,9 @@ export class ControlPlane {
         .prepare(`
           INSERT INTO artifacts(
             id, work_item_id, run_id, sha256, storage_name,
-            media_type, byte_size, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            media_type, byte_size, producer_report_json,
+            producer_report_hash, producer_report_byte_size, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           artifactId,
@@ -2522,8 +2583,11 @@ export class ControlPlane {
           String(run.id),
           digest,
           storageName,
-          input.mediaType ?? "text/plain",
+          mediaType,
           byteSize,
+          producerReportJson,
+          producerReportHash,
+          producerReportByteSize,
           now(),
         );
       const completedAt = now();
@@ -2566,9 +2630,10 @@ export class ControlPlane {
           kind: "artifact",
           artifactId,
           artifactHash: digest,
-          mediaType: input.mediaType ?? "text/plain",
+          mediaType,
         },
         artifactContent: content,
+        ...(producerReport ? { producerReport } : {}),
         toolEvidence: this.listToolEvidence(input.id).filter(
           ({ runId }) => runId === String(run.id),
         ),
@@ -2578,10 +2643,20 @@ export class ControlPlane {
       this.event("artifact.submitted", input.id, input.actor, {
         artifactId,
         sha256: digest,
+        producerReportHash,
         packetHash: packet.binding.packetHash,
       });
-      return { workItem: this.get(input.id), artifactId, sha256: digest };
+      return {
+        workItem: this.get(input.id),
+        artifactId,
+        sha256: digest,
+        producerReportHash,
+      };
     });
+    return {
+      ...result,
+      producerReportHash: result.producerReportHash ?? null,
+    };
   }
 
   decide(input: {
@@ -2640,6 +2715,7 @@ export class ControlPlane {
       );
       const approvalId = this.nextId("approval");
       const decidedAt = now();
+      this.ensureDecisionPacketStored(packet, decidedAt);
       this.database
         .prepare(`
           INSERT INTO approvals(
@@ -3329,6 +3405,7 @@ export class ControlPlane {
       );
       const approvalId = this.nextId("tool-approval");
       const createdAt = now();
+      this.ensureDecisionPacketStored(packet, createdAt);
       this.database
         .prepare(`
           INSERT INTO tool_approvals(
@@ -3467,6 +3544,7 @@ export class ControlPlane {
       );
       const denialId = this.nextId("tool-denial");
       const deniedAt = now();
+      this.ensureDecisionPacketStored(packet, deniedAt);
       const note = assertText(input.note, "note");
       this.database
         .prepare(`
@@ -3848,7 +3926,8 @@ export class ControlPlane {
     const row = this.database
       .prepare(`
         SELECT id, work_item_id, run_id, sha256, storage_name,
-               media_type, byte_size, created_at
+               media_type, byte_size, producer_report_json,
+               producer_report_hash, producer_report_byte_size, created_at
         FROM artifacts
         WHERE work_item_id = ?
         ORDER BY created_at DESC, id DESC
@@ -3857,17 +3936,61 @@ export class ControlPlane {
       .get(id) as Row | undefined;
     if (!row) return null;
     const storageName = String(row.storage_name);
-    if (!/^[a-f0-9]{64}\.txt$/u.test(storageName)) {
+    const storedSha256 = String(row.sha256);
+    if (
+      !/^[a-f0-9]{64}$/u.test(storedSha256) ||
+      storageName !== `${storedSha256}.txt`
+    ) {
       throw new Error("Artifact storage name is invalid.");
+    }
+    const artifactBytes = readFileSync(join(this.artifactDirectory, storageName));
+    if (
+      artifactBytes.byteLength !== Number(row.byte_size) ||
+      createHash("sha256").update(artifactBytes).digest("hex") !== storedSha256
+    ) {
+      throw new Error("ARTIFACT_INTEGRITY_MISMATCH");
+    }
+    let producerReport: ArtifactProducerReport | undefined;
+    let producerReportHash: string | undefined;
+    if (row.producer_report_json !== null && row.producer_report_json !== undefined) {
+      try {
+        producerReport = normalizeArtifactProducerReport(
+          JSON.parse(String(row.producer_report_json)) as unknown,
+        );
+      } catch {
+        throw new Error("ARTIFACT_PRODUCER_REPORT_INVALID");
+      }
+      producerReportHash = String(row.producer_report_hash ?? "");
+      if (
+        !/^[a-f0-9]{64}$/u.test(producerReportHash) ||
+        canonicalHash(producerReport) !== producerReportHash ||
+        Buffer.byteLength(String(row.producer_report_json)) !==
+          Number(row.producer_report_byte_size)
+      ) {
+        throw new Error("ARTIFACT_PRODUCER_REPORT_HASH_MISMATCH");
+      }
+    } else if (
+      (row.producer_report_hash !== null &&
+        row.producer_report_hash !== undefined) ||
+      Number(row.producer_report_byte_size) !== 0
+    ) {
+      throw new Error("ARTIFACT_PRODUCER_REPORT_INVALID");
     }
     return {
       id: String(row.id),
       workItemId: String(row.work_item_id),
       runId: String(row.run_id),
-      sha256: String(row.sha256),
+      sha256: storedSha256,
       mediaType: String(row.media_type),
       byteSize: Number(row.byte_size),
-      content: readFileSync(join(this.artifactDirectory, storageName), "utf8"),
+      content: artifactBytes.toString("utf8"),
+      ...(producerReport && producerReportHash
+        ? {
+            producerReport,
+            producerReportHash,
+            producerReportByteSize: Number(row.producer_report_byte_size),
+          }
+        : {}),
       createdAt: String(row.created_at),
     };
   }

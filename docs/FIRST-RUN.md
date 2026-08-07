@@ -12,11 +12,14 @@ approvals, model connection, operations, and troubleshooting, see
 GitHub package path, with no manual source checkout:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh version --json
-npx --yes github:jade-blanco/chartermesh propose `
+npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 version --json
+npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 propose `
   --target C:\path\to\target `
   --profile balanced
 ```
+
+The tag pins this friend-trial guide to a reproducible pre-alpha release. Omit
+`#v0.0.8-alpha.1` only when intentionally testing the latest `main` branch.
 
 This requires an explicitly authorized package download. For source
 development:

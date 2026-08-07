@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   ControlPlane,
+  buildDecisionPacket,
+  canonicalHash,
+  createDecisionContract,
   dispatchOutboxBatch,
+  normalizeArtifactProducerReport,
   openControlPlaneDatabase,
+  projectDecisionReviewView,
+  type ArtifactProducerReport,
+  type ToolExecutionEvidenceRecord,
 } from "../src/index.ts";
 import {
   createWorkspaceToolRuntime,
@@ -29,6 +36,278 @@ function currentPacketHash(controlPlane: ControlPlane, id: string): string {
   assert.ok(packet, `Expected a current decision packet for ${id}.`);
   return packet.binding.packetHash;
 }
+
+const boundedProducerReport: ArtifactProducerReport = {
+  apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
+  source: "model_reported",
+  summary: "A bounded producer report.",
+  deliverable: "A bounded deliverable.",
+  reportedChecks: [],
+  reportedRisks: [],
+  nextActions: [],
+  confidence: "unknown",
+};
+
+test("producer reports and packet evidence reject ambiguous boundary inputs", () => {
+  const disguisedSparseChecks = Array<string>(2);
+  disguisedSparseChecks[0] = "Only one indexed entry exists.";
+  Object.defineProperty(disguisedSparseChecks, "extra", {
+    enumerable: true,
+    value: "This made Object.keys(array).length equal array.length.",
+  });
+  assert.throws(
+    () =>
+      normalizeArtifactProducerReport({
+        ...boundedProducerReport,
+        reportedChecks: Array(1),
+      }),
+    /PRODUCER_REPORT_INVALID/u,
+  );
+  assert.throws(
+    () =>
+      normalizeArtifactProducerReport({
+        ...boundedProducerReport,
+        reportedChecks: disguisedSparseChecks,
+      }),
+    /PRODUCER_REPORT_INVALID/u,
+  );
+  assert.throws(
+    () =>
+      normalizeArtifactProducerReport({
+        ...boundedProducerReport,
+        summary: "embedded\0NUL",
+      }),
+    /PRODUCER_REPORT_INVALID/u,
+  );
+  assert.throws(
+    () =>
+      normalizeArtifactProducerReport({
+        ...boundedProducerReport,
+        reportedChecks: ["embedded\0NUL"],
+      }),
+    /PRODUCER_REPORT_INVALID/u,
+  );
+  const unicodeReport = normalizeArtifactProducerReport({
+    ...boundedProducerReport,
+    summary: "😀".repeat(2_000),
+  });
+  assert.equal(Array.from(unicodeReport.summary).length, 2_000);
+  assert.throws(
+    () =>
+      normalizeArtifactProducerReport({
+        ...boundedProducerReport,
+        summary: "😀".repeat(2_001),
+      }),
+    /PRODUCER_REPORT_INVALID/u,
+  );
+
+  const workItem = {
+    id: "work-boundary",
+    rootId: "work-boundary",
+    parentId: null,
+    title: "Boundary",
+    summary: "Exercise the packet boundary.",
+    ownerRole: "operator",
+    executionTarget: "local",
+    status: "in_progress" as const,
+    availability: "approval_waiting" as const,
+    priority: 50,
+    version: 1,
+    wait: null,
+    nextAction: "Review",
+    archivedAt: null,
+    createdAt: "2026-08-02T00:00:00.000Z",
+    updatedAt: "2026-08-02T00:00:00.000Z",
+  };
+  const contract = createDecisionContract({
+    objective: workItem.summary,
+    source: "user",
+  });
+  assert.throws(
+    () =>
+      buildDecisionPacket({
+        workItem,
+        contract,
+        subject: {
+          kind: "tool_call",
+          callHash: canonicalHash("bounded-call"),
+          toolName: "workspace.read_file",
+        },
+        producerReport: boundedProducerReport,
+        toolEvidence: [],
+        createdAt: workItem.createdAt,
+      }),
+    /PRODUCER_REPORT_INVALID/u,
+  );
+
+  const nonArtifactPacket = buildDecisionPacket({
+    workItem,
+    contract,
+    subject: {
+      kind: "tool_call",
+      callHash: canonicalHash("bounded-call"),
+      toolName: "workspace.read_file",
+    },
+    producerReport: null,
+    toolEvidence: [],
+    createdAt: workItem.createdAt,
+  });
+  assert.equal(nonArtifactPacket.producerReport, null);
+  assert.equal(nonArtifactPacket.binding.producerReportHash, null);
+  assert.throws(
+    () =>
+      buildDecisionPacket({
+        workItem,
+        contract,
+        subject: {
+          kind: "tool_call",
+          callHash: canonicalHash("bounded-call"),
+          toolName: "workspace.read_file",
+        },
+        producerReport: null,
+        toolEvidence: [],
+        createdAt: workItem.createdAt,
+        question: "embedded\0NUL",
+      }),
+    /TEXT_INVALID/u,
+  );
+  assert.throws(
+    () =>
+      buildDecisionPacket({
+        workItem,
+        contract: {
+          ...contract,
+          decisionQuestion: "fallback\0NUL",
+        },
+        subject: {
+          kind: "tool_call",
+          callHash: canonicalHash("bounded-call"),
+          toolName: "workspace.read_file",
+        },
+        producerReport: null,
+        toolEvidence: [],
+        createdAt: workItem.createdAt,
+      }),
+    /TEXT_INVALID/u,
+  );
+
+  const toolEvidence: ToolExecutionEvidenceRecord[] = Array.from(
+    { length: 500 },
+    (_, index) => ({
+      id: `evidence-${index}`,
+      workItemId: workItem.id,
+      runId: "run-boundary",
+      attemptId: "attempt-boundary",
+      receiptId: `receipt-${index}`,
+      provenance: "control_plane_receipt",
+      callHash: canonicalHash({ index, kind: "call" }),
+      toolName: "workspace.read_file",
+      status: "succeeded",
+      inputHash: canonicalHash({ index, kind: "input" }),
+      outputHash: canonicalHash({ index, kind: "output" }),
+      paths: [],
+      durationMs: 1,
+      createdAt: workItem.createdAt,
+    }),
+  );
+  const disguisedSparseEvidence = Array<ToolExecutionEvidenceRecord>(2);
+  disguisedSparseEvidence[0] = toolEvidence[0]!;
+  Object.defineProperty(disguisedSparseEvidence, "extra", {
+    enumerable: true,
+    value: toolEvidence[1],
+  });
+  assert.throws(
+    () =>
+      buildDecisionPacket({
+        workItem,
+        contract,
+        subject: {
+          kind: "tool_call",
+          callHash: canonicalHash("bounded-call"),
+          toolName: "workspace.read_file",
+        },
+        toolEvidence: disguisedSparseEvidence,
+        createdAt: workItem.createdAt,
+      }),
+    /DECISION_PACKET_EVIDENCE_INVALID/u,
+  );
+  const maximumPacket = buildDecisionPacket({
+    workItem,
+    contract,
+    subject: {
+      kind: "tool_call",
+      callHash: canonicalHash("bounded-call"),
+      toolName: "workspace.read_file",
+    },
+    toolEvidence: toolEvidence.slice(0, 499),
+    createdAt: workItem.createdAt,
+  });
+  assert.equal(maximumPacket.evidence.length, 500);
+  assert.throws(
+    () =>
+      buildDecisionPacket({
+        workItem,
+        contract,
+        subject: {
+          kind: "tool_call",
+          callHash: canonicalHash("bounded-call"),
+          toolName: "workspace.read_file",
+        },
+        toolEvidence,
+        createdAt: workItem.createdAt,
+      }),
+    /DECISION_PACKET_EVIDENCE_LIMIT/u,
+  );
+});
+
+test("v1alpha2 schemas mirror runtime whitespace and NUL boundaries", () => {
+  const producerSchema = JSON.parse(
+    readFileSync("schemas/artifact-producer-report-v1alpha1.schema.json", "utf8"),
+  ) as {
+    properties: {
+      summary: Record<string, unknown>;
+      deliverable: Record<string, unknown>;
+    };
+    $defs: { stringList: { items: Record<string, unknown> } };
+  };
+  for (const boundary of [
+    producerSchema.properties.summary,
+    producerSchema.properties.deliverable,
+    producerSchema.$defs.stringList.items,
+  ]) {
+    assert.equal(boundary.pattern, "\\S");
+    assert.deepEqual(boundary.not, { pattern: "\\u0000" });
+  }
+
+  const packetSchema = JSON.parse(
+    readFileSync("schemas/decision-packet-v1alpha2.schema.json", "utf8"),
+  ) as {
+    properties: {
+      question: Record<string, unknown>;
+      producerReport: {
+        properties: {
+          summary: Record<string, unknown>;
+          deliverable: Record<string, unknown>;
+        };
+      };
+    };
+    allOf: Array<Record<string, unknown>>;
+    $defs: { stringList: { items: Record<string, unknown> } };
+  };
+  for (const boundary of [
+    packetSchema.properties.question,
+    packetSchema.properties.producerReport.properties.summary,
+    packetSchema.properties.producerReport.properties.deliverable,
+    packetSchema.$defs.stringList.items,
+  ]) {
+    assert.equal(boundary.pattern, "\\S");
+    assert.deepEqual(boundary.not, { pattern: "\\u0000" });
+  }
+  const schemaText = JSON.stringify(packetSchema.allOf);
+  assert.match(schemaText, /tool_execution/u);
+  assert.match(schemaText, /user_input/u);
+  assert.match(schemaText, /"producerReport":\{"type":"null"\}/u);
+});
 
 test("intake through approval completes and resurfaces a successor", () => {
   const { database, controlPlane } = fixture();
@@ -544,6 +823,15 @@ test("decision packets keep model claims unverified and reject stale or non-huma
     assert.ok(firstPacket);
     assert.equal(firstPacket.kind, "artifact_review");
     assert.equal(firstPacket.producerReport?.summary, "A bounded result was produced.");
+    assert.match(firstArtifact.producerReportHash ?? "", /^[a-f0-9]{64}$/u);
+    assert.equal(
+      controlPlane.latestArtifact(item.id)?.producerReportHash,
+      firstArtifact.producerReportHash,
+    );
+    assert.equal(
+      firstPacket.binding.producerReportHash,
+      firstArtifact.producerReportHash,
+    );
     assert.deepEqual(
       firstPacket.evidence
         .filter(({ source }) => source === "model_reported")
@@ -639,6 +927,369 @@ test("decision packets keep model claims unverified and reject stale or non-huma
     );
   } finally {
     database.close();
+  }
+});
+
+test("artifact producer sidecars bind real deliverables while keeping reported checks as claims", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Review a rendered deliverable",
+      summary: "Keep the immutable deliverable separate from its bounded report.",
+      actor: "human:test",
+      idempotencyKey: "sidecar:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "sidecar:triage",
+    });
+    const firstClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "sidecar:claim:1",
+    });
+    const deliverable = "<html><body>release notes</body></html>";
+    const report = {
+      apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1" as const,
+      source: "runtime_compiled" as const,
+      summary: "Release notes were rendered.",
+      deliverable: "HTML release notes",
+      reportedChecks: ["The runtime compiler produced bounded HTML."],
+      reportedRisks: [],
+      nextActions: [],
+      confidence: "high" as const,
+    };
+    const firstArtifact = controlPlane.submitArtifact({
+      id: item.id,
+      content: deliverable,
+      mediaType: "text/html",
+      producerReport: report,
+      generation: firstClaim.generation,
+      actor: "runner:test",
+      idempotencyKey: "sidecar:submit:1",
+    });
+    const firstPacket = controlPlane.decisionPacket(item.id);
+    assert.ok(firstPacket);
+    assert.equal(firstPacket.apiVersion, "chartermesh.dev/decision-packet/v1alpha2");
+    assert.equal(firstPacket.subject.kind, "artifact");
+    assert.equal(firstPacket.producerReport?.source, "runtime_compiled");
+    assert.equal(
+      firstPacket.binding.producerReportHash,
+      firstArtifact.producerReportHash,
+    );
+    const replayRow = database
+      .prepare(
+        "SELECT response_json FROM command_results WHERE idempotency_key = ?",
+      )
+      .get("sidecar:submit:1") as { response_json: string };
+    const legacyReplay = JSON.parse(replayRow.response_json) as Record<
+      string,
+      unknown
+    >;
+    delete legacyReplay.producerReportHash;
+    database
+      .prepare(
+        "UPDATE command_results SET response_json = ? WHERE idempotency_key = ?",
+      )
+      .run(JSON.stringify(legacyReplay), "sidecar:submit:1");
+    const replayed = controlPlane.submitArtifact({
+      id: item.id,
+      content: deliverable,
+      mediaType: "text/html",
+      producerReport: report,
+      generation: firstClaim.generation,
+      actor: "runner:test",
+      idempotencyKey: "sidecar:submit:1",
+    });
+    assert.equal(replayed.producerReportHash, null);
+    assert.equal(
+      firstPacket.exceptions.some(
+        ({ code }) => code === "ARTIFACT_UNSTRUCTURED",
+      ),
+      false,
+    );
+    assert.equal(
+      firstPacket.exceptions.some(({ code }) => code === "MODEL_REPORTED_ONLY"),
+      true,
+    );
+    assert.equal(
+      firstPacket.evidence.some(
+        ({ source, status }) =>
+          source === "model_reported" && status === "claimed",
+      ),
+      true,
+    );
+    const reviewView = projectDecisionReviewView(firstPacket);
+    assert.equal(
+      reviewView.apiVersion,
+      "chartermesh.dev/decision-review-view/v1alpha1",
+    );
+    assert.equal(reviewView.result?.summary, report.summary);
+    assert.equal(
+      reviewView.binding.packetHash,
+      firstPacket.binding.packetHash,
+    );
+    const stored = controlPlane.latestArtifact(item.id);
+    assert.equal(stored?.content, deliverable);
+    assert.deepEqual(stored?.producerReport, report);
+
+    controlPlane.decide({
+      id: item.id,
+      decision: "changes_requested",
+      artifactHash: firstArtifact.sha256,
+      packetHash: firstPacket.binding.packetHash,
+      note: "Clarify the report while preserving the exact deliverable.",
+      actor: "human:test",
+      idempotencyKey: "sidecar:changes",
+    });
+    const secondClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "sidecar:claim:2",
+    });
+    const secondArtifact = controlPlane.submitArtifact({
+      id: item.id,
+      content: deliverable,
+      mediaType: "text/html",
+      producerReport: {
+        ...report,
+        summary: "Release notes were rendered and bounded to this report.",
+      },
+      generation: secondClaim.generation,
+      actor: "runner:test",
+      idempotencyKey: "sidecar:submit:2",
+    });
+    const secondPacket = controlPlane.decisionPacket(item.id);
+    assert.ok(secondPacket);
+    assert.equal(secondArtifact.sha256, firstArtifact.sha256);
+    assert.notEqual(
+      secondArtifact.producerReportHash,
+      firstArtifact.producerReportHash,
+    );
+    assert.notEqual(
+      secondPacket.binding.packetHash,
+      firstPacket.binding.packetHash,
+    );
+    assert.throws(
+      () =>
+        controlPlane.decide({
+          id: item.id,
+          decision: "approve",
+          artifactHash: secondArtifact.sha256,
+          packetHash: firstPacket.binding.packetHash,
+          note: "A report-bound stale packet cannot be reused.",
+          actor: "human:test",
+          idempotencyKey: "sidecar:stale",
+        }),
+      /packet does not match/u,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("a projected v1alpha2 packet is persisted before approving a migrated active review", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Migrate an active review",
+      summary: "Persist the current packet before recording its approval.",
+      actor: "human:test",
+      idempotencyKey: "packet-migration:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "packet-migration:triage",
+    });
+    const claim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "packet-migration:claim",
+    });
+    const artifact = controlPlane.submitArtifact({
+      id: item.id,
+      content: "migrated review artifact",
+      generation: claim.generation,
+      actor: "runner:test",
+      idempotencyKey: "packet-migration:submit",
+    });
+    const current = controlPlane.decisionPacket(item.id);
+    assert.ok(current);
+    const legacy = structuredClone(current) as unknown as Record<string, unknown>;
+    legacy.apiVersion = "chartermesh.dev/decision-packet/v1alpha1";
+    const legacyBinding = legacy.binding as Record<string, unknown>;
+    legacyBinding.projectionVersion = "v1alpha1";
+    delete legacyBinding.producerReportHash;
+    const legacyHash = "e".repeat(64);
+    legacyBinding.packetHash = legacyHash;
+    database
+      .prepare(`
+        UPDATE decision_packets
+        SET packet_hash = ?, packet_json = ?
+        WHERE work_item_id = ? AND superseded_at IS NULL
+      `)
+      .run(legacyHash, JSON.stringify(legacy), item.id);
+
+    const projected = controlPlane.decisionPacket(item.id);
+    assert.ok(projected);
+    assert.equal(projected.apiVersion, "chartermesh.dev/decision-packet/v1alpha2");
+    assert.notEqual(projected.binding.packetHash, legacyHash);
+    controlPlane.decide({
+      id: item.id,
+      decision: "approve",
+      artifactHash: artifact.sha256,
+      packetHash: projected.binding.packetHash,
+      note: "Approve only after the migrated packet is durably recorded.",
+      actor: "human:test",
+      idempotencyKey: "packet-migration:approve",
+    });
+    const persisted = database
+      .prepare(`
+        SELECT COUNT(*) AS count
+        FROM decision_packets
+        WHERE work_item_id = ? AND packet_hash = ?
+      `)
+      .get(item.id, projected.binding.packetHash) as { count: number };
+    assert.equal(Number(persisted.count), 1);
+    const approval = database
+      .prepare(`
+        SELECT packet_hash
+        FROM approvals
+        WHERE work_item_id = ?
+        ORDER BY created_at DESC LIMIT 1
+      `)
+      .get(item.id) as { packet_hash: string };
+    assert.equal(approval.packet_hash, projected.binding.packetHash);
+  } finally {
+    database.close();
+  }
+});
+
+test("artifact and producer-report tampering fail closed before review", () => {
+  const prepare = (suffix: string) => {
+    const value = fixture();
+    const item = value.controlPlane.intake({
+      title: `Integrity ${suffix}`,
+      summary: "Review only hash-matching immutable evidence.",
+      actor: "human:test",
+      idempotencyKey: `integrity:${suffix}:intake`,
+    });
+    value.controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: `integrity:${suffix}:triage`,
+    });
+    const claim = value.controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: `integrity:${suffix}:claim`,
+    });
+    const artifact = value.controlPlane.submitArtifact({
+      id: item.id,
+      content: "immutable artifact bytes",
+      producerReport: {
+        apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
+        source: "runtime_compiled",
+        summary: "Bounded integrity fixture.",
+        deliverable: "immutable artifact bytes",
+        reportedChecks: [],
+        reportedRisks: [],
+        nextActions: [],
+        confidence: "medium",
+      },
+      generation: claim.generation,
+      actor: "runner:test",
+      idempotencyKey: `integrity:${suffix}:submit`,
+    });
+    return { ...value, item, artifact };
+  };
+
+  const blob = prepare("blob");
+  try {
+    writeFileSync(
+      join(blob.directory, "artifacts", `${blob.artifact.sha256}.txt`),
+      "tampered artifact bytes",
+      "utf8",
+    );
+    assert.throws(
+      () => blob.controlPlane.latestArtifact(blob.item.id),
+      /ARTIFACT_INTEGRITY_MISMATCH/u,
+    );
+    assert.throws(
+      () => blob.controlPlane.decisionPacket(blob.item.id),
+      /ARTIFACT_INTEGRITY_MISMATCH/u,
+    );
+  } finally {
+    blob.database.close();
+  }
+
+  const report = prepare("report");
+  try {
+    report.database
+      .prepare(`
+        UPDATE artifacts
+        SET producer_report_json = ?
+        WHERE work_item_id = ?
+      `)
+      .run(
+        JSON.stringify({
+          apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
+          source: "runtime_compiled",
+          summary: "Tampered report.",
+          deliverable: "immutable artifact bytes",
+          reportedChecks: [],
+          reportedRisks: [],
+          nextActions: [],
+          confidence: "medium",
+        }),
+        report.item.id,
+      );
+    assert.throws(
+      () => report.controlPlane.latestArtifact(report.item.id),
+      /ARTIFACT_PRODUCER_REPORT_HASH_MISMATCH/u,
+    );
+    assert.throws(
+      () => report.controlPlane.decisionPacket(report.item.id),
+      /ARTIFACT_PRODUCER_REPORT_HASH_MISMATCH/u,
+    );
+  } finally {
+    report.database.close();
+  }
+
+  const media = prepare("media");
+  try {
+    const before = media.controlPlane.decisionPacket(media.item.id);
+    assert.ok(before);
+    media.database
+      .prepare("UPDATE artifacts SET media_type = ? WHERE work_item_id = ?")
+      .run("application/octet-stream", media.item.id);
+    const after = media.controlPlane.decisionPacket(media.item.id);
+    assert.ok(after);
+    assert.notEqual(after.binding.subjectHash, before.binding.subjectHash);
+    assert.notEqual(after.binding.packetHash, before.binding.packetHash);
+    assert.throws(
+      () =>
+        media.controlPlane.decide({
+          id: media.item.id,
+          decision: "approve",
+          artifactHash: media.artifact.sha256,
+          packetHash: before.binding.packetHash,
+          note: "A stale media-type binding must not approve.",
+          actor: "human:test",
+          idempotencyKey: "integrity:media:stale-approve",
+        }),
+      /packet does not match/u,
+    );
+  } finally {
+    media.database.close();
   }
 });
 
@@ -1442,6 +2093,7 @@ test("audit export projection preserves allowlisted evidence and drops all other
         "must-not-export-actor-secret",
         JSON.stringify({
           sha256: "a".repeat(64),
+          producerReportHash: "b".repeat(64),
           token: "must-not-export",
           nested: { arguments: { path: ".", content: "private" } },
         }),
@@ -1449,6 +2101,7 @@ test("audit export projection preserves allowlisted evidence and drops all other
       );
     const records = controlPlane.auditRecords();
     assert.equal(records[0]?.payload.sha256, "a".repeat(64));
+    assert.equal(records[0]?.payload.producerReportHash, "b".repeat(64));
     assert.equal(records[0]?.payload.token, undefined);
     assert.equal(records[0]?.payload.nested, undefined);
     assert.equal(records[0]?.actor, "system:unknown");

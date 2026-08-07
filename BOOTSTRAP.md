@@ -35,7 +35,9 @@ and a report of every changed file. No model call is required to bootstrap.
 1. Prefer an already available CharterMesh executable. A source checkout may
    use `node bin/chartermesh.mjs`. With only the GitHub URL, and after the user
    authorizes the one-time package download, use
-   `npx --yes github:jade-blanco/chartermesh`.
+   `npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1` for the reproducible
+   friend-trial release, or omit the tag only when the user explicitly wants
+   the latest `main` branch.
 2. Resolve the intended target repository.
 3. Read the target's applicable agent instructions.
 4. Inspect its Git status and existing `.chartermesh` directory without
@@ -154,7 +156,10 @@ Never report credential values or unrelated absolute paths.
 - A model invocation is recorded as running before inference and is closed as
   succeeded, failed, canceled, or abandoned.
 - Stale generations cannot submit artifacts.
-- Human review binds the exact immutable artifact hash.
+- Human decisions bind the exact immutable Decision Packet hash. For artifact
+  review, its subject binds the artifact bytes and media type separately from
+  the producer-report hash, evidence-set hash, WorkItem version, and projection
+  version.
 - Tool availability, workspace roots, and iteration limits come from OrgSpec.
 - Workspace writes require approval of the exact canonical tool-call hash.
 - Tool evidence records hashes, status, bounded paths, and timing, not raw

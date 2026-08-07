@@ -20,12 +20,14 @@ import {
   CODEX_EXEC_MODEL_PROTOCOL_SHA256,
   CODEX_GENERALIST_FEEDBACK_PROTOCOL_SHA256,
   CODEX_PROXY_ENVIRONMENT_POLICY_VERSION,
+  CODEX_PROXY_FAILURE_CLASSIFIER_POLICY_VERSION,
   CodexProxyError,
   FIXED_SELF_REVIEW_FEEDBACK,
   FIXED_SELF_REVIEW_FEEDBACK_SHA256,
   FixedSelfReviewFeedbackProvider,
   NEUTRAL_REPEAT_FEEDBACK,
   NeutralRepeatFeedbackProvider,
+  isCodexProxyPauseError,
   SIMULATED_USER_ACTOR_TYPE,
   SIMULATED_USER_FEEDBACK_REQUEST_API_VERSION,
   type CodexSpawnFunction,
@@ -198,6 +200,18 @@ async function absent(path: string): Promise<boolean> {
     return false;
   } catch {
     return true;
+  }
+}
+
+async function codexProxyRejection(
+  promise: Promise<unknown>,
+): Promise<CodexProxyError> {
+  try {
+    await promise;
+    throw new Error("expected Codex proxy rejection");
+  } catch (error) {
+    if (!(error instanceof CodexProxyError)) throw error;
+    return error;
   }
 }
 
@@ -693,16 +707,198 @@ test("unsupported required Codex flags fail explicitly", async (t) => {
       observation,
       {
         exitCode: 2,
-        stderr: "error: unexpected argument '--ignore-rules'",
+        stderr: [
+          "error: unexpected argument '--ignore-rules'",
+          '{"error":{"code":"usage_limit_reached","message":"private@example.com C:\\\\Users\\\\private\\\\.codex\\\\auth.json"}}',
+        ].join("\n"),
       },
     ),
   });
-  await assert.rejects(
-    provider.provideFeedback(request()),
-    (error: unknown) =>
-      error instanceof CodexProxyError &&
-      error.code === "CODEX_PROXY_UNSUPPORTED_FLAGS",
+  const error = await codexProxyRejection(provider.provideFeedback(request()));
+  assert.equal(error.code, "CODEX_PROXY_UNSUPPORTED_FLAGS");
+  assert.equal(
+    error.message,
+    "CODEX_PROXY_UNSUPPORTED_FLAGS: this Codex CLI version rejected a required isolation flag",
   );
+  assert.doesNotMatch(error.message, /private@example\.com|auth\.json/iu);
+});
+
+test("Codex nonzero exits classify exact and structured pause signals without disclosing stderr", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  assert.equal(
+    CODEX_PROXY_FAILURE_CLASSIFIER_POLICY_VERSION,
+    "chartermesh.dev/codex-proxy-failure-classifier/v1alpha1",
+  );
+  const secret = "sk-private-value private@example.com C:\\Users\\private\\.codex\\auth.json";
+  const cases = [
+    {
+      label: "structured usage limit",
+      stderr: JSON.stringify({
+        type: "error",
+        error: { code: "insufficient_quota", message: secret },
+      }),
+      code: "CODEX_PROXY_USAGE_LIMIT_REACHED",
+      message:
+        "CODEX_PROXY_USAGE_LIMIT_REACHED: Codex account usage capacity is exhausted; a later authorized resume is required",
+    },
+    {
+      label: "structured billing hard limit",
+      stderr: JSON.stringify({
+        error: { code: "billing_hard_limit_reached", message: secret },
+      }),
+      code: "CODEX_PROXY_USAGE_LIMIT_REACHED",
+      message:
+        "CODEX_PROXY_USAGE_LIMIT_REACHED: Codex account usage capacity is exhausted; a later authorized resume is required",
+    },
+    {
+      label: "exact usage limit",
+      stderr: `Error: You've hit your usage limit. ${secret}`,
+      code: "CODEX_PROXY_USAGE_LIMIT_REACHED",
+      message:
+        "CODEX_PROXY_USAGE_LIMIT_REACHED: Codex account usage capacity is exhausted; a later authorized resume is required",
+    },
+    {
+      label: "structured rate limit",
+      stderr: JSON.stringify({
+        error: { type: "rate_limit_exceeded", message: secret },
+      }),
+      code: "CODEX_PROXY_RATE_LIMITED",
+      message:
+        "CODEX_PROXY_RATE_LIMITED: Codex temporarily rate-limited the invocation; a later authorized resume is required",
+    },
+    {
+      label: "exact rate limit",
+      stderr: `429 Too Many Requests: ${secret}`,
+      code: "CODEX_PROXY_RATE_LIMITED",
+      message:
+        "CODEX_PROXY_RATE_LIMITED: Codex temporarily rate-limited the invocation; a later authorized resume is required",
+    },
+    {
+      label: "structured authentication",
+      stderr: JSON.stringify({
+        error: { code: "authentication_required", message: secret },
+      }),
+      code: "CODEX_PROXY_AUTHENTICATION_REQUIRED",
+      message:
+        "CODEX_PROXY_AUTHENTICATION_REQUIRED: Codex authentication is required before an authorized resume",
+    },
+    {
+      label: "exact authentication",
+      stderr: `Not logged in. Run 'codex login'. ${secret}`,
+      code: "CODEX_PROXY_AUTHENTICATION_REQUIRED",
+      message:
+        "CODEX_PROXY_AUTHENTICATION_REQUIRED: Codex authentication is required before an authorized resume",
+    },
+    {
+      label: "structured refresh token expired",
+      stderr: JSON.stringify({
+        error: { code: "refresh_token_expired", message: secret },
+      }),
+      code: "CODEX_PROXY_AUTHENTICATION_REQUIRED",
+      message:
+        "CODEX_PROXY_AUTHENTICATION_REQUIRED: Codex authentication is required before an authorized resume",
+    },
+    {
+      label: "exact http unauthorized",
+      stderr: `HTTP 401 Unauthorized: ${secret}`,
+      code: "CODEX_PROXY_AUTHENTICATION_REQUIRED",
+      message:
+        "CODEX_PROXY_AUTHENTICATION_REQUIRED: Codex authentication is required before an authorized resume",
+    },
+  ] as const;
+
+  for (const classification of cases) {
+    const observation: SpawnObservation = { killSignals: [] };
+    const engine = new CodexExecModelEngine({
+      profileId: `pause-${classification.label.replaceAll(" ", "-")}`,
+      executablePath: fixture.path,
+      executableSha256: fixture.digest,
+      model: "gpt-test",
+      spawn: scriptedSpawn(
+        { action: "dispatch" },
+        observation,
+        { exitCode: 1, stderr: classification.stderr },
+      ),
+    });
+    const error = await codexProxyRejection(engine.generate(modelRequest()));
+    assert.equal(error.code, classification.code, classification.label);
+    assert.equal(error.message, classification.message, classification.label);
+    assert.equal(isCodexProxyPauseError(error), true, classification.label);
+    assert.doesNotMatch(
+      error.message,
+      /sk-private-value|private@example\.com|C:\\Users|auth\.json/iu,
+      classification.label,
+    );
+  }
+});
+
+test("Codex failure classification rejects near-miss prose and withholds generic stderr", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const nearMisses = [
+    'The task asked for documentation of the phrase "rate limit exceeded", but rendering failed.',
+    JSON.stringify({
+      type: "error",
+      message: "usage_limit_reached was supplied by the user",
+    }),
+    "Authentication may be required for another provider, but this is a network failure.",
+    "Quota remaining: 0? The metric was unavailable.",
+    JSON.stringify({
+      error: { code: "network_error" },
+      hint: "authentication_required",
+    }),
+    "error: unsupported option '--provider-specific-setting'",
+  ];
+
+  for (const [index, stderr] of nearMisses.entries()) {
+    const observation: SpawnObservation = { killSignals: [] };
+    const engine = new CodexExecModelEngine({
+      profileId: `near-miss-${index}`,
+      executablePath: fixture.path,
+      executableSha256: fixture.digest,
+      model: "gpt-test",
+      spawn: scriptedSpawn(
+        { action: "dispatch" },
+        observation,
+        { exitCode: 1, stderr },
+      ),
+    });
+    const error = await codexProxyRejection(engine.generate(modelRequest()));
+    assert.equal(error.code, "CODEX_PROXY_EXIT_NONZERO");
+    assert.equal(
+      error.message,
+      "CODEX_PROXY_EXIT_NONZERO: Codex CLI exited unsuccessfully; stderr is withheld from the public error surface",
+    );
+    assert.equal(isCodexProxyPauseError(error), false);
+    assert.equal(error.message.includes(stderr), false);
+  }
+});
+
+test("stderr pause phrases never override a successful Codex exit", async (t) => {
+  const fixture = await fixtureExecutable();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const observation: SpawnObservation = { killSignals: [] };
+  const engine = new CodexExecModelEngine({
+    profileId: "successful-with-scary-stderr",
+    executablePath: fixture.path,
+    executableSha256: fixture.digest,
+    model: "gpt-test",
+    spawn: scriptedSpawn(
+      { action: "dispatch" },
+      observation,
+      {
+        stderr: [
+          "Error: You've hit your usage limit.",
+          "429 Too Many Requests.",
+          '{"error":{"code":"authentication_required"}}',
+        ].join("\n"),
+      },
+    ),
+  });
+
+  const result = await engine.generate(modelRequest());
+  assert.equal(result.text, JSON.stringify({ action: "dispatch" }));
 });
 
 test("Codex exec model engine is schema-required, tool-less, transport-labelled, and usage-unknown", async (t) => {

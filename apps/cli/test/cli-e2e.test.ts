@@ -13,7 +13,10 @@ import {
   ControlPlane,
   openControlPlaneDatabase,
 } from "../../../packages/control-plane/src/index.ts";
-import { compareVersions } from "../src/main.ts";
+import {
+  compareVersions,
+  selectLatestPublishedVersion,
+} from "../src/main.ts";
 
 const executable = resolve("bin", "chartermesh.mjs");
 
@@ -21,6 +24,19 @@ test("version comparison does not treat an older release as an update", () => {
   assert.ok(compareVersions("0.0.7-alpha.1", "0.0.6-alpha.1") > 0);
   assert.ok(compareVersions("0.0.7", "0.0.7-alpha.1") > 0);
   assert.equal(compareVersions("v0.0.7-alpha.1", "0.0.7-alpha.1"), 0);
+});
+
+test("latest release selection includes prereleases and ignores drafts", () => {
+  assert.equal(
+    selectLatestPublishedVersion([
+      { tag_name: "v0.0.7", draft: false, prerelease: false },
+      { tag_name: "v0.0.8-alpha.1", draft: false, prerelease: true },
+      { tag_name: "v0.0.9-alpha.1", draft: true, prerelease: true },
+      { tag_name: "nightly", draft: false, prerelease: true },
+    ]),
+    "0.0.8-alpha.1",
+  );
+  assert.equal(selectLatestPublishedVersion({ tag_name: "v0.0.8-alpha.1" }), null);
 });
 
 function cli(
