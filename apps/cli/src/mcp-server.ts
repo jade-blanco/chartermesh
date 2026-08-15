@@ -2005,7 +2005,7 @@ export function createControlPlaneMcpHandler(
       ),
     ),
     workspaceRoot: options.workspaceRoot
-      ? realpathSync(resolve(options.workspaceRoot))
+      ? realpathSync.native(resolve(options.workspaceRoot))
       : null,
     rolePolicies: new Map(
       Object.entries(options.rolePolicies ?? {}).map(([roleId, policy]) => [

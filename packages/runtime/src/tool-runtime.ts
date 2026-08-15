@@ -865,6 +865,7 @@ export function createWorkspaceTools(
   workspaceRoot: string,
   policy: ToolPolicy,
 ): RuntimeTool[] {
+  const canonicalWorkspaceRoot = realpathSync.native(workspaceRoot);
   return [
     {
       modelTool: {
@@ -885,7 +886,7 @@ export function createWorkspaceTools(
       async execute(value) {
         const args = objectArguments(value);
         const path = canonicalPath(
-          workspaceRoot,
+          canonicalWorkspaceRoot,
           policy,
           args.path,
           "read",
@@ -965,7 +966,7 @@ export function createWorkspaceTools(
       async execute(value) {
         const args = objectArguments(value);
         const path = canonicalPath(
-          workspaceRoot,
+          canonicalWorkspaceRoot,
           policy,
           args.path,
           "read",
@@ -1061,9 +1062,13 @@ export function createWorkspaceTools(
       },
       permission: "workspace_write",
       async execute(value) {
-        const plan = planWorkspaceWrite(workspaceRoot, policy, value);
+        const plan = planWorkspaceWrite(
+          canonicalWorkspaceRoot,
+          policy,
+          value,
+        );
         applyFileTransaction(
-          workspaceRoot,
+          canonicalWorkspaceRoot,
           `runtime-${digest({
             path: plan.path.display,
             beforeSha256: plan.beforeSha256,
@@ -1120,7 +1125,7 @@ export class ToolRuntime {
   readonly #onEvidence?: ToolRuntimeOptions["onEvidence"];
 
   constructor(options: ToolRuntimeOptions) {
-    this.#workspaceRoot = realpathSync(options.workspaceRoot);
+    this.#workspaceRoot = realpathSync.native(options.workspaceRoot);
     this.#workItemId = options.workItemId;
     this.#policy = snapshotToolPolicy(options.policy);
     this.#tools = new Map(

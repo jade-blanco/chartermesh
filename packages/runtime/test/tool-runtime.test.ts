@@ -243,6 +243,52 @@ test("bounded descriptor hashing rejects oversized and replaced paths", () => {
   );
 });
 
+test(
+  "governed writes normalize a Windows 8.3 workspace root before planning",
+  { skip: process.platform !== "win32" },
+  async (context) => {
+    const base = mkdtempSync(join(tmpdir(), "chartermesh-runtime-short-base-"));
+    const workspace = join(base, "governed-workspace-long-name");
+    mkdirSync(workspace);
+    const shortWorkspace = join(base, "GOVERN~1");
+    if (!existsSync(shortWorkspace)) {
+      context.skip("NTFS 8.3 names are disabled for this volume.");
+      return;
+    }
+    if (
+      realpathSync(shortWorkspace) === realpathSync.native(shortWorkspace)
+    ) {
+      context.skip("The legacy resolver already expands this 8.3 root.");
+      return;
+    }
+    const runtime = createWorkspaceToolRuntime({
+      workspaceRoot: shortWorkspace,
+      workItemId: "work-short-root",
+      policy: {
+        allow: ["workspace.write_file"],
+        approvalRequired: ["workspace.write_file"],
+        workspaceRoots: ["."],
+        maxIterations: 2,
+      },
+      isApproved: () => true,
+    });
+    const result = await runtime.executeApprovedCall({
+      id: "write-short-root",
+      name: "workspace.write_file",
+      arguments: {
+        path: "result.txt",
+        content: "native canonical root\n",
+        beforeSha256: null,
+      },
+    });
+    assert.equal(result.evidence.status, "succeeded");
+    assert.equal(
+      readFileSync(join(workspace, "result.txt"), "utf8"),
+      "native canonical root\n",
+    );
+  },
+);
+
 test("workspace writes require an exact human-approved call hash", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-write-"));
   const call = {

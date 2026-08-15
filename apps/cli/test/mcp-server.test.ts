@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -24,8 +25,11 @@ import {
   type JsonRpcResponse,
 } from "../src/mcp-server.ts";
 
-function fixture() {
-  const target = mkdtempSync(join(tmpdir(), "chartermesh-mcp-"));
+function fixture(
+  options: { target?: string; workspaceRoot?: string } = {},
+) {
+  const target = options.target ??
+    mkdtempSync(join(tmpdir(), "chartermesh-mcp-"));
   const stateDirectory = join(target, ".chartermesh");
   mkdirSync(stateDirectory, { recursive: true });
   writeFileSync(
@@ -52,7 +56,7 @@ function fixture() {
       actor: "host:test-codex",
       allowedRoles: ["implementer"],
       allowedExecutionTargets: ["codex"],
-      workspaceRoot: target,
+      workspaceRoot: options.workspaceRoot ?? target,
       rolePolicies: {
         implementer: {
           allow: ["workspace.write_file"],
@@ -742,6 +746,60 @@ test("MCP workspace change sets apply multiple files with one exact human approv
     context.database.close();
   }
 });
+
+test(
+  "MCP governed writes normalize a Windows 8.3 workspace root",
+  { skip: process.platform !== "win32" },
+  async (testContext) => {
+    const base = mkdtempSync(join(tmpdir(), "chartermesh-mcp-short-base-"));
+    const workspace = join(base, "governed-workspace-long-name");
+    mkdirSync(workspace);
+    const shortWorkspace = join(base, "GOVERN~1");
+    if (!existsSync(shortWorkspace)) {
+      testContext.skip("NTFS 8.3 names are disabled for this volume.");
+      return;
+    }
+    if (
+      realpathSync(shortWorkspace) === realpathSync.native(shortWorkspace)
+    ) {
+      testContext.skip("The legacy resolver already expands this 8.3 root.");
+      return;
+    }
+    const context = fixture({
+      target: workspace,
+      workspaceRoot: shortWorkspace,
+    });
+    try {
+      const prepared = await approvedWorkspaceChange(
+        context,
+        "short-root",
+        [{
+          path: "generated.txt",
+          content: "native canonical root\n",
+          beforeSha256: null,
+        }],
+      );
+      const executed = toolEnvelope(await asyncToolCall(
+        context.handler,
+        103,
+        "chartermesh_workspace_write_execute",
+        {
+          id: prepared.id,
+          ...prepared.claim,
+          callHash: prepared.callHash,
+          idempotencyKey: "short-root:execute",
+        },
+      ));
+      assert.equal(executed.ok, true, JSON.stringify(executed));
+      assert.equal(
+        readFileSync(join(workspace, "generated.txt"), "utf8"),
+        "native canonical root\n",
+      );
+    } finally {
+      context.database.close();
+    }
+  },
+);
 
 test("MCP workspace write requests reject paths outside the governed roots", async () => {
   const context = fixture();
