@@ -29,9 +29,13 @@ private paths, or user data.
   projection version.
 - OrgSpec tool allowlists, project-relative workspace roots, symbolic-link
   rejection, and hard iteration bounds
-- Exact-call human approval for every built-in workspace write
-- Tool evidence stores hashes and bounded relative paths rather than raw tool
-  arguments or results
+- Exact-call human approval, exact prior-state hash or absence, recoverable
+  transaction, and durable execution reservation for every built-in workspace
+  write
+- Tool evidence and audit projections store hashes and bounded relative paths
+  rather than raw tool arguments or results. Exact proposed/approved workspace
+  bytes are stored locally in pending approval state so a later fenced process
+  can apply precisely what the person reviewed.
 - Journaled bootstrap replacement with hash-directed crash recovery
 - Per-artifact and per-work-item evidence size limits
 - Allowlisted JSONL audit export that drops unknown payload fields
@@ -54,6 +58,12 @@ absent unless configured and every exact query requires human approval. There
 is no generic URL fetch, shell, package-manager, deployment, or unattended
 external-side-effect tool. The threat model must be expanded before adding any
 such executor, daemon, or unattended AgentHost mutation.
+
+The local filesystem controls reduce accidental and stale-path corruption;
+they do not defend against another malicious local process that can race path
+components during a write, replace the database, or roll back the whole
+project directory. Use operating-system isolation and separately controlled
+approval credentials when that adversary is in scope.
 
 Bundled Agent Skills are instruction text, not trusted executables or
 permissions. External MCP packages in the catalog are metadata only. Review

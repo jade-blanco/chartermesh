@@ -1,8 +1,11 @@
 export { diffValues } from "./diff.ts";
 export {
   applyFileTransaction,
+  recoverFileTransaction,
   recoverFileTransactions,
   type FileTransactionInput,
+  type FileTransactionOptions,
+  type FileTransactionOptions,
   type RecoveryResult,
 } from "./file-transaction.ts";
 export {

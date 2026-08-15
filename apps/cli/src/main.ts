@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
@@ -12,6 +13,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -19,7 +21,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, join, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { FakeModelEngine } from "../../../adapters/model-engines/fake/src/index.ts";
 import {
   CommandProcessModelEngine,
@@ -32,6 +35,10 @@ import {
   validateOpenAICompatibleConfig,
   type OpenAICompatibleConfig,
 } from "../../../adapters/model-engines/openai-compatible/src/index.ts";
+import {
+  CodexAppServerAgentHost,
+} from "../../../adapters/agent-hosts/codex/src/index.ts";
+import type { AgentHost } from "../../../packages/adapter-sdk/src/index.ts";
 import {
   ControlPlane,
   acquireMaintenanceLock,
@@ -48,6 +55,7 @@ import {
 } from "../../../packages/orgspec/src/index.ts";
 import {
   applyFileTransaction,
+  recoverFileTransaction,
   recoverFileTransactions,
 } from "../../../packages/compiler/src/index.ts";
 import {
@@ -57,13 +65,22 @@ import {
   capabilityCatalog,
   createWorkspaceToolRuntime,
   createWebSearchTools,
+  createHostProjectionPlan,
+  discoverHost,
   evaluateIntervalSchedule,
   parseRuntimeConfig,
+  parseStructuredArtifact,
   portableAgentEntrypoint,
   portableSkillDocuments,
+  readBoundedRegularText,
   recommendedCapabilities,
+  resolveProjectStatePaths,
   validateWebSearchConfig,
   type RuntimeConfig,
+  type HostCapabilitySnapshotInput,
+  type HostExecutableBinding,
+  type HostKind,
+  type HostProjectionOperation,
   type ToolExecutionEvidence,
 } from "../../../packages/runtime/src/index.ts";
 import {
@@ -73,6 +90,18 @@ import {
 } from "./proposal.ts";
 import { evaluateModelEngine } from "./evaluate-model.ts";
 import { evaluateCollaboration } from "./evaluate-collaboration.ts";
+import { runControlPlaneMcpStdio } from "./mcp-server.ts";
+import {
+  beginApplyOperation,
+  completeApplyOperation,
+  findApplyOperation,
+  inspectApplyOperationFiles,
+  listPendingApplyOperations,
+  markApplyOperationDatabaseCommitted,
+  markApplyOperationFilesCommitted,
+  type ApplyOperationReceipt,
+  type JsonValue,
+} from "./apply-operation-journal.ts";
 import { collectCodeEvaluationProvenance } from "./code-evaluation/provenance.ts";
 import {
   SandboxContainmentError,
@@ -125,7 +154,9 @@ import {
 } from "./decision-review-evaluation/resume.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
-const CHARTERMESH_VERSION = "0.0.8-alpha.1";
+const CHARTERMESH_VERSION = "0.0.9-alpha.1";
+const CHARTERMESH_GITHUB_REF =
+  `github:jade-blanco/chartermesh#v${CHARTERMESH_VERSION}`;
 
 interface BootstrapFile {
   path: string;
@@ -136,10 +167,42 @@ interface BootstrapFile {
 
 interface BootstrapPlan {
   apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1";
-  operation: "bootstrap" | "configure-engine";
+  operation: "bootstrap" | "kickoff" | "configure-engine" | "configure-host";
   target: string;
   engine: string;
   files: BootstrapFile[];
+  kickoff?: {
+    title: string;
+    summary: string;
+    briefHash: string;
+    ownerRole: string;
+    executionTarget: string;
+    priority: number;
+    decisionQuestion: string;
+    acceptanceCriteria: Array<{
+      id: string;
+      text: string;
+      critical: boolean;
+      evidenceRequirements: [];
+    }>;
+  };
+  hostBinding?: {
+    kind: HostKind;
+    executablePath: string;
+    executableSha256: string;
+    args: string[];
+    reportedVersion: string;
+    capabilitySnapshotSha256: string;
+    projectionPlanHash: string;
+    directProtocol: boolean;
+  };
+  workRetargets?: Array<{
+    id: string;
+    expectedVersion: number;
+    ownerRole: string;
+    fromExecutionTarget: string;
+    toExecutionTarget: string;
+  }>;
   planHash: string;
 }
 
@@ -265,20 +328,81 @@ function targetOf(args: string[]): string {
   return resolve(option(args, "--target") ?? process.cwd());
 }
 
+function findInitializedProjectRoot(start: string): string | null {
+  let current = resolve(start);
+  while (true) {
+    if (
+      existsSync(join(current, ".chartermesh", "organization.json")) &&
+      existsSync(join(current, ".chartermesh", "state.db"))
+    ) {
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function discoverMcpProjectRoot(): string {
+  const candidates = [
+    process.env.CLAUDE_PROJECT_DIR,
+    process.cwd(),
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    const found = findInitializedProjectRoot(candidate);
+    if (found) return found;
+  }
+  throw new Error(
+    "No initialized CharterMesh project was found from the host project directory or current directory.",
+  );
+}
+
 function statePaths(target: string) {
-  const root = join(target, ".chartermesh");
+  return resolveProjectStatePaths(target);
+}
+
+function pendingFileTransactionState(target: string): {
+  pending: boolean;
+  transactionCount: number;
+  applyLock: boolean;
+  invalidMetadata: boolean;
+} {
+  const root = statePaths(target).root;
+  const transactionRoot = join(root, ".transactions");
+  const applyLockPath = join(root, ".apply-lock");
+  let transactionCount = 0;
+  let invalidMetadata = false;
+  if (existsSync(transactionRoot)) {
+    const metadata = lstatSync(transactionRoot);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      invalidMetadata = true;
+    } else {
+      transactionCount = readdirSync(transactionRoot).length;
+    }
+  }
+  let applyLock = false;
+  if (existsSync(applyLockPath)) {
+    const metadata = lstatSync(applyLockPath);
+    applyLock = true;
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      invalidMetadata = true;
+    }
+  }
   return {
-    root,
-    database: join(root, "state.db"),
-    artifacts: join(root, "artifacts"),
-    installation: join(root, "installation.json"),
-    organization: join(root, "organization.json"),
-    proposal: join(root, "proposal.json"),
-    runtime: join(root, "runtime.json"),
-    exports: join(root, "exports"),
-    backups: join(root, "backups"),
-    engineWork: join(root, "engine-work"),
+    pending: transactionCount > 0 || applyLock || invalidMetadata,
+    transactionCount,
+    applyLock,
+    invalidMetadata,
   };
+}
+
+function assertNoPendingFileTransactions(target: string): void {
+  const state = pendingFileTransactionState(target);
+  if (state.pending) {
+    throw new Error(
+      "A prior file transaction requires explicit inspection and recovery; run chartermesh recover before generating a new plan.",
+    );
+  }
 }
 
 function controlPlaneFor(target: string) {
@@ -297,7 +421,7 @@ function controlPlaneFor(target: string) {
   if (existsSync(paths.organization)) {
     try {
       const organization = JSON.parse(
-        readFileSync(paths.organization, "utf8"),
+        readBoundedRegularText(paths.organization),
       ) as {
         spec?: { budgets?: typeof budgets };
       };
@@ -320,7 +444,7 @@ function readRuntime(target: string): RuntimeConfig {
       "Runtime configuration is missing. Run 'chartermesh bootstrap' first.",
     );
   }
-  return parseRuntimeConfig(readFileSync(path, "utf8"));
+  return parseRuntimeConfig(readBoundedRegularText(path));
 }
 
 function readOrganization(target: string) {
@@ -330,7 +454,7 @@ function readOrganization(target: string) {
       "Organization configuration is missing. Run 'chartermesh bootstrap' first.",
     );
   }
-  return parseOrgSpec(readFileSync(path, "utf8"));
+  return parseOrgSpec(readBoundedRegularText(path));
 }
 
 function configuredEngine(
@@ -546,7 +670,7 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
 
 function bootstrapPlan(args: string[]): BootstrapPlan {
   const target = targetOf(args);
-  recoverFileTransactions(target);
+  assertNoPendingFileTransactions(target);
   const runtime = runtimeTemplate(args);
   const paths = statePaths(target);
   const proposal = proposalFor(args);
@@ -585,10 +709,12 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
         "artifacts/",
         "backups/",
         "engine-work/",
+        "hosts/",
         "exports/",
         "dashboard.port",
         ".transactions/",
         ".apply-lock/",
+        "operations/",
         "",
       ].join("\n"),
     },
@@ -604,7 +730,7 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
         "- Credentials are read only from the environment variable named in `runtime.json`.",
         "- `AGENT-ENTRYPOINT.md` and `skills/` contain provider-neutral, Apache-2.0 guidance.",
         "- External search is disabled unless `runtime.json` names a reviewed endpoint and OrgSpec allows `web.search`.",
-        "- Run `chartermesh doctor --target .` before live model use.",
+        `- Run \`npx --yes ${CHARTERMESH_GITHUB_REF} doctor --target .\` before live model use.`,
         "",
       ].join("\n"),
     },
@@ -637,9 +763,1031 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
   return { ...body, planHash: sha256(body) };
 }
 
+function kickoffPlan(args: string[]): BootstrapPlan {
+  const briefFile = option(args, "--brief-file");
+  if (!briefFile) {
+    throw new Error("kickoff requires --brief-file PATH.");
+  }
+  const briefPath = resolve(briefFile);
+  if (!existsSync(briefPath) || !statSync(briefPath).isFile()) {
+    throw new Error(`Project brief does not exist: ${briefPath}`);
+  }
+  const briefBytes = readFileSync(briefPath);
+  if (briefBytes.byteLength > 65_536) {
+    throw new Error("Project brief must be 64 KiB or smaller.");
+  }
+  const rawBrief = briefBytes.toString("utf8");
+  if (rawBrief.includes("\0")) {
+    throw new Error("Project brief cannot contain NUL bytes.");
+  }
+  const brief = rawBrief.trim();
+  if (!brief) throw new Error("Project brief cannot be empty.");
+  const base = bootstrapPlan(args);
+  const titleFromBrief = brief
+    .split(/\r?\n/u)
+    .map((line) => line.replace(/^#+\s*/u, "").trim())
+    .find(Boolean) ?? "Implement the approved project brief";
+  const title = (option(args, "--title") ?? titleFromBrief).trim();
+  if (!title || title.length > 240) {
+    throw new Error("Kickoff title must contain 1 to 240 characters.");
+  }
+  const ownerRole = option(args, "--role") ?? "operator";
+  const executionTarget = option(args, "--execution-target") ?? "local";
+  const priority = Number(option(args, "--priority") ?? 70);
+  if (!Number.isInteger(priority) || priority < 0 || priority > 100) {
+    throw new Error("--priority must be an integer from 0 to 100.");
+  }
+  const briefHash = createHash("sha256").update(brief).digest("hex");
+  const acceptanceTexts = options(args, "--acceptance");
+  const criteria = (
+    acceptanceTexts.length > 0
+      ? acceptanceTexts
+      : ["The deliverable satisfies the approved project brief and reports its verification evidence."]
+  ).map((text, index) => {
+    const clean = text.trim();
+    if (!clean || clean.length > 4_000) {
+      throw new Error("Each --acceptance value must contain 1 to 4000 characters.");
+    }
+    return {
+      id: `kickoff-${index + 1}`,
+      text: clean,
+      critical: true,
+      evidenceRequirements: [] as [],
+    };
+  });
+  const summaryPrefix =
+    `Implement the approved project brief stored at .chartermesh/PROJECT-BRIEF.md ` +
+    `(SHA-256 ${briefHash}).\n\n`;
+  const summary = `${summaryPrefix}${brief}`.slice(0, 4_000);
+  const projectBriefPath = join(base.target, ".chartermesh", "PROJECT-BRIEF.md");
+  const rootGuidePath = join(base.target, "CHARTERMESH.md");
+  const extraDesired = [
+    {
+      path: projectBriefPath,
+      content: `${brief}\n`,
+    },
+    {
+      path: rootGuidePath,
+      content: [
+        "# CharterMesh project",
+        "",
+        "The approved project brief is `.chartermesh/PROJECT-BRIEF.md`.",
+        "Mutable work, runs, host bindings, evidence, and decisions live in the local Control Plane database.",
+        "Do not replace that ledger with a Markdown task list or a provider-native task list.",
+        "",
+        "Start every coding-agent session by reading `.chartermesh/AGENT-ENTRYPOINT.md`, then run:",
+        "",
+        "```text",
+        `npx --yes ${CHARTERMESH_GITHUB_REF} doctor --target .`,
+        `npx --yes ${CHARTERMESH_GITHUB_REF} list --target . --active-only`,
+        "```",
+        "",
+        "Use the CharterMesh CLI or its local MCP server for state changes. Human approval remains required for exact plans, tools that require approval, and final decisions.",
+        "",
+      ].join("\n"),
+    },
+  ];
+  const files = [
+    ...base.files,
+    ...extraDesired.map(({ path, content }) => ({
+      path,
+      content,
+      beforeHash: existsSync(path)
+        ? createHash("sha256").update(readFileSync(path)).digest("hex")
+        : null,
+      afterHash: createHash("sha256").update(content).digest("hex"),
+    })),
+  ];
+  const kickoff = {
+    title,
+    summary,
+    briefHash,
+    ownerRole,
+    executionTarget,
+    priority,
+    decisionQuestion:
+      option(args, "--decision-question") ??
+      "Does the result satisfy the approved project brief?",
+    acceptanceCriteria: criteria,
+  };
+  const body = {
+    apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1" as const,
+    operation: "kickoff" as const,
+    target: base.target,
+    engine: base.engine,
+    files,
+    kickoff,
+  };
+  return { ...body, planHash: sha256(body) };
+}
+
+function hostKindOf(args: string[]): HostKind {
+  const value = option(args, "--host");
+  if (value !== "codex" && value !== "claude") {
+    throw new Error("--host must be codex or claude.");
+  }
+  return value;
+}
+
+function declaredHostCapabilitySnapshot(
+  hostKind: HostKind,
+  directProtocol: boolean,
+): HostCapabilitySnapshotInput {
+  return {
+    contractVersion: "chartermesh.dev/host-capabilities/v1alpha1",
+    hostKind,
+    capabilities: [
+      { name: "agents.project", support: "native", stability: "beta" },
+      { name: "instructions.project", support: "native", stability: "stable" },
+      { name: "mcp.stdio", support: "native", stability: "stable" },
+      {
+        name: "sessions.resume",
+        support: hostKind === "codex" && directProtocol
+          ? "native"
+          : "manual_step_required",
+        stability: "beta",
+      },
+    ],
+  };
+}
+
+function locateHostExecutable(command: string): string | null {
+  if (isAbsolute(command)) {
+    return existsSync(command) && statSync(command).isFile()
+      ? realpathSync(command)
+      : null;
+  }
+  if (command.includes("/") || command.includes("\\")) {
+    const candidate = resolve(command);
+    return existsSync(candidate) && statSync(candidate).isFile()
+      ? realpathSync(candidate)
+      : null;
+  }
+  const pathValue = process.env.PATH ?? "";
+  const extensions = process.platform === "win32"
+    ? [".exe", ".cmd", ".bat", ".com", ""]
+    : [""];
+  for (const directory of pathValue.split(process.platform === "win32" ? ";" : ":")) {
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = join(directory, `${command}${extension}`);
+      try {
+        if (existsSync(candidate) && statSync(candidate).isFile()) {
+          return realpathSync(candidate);
+        }
+      } catch {
+        // Continue through PATH entries that are inaccessible or stale.
+      }
+    }
+  }
+  return null;
+}
+
+async function inspectHost(
+  target: string,
+  args: string[],
+): Promise<HostExecutableBinding & {
+  args: string[];
+  protocolVersion?: string;
+}> {
+  const hostKind = hostKindOf(args);
+  const directProtocol =
+    hostKind === "codex" &&
+    (has(args, "--direct") || options(args, "--activate-role").length > 0);
+  const hostArgs = options(args, "--host-arg");
+  const executableInput = option(args, "--executable") ?? hostKind;
+  const located = locateHostExecutable(executableInput);
+  if (!located) {
+    throw new Error(
+      `${hostKind} executable was not found. Pass --executable ABSOLUTE_PATH.`,
+    );
+  }
+  const windowsCommandWrapper =
+    process.platform === "win32" && /\.(?:cmd|bat)$/iu.test(located);
+  if (windowsCommandWrapper && hostArgs.length > 0) {
+    throw new Error(
+      "Windows command wrappers do not accept --host-arg during host discovery.",
+    );
+  }
+  if (windowsCommandWrapper && /[&|<>^%!`\r\n]/u.test(located)) {
+    throw new Error(
+      "Windows command wrapper path contains unsafe shell metacharacters.",
+    );
+  }
+  const observedSha256 = createHash("sha256")
+    .update(readFileSync(located))
+    .digest("hex");
+  const expectedSha256 = option(args, "--executable-sha256") ?? observedSha256;
+  let observedVersionOutput = "";
+  const result = await discoverHost(
+    {
+      hostKind,
+      executablePath: located,
+      expectedExecutableSha256: expectedSha256,
+      expectedVersion: option(args, "--expected-version"),
+      expectedCapabilitySnapshotSha256: option(
+        args,
+        "--capability-snapshot-sha256",
+      ),
+      requiredCapabilities: [
+        "agents.project",
+        "instructions.project",
+        "mcp.stdio",
+      ],
+      capabilitySnapshot: declaredHostCapabilitySnapshot(hostKind, directProtocol),
+      versionArgs: [...hostArgs, "--version"],
+      projectRoot: target,
+    },
+    {
+      files: {
+        async locateExecutable(command) {
+          return locateHostExecutable(command);
+        },
+        async realpath(path) {
+          return realpathSync(path);
+        },
+        async isFile(path) {
+          return statSync(path).isFile();
+        },
+        async readFile(path) {
+          return readFileSync(path);
+        },
+      },
+      process: {
+        async run(input) {
+          const windowsWrapper =
+            process.platform === "win32" &&
+            /\.(?:cmd|bat)$/iu.test(input.executable);
+          const systemRoot =
+            process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+          if (
+            windowsWrapper &&
+            (input.args.length !== 1 || input.args[0] !== "--version")
+          ) {
+            throw new Error(
+              "Windows command wrappers may be probed only with --version.",
+            );
+          }
+          const spawnOptions = {
+            cwd: input.cwd,
+            env: windowsWrapper
+              ? {
+                  SystemRoot: systemRoot,
+                  WINDIR: systemRoot,
+                  ComSpec:
+                    process.env.ComSpec ??
+                    join(systemRoot, "System32", "cmd.exe"),
+                  PATHEXT: process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
+                  PATH: [
+                    dirname(process.execPath),
+                    dirname(input.executable),
+                  ].join(";"),
+                }
+              : input.environment,
+            encoding: "utf8" as const,
+            timeout: 10_000,
+            maxBuffer: input.maxOutputBytes,
+            windowsHide: true,
+          };
+          const probe = windowsWrapper
+            ? spawnSync(`"${input.executable}" --version`, {
+                ...spawnOptions,
+                shell: true,
+              })
+            : spawnSync(input.executable, [...input.args], {
+                ...spawnOptions,
+                shell: false,
+              });
+          if (probe.error) throw probe.error;
+          observedVersionOutput = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
+          return {
+            exitCode: probe.status ?? -1,
+            stdout: probe.stdout ?? "",
+            stderr: probe.stderr ?? "",
+          };
+        },
+      },
+    },
+  );
+  if (!result.ok || !result.binding) {
+    throw new Error(
+      result.issues.map(({ code, message }) => `${code}: ${message}`).join("\n"),
+    );
+  }
+  if (
+    hostKind === "claude" &&
+    !/\bClaude Code\b/iu.test(observedVersionOutput)
+  ) {
+    throw new Error(
+      "Claude executable version output did not identify Anthropic Claude Code.",
+    );
+  }
+  if (hostKind === "codex" && !/\bcodex(?:-cli)?\b/iu.test(observedVersionOutput)) {
+    throw new Error(
+      "Codex executable version output did not identify OpenAI Codex CLI.",
+    );
+  }
+  if (hostKind === "codex" && directProtocol) {
+    const adapter = new CodexAppServerAgentHost({
+      id: "codex-protocol-probe",
+      command: result.binding.executablePath,
+      ...(hostArgs.length > 0 ? { args: hostArgs } : {}),
+      executableSha256: result.binding.executableSha256,
+      workingDirectory: target,
+      allowUnrestrictedRead: true,
+      discoveryTimeoutMs: 15_000,
+    });
+    const discovery = await adapter.discover();
+    if (!discovery.available) {
+      throw new Error(
+        discovery.diagnostics
+          .map(({ code, message }) => `${code}: ${message}`)
+          .join("\n") || "Codex app-server protocol discovery failed.",
+      );
+    }
+    if (discovery.providerVersion !== result.binding.reportedVersion) {
+      throw new Error(
+        `Codex app-server reported ${discovery.providerVersion ?? "an unknown version"}, but the executable reported ${result.binding.reportedVersion}.`,
+      );
+    }
+    return {
+      ...result.binding,
+      args: hostArgs,
+      ...(discovery.protocolVersion
+        ? { protocolVersion: discovery.protocolVersion }
+        : {}),
+    };
+  }
+  return { ...result.binding, args: hostArgs };
+}
+
+function splitTomlSections(text: string): Array<{
+  name: string;
+  header: string;
+  body: string[];
+}> {
+  const sections: Array<{ name: string; header: string; body: string[] }> = [];
+  let current: { name: string; header: string; body: string[] } | undefined;
+  for (const line of text.replaceAll("\r\n", "\n").split("\n")) {
+    const match = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/u);
+    if (match) {
+      current = { name: match[1]!.trim(), header: line, body: [] };
+      sections.push(current);
+    } else if (current) {
+      current.body.push(line);
+    }
+  }
+  return sections;
+}
+
+function assertMergeableCodexToml(text: string): void {
+  if (/"""|'''/u.test(text)) {
+    throw new Error(
+      "Codex config contains a multiline string; refusing an ambiguous merge.",
+    );
+  }
+  const seenTables = new Set<string>();
+  let table = "";
+  for (const [offset, line] of text.replaceAll("\r\n", "\n").split("\n").entries()) {
+    const lineNumber = offset + 1;
+    if (/^\s*\[\[/u.test(line)) {
+      throw new Error(
+        `Codex config contains an array table at line ${lineNumber}; refusing an ambiguous merge.`,
+      );
+    }
+    const headerLike = /^\s*\[/u.test(line);
+    const header = line.match(
+      /^\s*\[([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)\]\s*(?:#.*)?$/u,
+    );
+    if (headerLike) {
+      if (!header) {
+        throw new Error(
+          `Codex config contains an unsupported or quoted table at line ${lineNumber}.`,
+        );
+      }
+      table = header[1]!;
+      if (seenTables.has(table)) {
+        throw new Error(`Codex config has duplicate ${table} tables.`);
+      }
+      seenTables.add(table);
+      if (
+        table.startsWith("agents.") ||
+        table.startsWith("mcp_servers.chartermesh.")
+      ) {
+        throw new Error(
+          `Codex config defines the managed namespace '${table}' as a nested table.`,
+        );
+      }
+      continue;
+    }
+    const uncommented = line.replace(/\s+#.*$/u, "").trim();
+    if (!uncommented) continue;
+    const assignment = uncommented.match(/^([^=]+?)\s*=\s*(.*)$/u);
+    if (!assignment) {
+      throw new Error(`Codex config has unsupported syntax at line ${lineNumber}.`);
+    }
+    const key = assignment[1]!.trim();
+    const value = assignment[2]!.trim();
+    if (!/^[A-Za-z0-9_-]+$/u.test(key)) {
+      throw new Error(
+        `Codex config contains a dotted or quoted key at line ${lineNumber}; refusing an ambiguous merge.`,
+      );
+    }
+    if (value.startsWith("{")) {
+      throw new Error(
+        `Codex config contains an inline table at line ${lineNumber}; refusing an ambiguous merge.`,
+      );
+    }
+    if (
+      (table === "" && (key === "agents" || key === "mcp_servers")) ||
+      (table === "mcp_servers" && key === "chartermesh")
+    ) {
+      throw new Error(
+        `Codex config defines the managed namespace through '${key}' at line ${lineNumber}.`,
+      );
+    }
+  }
+}
+
+function mergeCodexToml(existing: string, fragment: string): string {
+  if (!existing.trim()) return fragment.endsWith("\n") ? fragment : `${fragment}\n`;
+  assertMergeableCodexToml(existing);
+  const fragmentSections = splitTomlSections(fragment);
+  const agentFragment = fragmentSections.find(({ name }) => name === "agents");
+  const mcpFragment = fragmentSections.find(
+    ({ name }) => name === "mcp_servers.chartermesh",
+  );
+  if (!agentFragment || !mcpFragment) {
+    throw new Error("Generated Codex projection fragment is incomplete.");
+  }
+  let lines = existing.replaceAll("\r\n", "\n").split("\n");
+  const tableRanges = (name: string) => {
+    const starts = lines
+      .map((line, index) => ({
+        index,
+        match: line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/u),
+      }))
+      .filter(({ match }) => match?.[1]?.trim() === name)
+      .map(({ index }) => index);
+    return starts.map((start) => ({
+      start,
+      end:
+        lines.findIndex(
+          (line, index) =>
+            index > start && /^\s*\[[^\]]+\]\s*(?:#.*)?$/u.test(line),
+        ) < 0
+          ? lines.length
+          : lines.findIndex(
+              (line, index) =>
+                index > start && /^\s*\[[^\]]+\]\s*(?:#.*)?$/u.test(line),
+            ),
+    }));
+  };
+  const existingMcp = tableRanges("mcp_servers.chartermesh");
+  if (existingMcp.length > 1) {
+    throw new Error("Codex config has duplicate mcp_servers.chartermesh tables.");
+  }
+  if (existingMcp[0]) {
+    lines.splice(existingMcp[0].start, existingMcp[0].end - existingMcp[0].start);
+  }
+  const existingAgents = tableRanges("agents");
+  if (existingAgents.length > 1) {
+    throw new Error("Codex config has duplicate agents tables.");
+  }
+  const desiredAgentLines = agentFragment.body.filter((line) =>
+    /^\s*[A-Za-z0-9_.-]+\s*=/u.test(line)
+  );
+  if (!existingAgents[0]) {
+    while (lines.at(-1) === "") lines.pop();
+    lines.push("", agentFragment.header, ...desiredAgentLines);
+  } else {
+    let range = tableRanges("agents")[0]!;
+    for (const desiredLine of desiredAgentLines) {
+      const key = desiredLine.match(/^\s*([A-Za-z0-9_.-]+)\s*=/u)![1]!;
+      const matching = lines
+        .map((line, index) => ({ line, index }))
+        .filter(
+          ({ line, index }) =>
+            index > range.start &&
+            index < range.end &&
+            line.match(/^\s*([A-Za-z0-9_.-]+)\s*=/u)?.[1] === key,
+        );
+      if (matching.length > 1) {
+        throw new Error(`Codex config has duplicate agents.${key} keys.`);
+      }
+      if (matching[0]) lines[matching[0].index] = desiredLine;
+      else {
+        lines.splice(range.end, 0, desiredLine);
+        range = { ...range, end: range.end + 1 };
+      }
+    }
+  }
+  while (lines.at(-1) === "") lines.pop();
+  lines.push("", mcpFragment.header, ...mcpFragment.body.filter((line) => line.length > 0), "");
+  return lines.join("\n");
+}
+
+function mergeClaudeMcpJson(existing: string, fragment: string): string {
+  const current = existing.trim() ? JSON.parse(existing) as unknown : {};
+  const desired = JSON.parse(fragment) as {
+    mcpServers: { chartermesh: unknown };
+  };
+  if (!current || typeof current !== "object" || Array.isArray(current)) {
+    throw new Error(".mcp.json must contain a JSON object.");
+  }
+  const record = current as Record<string, unknown>;
+  const currentServers = record.mcpServers;
+  if (
+    currentServers !== undefined &&
+    (!currentServers || typeof currentServers !== "object" || Array.isArray(currentServers))
+  ) {
+    throw new Error(".mcp.json mcpServers must contain a JSON object.");
+  }
+  return `${JSON.stringify(
+    {
+      ...record,
+      mcpServers: {
+        ...((currentServers ?? {}) as Record<string, unknown>),
+        chartermesh: desired.mcpServers.chartermesh,
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function upsertMarkdownProjection(
+  existing: string,
+  sectionId: string,
+  content: string,
+): string {
+  const begin = `<!-- chartermesh:${sectionId}:begin -->`;
+  const end = `<!-- chartermesh:${sectionId}:end -->`;
+  const section = `${begin}\n${content.trim()}\n${end}`;
+  const start = existing.indexOf(begin);
+  const finish = existing.indexOf(end);
+  if ((start < 0) !== (finish < 0) || (start >= 0 && finish < start)) {
+    throw new Error(`Markdown integration markers for '${sectionId}' are malformed.`);
+  }
+  if (start >= 0) {
+    const after = finish + end.length;
+    return `${existing.slice(0, start)}${section}${existing.slice(after)}`;
+  }
+  return `${existing.trimEnd()}${existing.trim() ? "\n\n" : ""}${section}\n`;
+}
+
+const HOST_PROJECTION_MAX_EXISTING_BYTES = 1024 * 1024;
+
+function readProjectionFile(target: string, candidate: string): string {
+  const root = resolve(target);
+  const path = resolve(candidate);
+  const rest = relative(root, path);
+  if (rest === ".." || rest.startsWith(`..${sep}`) || isAbsolute(rest)) {
+    throw new Error("Host projection path escapes the target.");
+  }
+  const ancestors: string[] = [];
+  let cursor = path;
+  while (true) {
+    ancestors.push(cursor);
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  for (const component of ancestors.reverse()) {
+    if (!existsSync(component)) break;
+    if (lstatSync(component).isSymbolicLink()) {
+      throw new Error(
+        `Host projection refuses a linked or reparse-point path: ${component}`,
+      );
+    }
+  }
+  if (!existsSync(path)) return "";
+  const before = lstatSync(path);
+  if (
+    !before.isFile() ||
+    before.size > HOST_PROJECTION_MAX_EXISTING_BYTES
+  ) {
+    throw new Error(
+      `Host projection source must be a regular file no larger than ${HOST_PROJECTION_MAX_EXISTING_BYTES} bytes.`,
+    );
+  }
+  let descriptor: number | undefined;
+  try {
+    const noFollow =
+      typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+    descriptor = openSync(path, constants.O_RDONLY | noFollow);
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile() ||
+      opened.size > HOST_PROJECTION_MAX_EXISTING_BYTES ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      throw new Error("Host projection source changed while opening.");
+    }
+    return readFileSync(descriptor, "utf8");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function projectionContent(target: string, operation: HostProjectionOperation): string {
+  const path = resolve(target, operation.path);
+  const relativePath = relative(resolve(target), path);
+  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    throw new Error(`Host projection path escapes the target: ${operation.path}`);
+  }
+  if (createHash("sha256").update(operation.content).digest("hex") !== operation.contentSha256) {
+    throw new Error(`Host projection content hash mismatch: ${operation.path}`);
+  }
+  const existing = readProjectionFile(target, path);
+  if (operation.kind === "write_managed_file") return operation.content;
+  if (operation.kind === "merge_toml_fragment") {
+    return mergeCodexToml(existing, operation.content);
+  }
+  if (operation.kind === "merge_json_fragment") {
+    return mergeClaudeMcpJson(existing, operation.content);
+  }
+  return upsertMarkdownProjection(existing, operation.sectionId, operation.content);
+}
+
+async function configureHostPlan(args: string[]): Promise<BootstrapPlan> {
+  const target = targetOf(args);
+  assertNoPendingFileTransactions(target);
+  const paths = statePaths(target);
+  if (!existsSync(paths.organization) || !existsSync(paths.runtime)) {
+    throw new Error("CharterMesh is not initialized. Run kickoff or bootstrap first.");
+  }
+  const binding = await inspectHost(target, args);
+  const organization = readOrganization(target);
+  const runtime = readRuntime(target);
+  const hostId = `${binding.hostKind}-host`;
+  const projectHostId = `${binding.hostKind}-project-host`;
+  const projectTargetId = `${binding.hostKind}-project`;
+  if (binding.hostKind === "codex" && !has(args, "--allow-unrestricted-read")) {
+    throw new Error(
+      "Configuring Codex roles requires --allow-unrestricted-read because its read-only sandbox does not confine reads to the project directory.",
+    );
+  }
+  const previousRoleTargets = new Map(
+    organization.spec.roles.map((role) => [role.id, role.execution.preferred]),
+  );
+  const roles = organization.spec.roles.map((role) => ({
+    id: role.id,
+    description: `${role.name}: ${role.class} role for ${organization.metadata.name}.`,
+    instructions: [
+      `Fulfill the '${role.id}' role using capabilities: ${role.capabilities.join(", ") || "none"}.`,
+      `Allowed tools: ${role.tools.allow.join(", ") || "none"}.`,
+      role.tools.approvalRequired?.length
+        ? `The following tools still require Control Plane approval: ${role.tools.approvalRequired.join(", ")}.`
+        : "Do not infer any additional approval authority.",
+    ].join("\n"),
+    permission:
+      role.tools.allow.includes("workspace.write_file") &&
+        !role.tools.approvalRequired?.includes("workspace.write_file")
+        ? "workspace_write" as const
+        : "read_only" as const,
+  }));
+  const projection = createHostProjectionPlan({
+    binding,
+    roles,
+    bridge: {
+      command: option(args, "--bridge-command") ?? "npx",
+      args:
+        options(args, "--bridge-arg").length > 0
+          ? options(args, "--bridge-arg")
+          : [
+              "--yes",
+              `github:jade-blanco/chartermesh#v${CHARTERMESH_VERSION}`,
+              "mcp",
+              "serve",
+              "--find-project-root",
+              "--actor",
+              `host:${binding.hostKind}`,
+              ...roles.flatMap(({ id }) => ["--role", id]),
+              "--execution-target",
+              projectTargetId,
+            ],
+      cwd: ".",
+    },
+    maxConcurrentAgents: Number(option(args, "--max-agents") ?? 4),
+  });
+  const desired = projection.operations.map((operation) => ({
+    path: resolve(target, operation.path),
+    content: projectionContent(target, operation),
+  }));
+  organization.spec.agentHosts = [
+    ...organization.spec.agentHosts.filter(({ id }) =>
+      ![hostId, projectHostId].includes(id)
+    ),
+    {
+      id: projectHostId,
+      adapter: `${binding.hostKind}-project-session`,
+      executionHost: "local",
+      enabled: true,
+    },
+  ];
+  organization.spec.executionTargets = [
+    ...organization.spec.executionTargets.filter(({ id }) =>
+      ![hostId, projectTargetId].includes(id)
+    ),
+    {
+      id: projectTargetId,
+      kind: "agent_host",
+      hostRef: projectHostId,
+      enabled: true,
+    },
+  ];
+  if (binding.hostKind === "codex") {
+    const activated = options(args, "--activate-role");
+    const activatedRoles = new Set(activated);
+    if (activated.length > 0) {
+      organization.spec.agentHosts.push({
+        id: hostId,
+        adapter: "codex-app-server",
+        executionHost: "local",
+        enabled: true,
+      });
+      organization.spec.executionTargets.push({
+        id: hostId,
+        kind: "agent_host",
+        hostRef: hostId,
+        enabled: true,
+      });
+    }
+    for (const roleId of activatedRoles) {
+      if (!organization.spec.roles.some(({ id }) => id === roleId)) {
+        throw new Error(`Unknown --activate-role '${roleId}'.`);
+      }
+    }
+    for (const role of organization.spec.roles) {
+      const direct = activatedRoles.has(role.id);
+      const preferred = direct ? hostId : projectTargetId;
+      const candidates = [
+        ...(direct ? [projectTargetId] : []),
+        role.execution.preferred,
+        ...(role.execution.fallbacks ?? []),
+      ];
+      role.execution = {
+        preferred,
+        fallbacks: [...new Set(candidates)].filter((targetId) =>
+          targetId !== preferred &&
+          (direct || targetId !== hostId) &&
+          organization.spec.executionTargets.some(
+            ({ id, enabled }) => id === targetId && enabled,
+          )
+        ),
+      };
+    }
+    runtime.agentHosts = (runtime.agentHosts ?? []).filter(
+      ({ id }) => id !== hostId,
+    );
+    if (activated.length > 0) {
+      runtime.agentHosts.push({
+        id: hostId,
+        adapter: "codex-app-server",
+        command: binding.executablePath,
+        executableSha256: binding.executableSha256,
+        ...(binding.args.length > 0 ? { args: binding.args } : {}),
+        ...(options(args, "--pass-env").length > 0
+          ? { environmentAllowlist: options(args, "--pass-env") }
+          : {}),
+        ...(option(args, "--model") ? { model: option(args, "--model") } : {}),
+        ...(option(args, "--reasoning-effort")
+          ? {
+              reasoningEffort: option(args, "--reasoning-effort") as
+                | "low"
+                | "medium"
+                | "high"
+                | "xhigh",
+            }
+          : {}),
+        ...(has(args, "--allow-unrestricted-read")
+          ? { allowUnrestrictedRead: true }
+          : {}),
+        timeoutMs: Number(option(args, "--timeout-ms") ?? 600_000),
+      });
+    }
+    parseRuntimeConfig(`${JSON.stringify(runtime)}\n`);
+    desired.push({
+      path: paths.runtime,
+      content: `${JSON.stringify(runtime, null, 2)}\n`,
+    });
+  } else {
+    if (options(args, "--activate-role").length > 0) {
+      throw new Error(
+        "Claude role activation requires a future direct AgentHost adapter; project roles and MCP can still be configured now.",
+      );
+    }
+    runtime.agentHosts = (runtime.agentHosts ?? []).filter(
+      ({ id }) => id !== hostId,
+    );
+    parseRuntimeConfig(`${JSON.stringify(runtime)}\n`);
+    desired.push({
+      path: paths.runtime,
+      content: `${JSON.stringify(runtime, null, 2)}\n`,
+    });
+    for (const role of organization.spec.roles) {
+      const candidates = [
+        role.execution.preferred,
+        ...(role.execution.fallbacks ?? []),
+      ];
+      role.execution = {
+        preferred: projectTargetId,
+        fallbacks: [...new Set(candidates)].filter((targetId) =>
+          targetId !== projectTargetId &&
+          targetId !== hostId &&
+          organization.spec.executionTargets.some(
+            ({ id, enabled }) => id === targetId && enabled,
+          )
+        ),
+      };
+    }
+  }
+  const targetChanges = new Map(
+    organization.spec.roles.flatMap((role) => {
+      const fromExecutionTarget = previousRoleTargets.get(role.id);
+      return fromExecutionTarget && fromExecutionTarget !== role.execution.preferred
+        ? [[
+            role.id,
+            {
+              fromExecutionTarget,
+              toExecutionTarget: role.execution.preferred,
+            },
+          ] as const]
+        : [];
+    }),
+  );
+  const workRetargets: NonNullable<BootstrapPlan["workRetargets"]> = [];
+  if (targetChanges.size > 0) {
+    if (!existsSync(paths.database)) {
+      throw new Error(
+        "Control Plane database is missing; run doctor before configuring a host.",
+      );
+    }
+    const walPath = `${paths.database}-wal`;
+    if (existsSync(walPath) && statSync(walPath).size > 0) {
+      throw new Error(
+        "Control Plane has uncheckpointed WAL state; stop active writers and run doctor before generating a host plan.",
+      );
+    }
+    const immutableDatabaseUri = `${pathToFileURL(paths.database).href}?mode=ro&immutable=1`;
+    const database = new DatabaseSync(immutableDatabaseUri, { readOnly: true });
+    try {
+      database.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;");
+      const migrationTable = database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'schema_migrations'
+      `).get() as { count: number };
+      const schemaVersion = Number(migrationTable.count) === 1
+        ? Number(
+            (database.prepare(
+              "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
+            ).get() as { version: number }).version,
+          )
+        : 0;
+      if (schemaVersion !== 15) {
+        throw new Error(
+          `Control Plane schema v${schemaVersion} cannot be inspected by this no-write plan; run doctor to migrate it to v15 first.`,
+        );
+      }
+      const changedRoles = [...targetChanges.entries()];
+      const rows = database.prepare(`
+        SELECT id, owner_role, execution_target, status, version
+        FROM work_items
+        WHERE archived_at IS NULL
+          AND status IN ('ready', 'changes_requested')
+          AND (${
+            changedRoles.map(() =>
+              "(owner_role = ? AND execution_target = ?)"
+            ).join(" OR ")
+          })
+        ORDER BY id ASC
+        LIMIT 501
+      `).all(
+        ...changedRoles.flatMap(([ownerRole, change]) => [
+          ownerRole,
+          change.fromExecutionTarget,
+        ]),
+      ) as Array<{
+        id: string;
+        owner_role: string;
+        execution_target: string;
+        status: string;
+        version: number;
+      }>;
+      for (const item of rows) {
+        const change = targetChanges.get(String(item.owner_role));
+        if (
+          change &&
+          String(item.execution_target) === change.fromExecutionTarget
+        ) {
+          workRetargets.push({
+            id: String(item.id),
+            expectedVersion: Number(item.version),
+            ownerRole: String(item.owner_role),
+            fromExecutionTarget: change.fromExecutionTarget,
+            toExecutionTarget: change.toExecutionTarget,
+          });
+          if (workRetargets.length > 500) {
+            throw new Error(
+              "Host activation would retarget more than 500 unclaimed work items; narrow the work set before activating the role.",
+            );
+          }
+        }
+      }
+    } finally {
+      database.close();
+    }
+    workRetargets.sort(({ id: left }, { id: right }) =>
+      left.localeCompare(right)
+    );
+  }
+  organization.metadata.revision += 1;
+  const organizationContent = `${JSON.stringify(organization, null, 2)}\n`;
+  parseOrgSpec(organizationContent);
+  desired.push({ path: paths.organization, content: organizationContent });
+  desired.push({
+    path: join(paths.root, "hosts", `${binding.hostKind}.json`),
+    content: `${JSON.stringify(
+      {
+        apiVersion: "chartermesh.dev/host-binding/v1alpha1",
+        hostKind: binding.hostKind,
+        command: option(args, "--executable") ?? binding.hostKind,
+        executableSha256: binding.executableSha256,
+        reportedVersion: binding.reportedVersion,
+        capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+        capabilitySnapshot: binding.capabilitySnapshot,
+        projectionPlanHash: projection.planHash,
+        directProtocol: binding.protocolVersion !== undefined,
+      },
+      null,
+      2,
+    )}\n`,
+  });
+  const uniqueDesired = new Map(desired.map((entry) => [entry.path, entry]));
+  const files = [...uniqueDesired.values()]
+    .sort(({ path: left }, { path: right }) => left.localeCompare(right))
+    .map(({ path, content }) => ({
+      path,
+      content,
+      beforeHash: existsSync(path)
+        ? createHash("sha256").update(readFileSync(path)).digest("hex")
+        : null,
+      afterHash: createHash("sha256").update(content).digest("hex"),
+    }));
+  const hostBinding = {
+    kind: binding.hostKind,
+    executablePath: binding.executablePath,
+    executableSha256: binding.executableSha256,
+    args: binding.args,
+    reportedVersion: binding.reportedVersion,
+    capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+    projectionPlanHash: projection.planHash,
+    directProtocol: binding.protocolVersion !== undefined,
+  };
+  const body = {
+    apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1" as const,
+    operation: "configure-host" as const,
+    target,
+    engine: `host:${binding.hostKind}`,
+    files,
+    hostBinding,
+    ...(workRetargets.length > 0 ? { workRetargets } : {}),
+  };
+  return { ...body, planHash: sha256(body) };
+}
+
+async function hostDoctorCommand(target: string, args: string[]): Promise<number> {
+  const binding = await inspectHost(target, args);
+  const data = {
+    ready: true,
+    hostKind: binding.hostKind,
+    executablePath: binding.executablePath,
+    executableSha256: binding.executableSha256,
+    reportedVersion: binding.reportedVersion,
+    protocolVersion: binding.protocolVersion ?? null,
+    capabilityAssessment: "chartermesh_declared" as const,
+    postProjectionVerificationRequired: true,
+    capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+    capabilities: binding.capabilitySnapshot.capabilities,
+  };
+  if (has(args, "--json")) writeJsonEnvelope("host doctor", data);
+  else {
+    console.log(`${binding.hostKind} host: ready`);
+    console.log(`Executable: ${binding.executablePath}`);
+    console.log(`SHA-256: ${binding.executableSha256}`);
+    console.log(`Version: ${binding.reportedVersion}`);
+    console.log(`Declared capabilities: ${binding.capabilitySnapshotSha256}`);
+    console.log("Post-projection MCP verification required: yes");
+  }
+  return 0;
+}
+
 function runtimePlan(args: string[]): BootstrapPlan {
   const target = targetOf(args);
-  recoverFileTransactions(target);
+  assertNoPendingFileTransactions(target);
   const paths = statePaths(target);
   if (!existsSync(paths.organization)) {
     throw new Error("CharterMesh is not initialized. Run bootstrap first.");
@@ -779,7 +1927,19 @@ function printBootstrapPlan(plan: BootstrapPlan, args: string[]): void {
   }
   console.log(`CharterMesh ${plan.operation} plan ${plan.planHash}`);
   console.log(`Target: ${plan.target}`);
-  console.log(`Model engine: ${plan.engine}`);
+  console.log(`${plan.operation === "configure-host" ? "Runtime" : "Model engine"}: ${plan.engine}`);
+  if (plan.hostBinding) {
+    console.log(
+      `Host: ${plan.hostBinding.kind} ${plan.hostBinding.reportedVersion} ` +
+        `(${plan.hostBinding.executableSha256})`,
+    );
+  }
+  for (const retarget of plan.workRetargets ?? []) {
+    console.log(
+      `- retarget ${retarget.id} v${retarget.expectedVersion}: ` +
+        `${retarget.fromExecutionTarget} -> ${retarget.toExecutionTarget}`,
+    );
+  }
   for (const file of plan.files) {
     console.log(
       `- ${file.beforeHash ? "verify/replace" : "create"} ${file.path}`,
@@ -790,12 +1950,67 @@ function printBootstrapPlan(plan: BootstrapPlan, args: string[]): void {
   console.log("");
   console.log(`Approval token: ${plan.planHash}`);
   console.log(
-    "Repeat the identical bootstrap command and append " +
+    `Repeat the identical ${plan.operation} command and append ` +
       `--approve ${plan.planHash}`,
   );
 }
 
-function applyBootstrap(args: string[], plan: BootstrapPlan): void {
+function approvedOperationPlan(
+  args: string[],
+  operation: BootstrapPlan["operation"],
+): BootstrapPlan | null {
+  const approved = option(args, "--approve");
+  if (!approved) return null;
+  const receipt = findApplyOperation<BootstrapPlan>(targetOf(args), approved);
+  if (!receipt) return null;
+  if (receipt.plan.operation !== operation) {
+    throw new Error(
+      `Approved operation ${approved} belongs to '${receipt.plan.operation}', not '${operation}'.`,
+    );
+  }
+  return receipt.plan;
+}
+
+function assertNoUnfinishedApplyOperation(target: string): void {
+  const pending = listPendingApplyOperations<BootstrapPlan>(target);
+  if (pending.length === 0) return;
+  throw new Error(
+    `An approved '${pending[0]!.plan.operation}' operation is unfinished at ` +
+      `stage '${pending[0]!.stage}'. Resume the identical command with ` +
+      `--approve ${pending[0]!.planHash} before generating another plan.`,
+  );
+}
+
+function printAppliedBootstrapResult(
+  plan: BootstrapPlan,
+  args: string[],
+  result: Record<string, JsonValue>,
+): void {
+  if (has(args, "--json")) {
+    writeJsonEnvelope(plan.operation, result);
+    return;
+  }
+  console.log(`Applied CharterMesh ${plan.operation} plan ${plan.planHash}.`);
+  if (typeof result.workItemId === "string") {
+    console.log(`Created and triaged initial work item ${result.workItemId}.`);
+  }
+  const retargeted = Array.isArray(result.retargetedWorkItemIds)
+    ? result.retargetedWorkItemIds.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : [];
+  if (retargeted.length > 0) {
+    console.log(
+      `Retargeted ${retargeted.length} unclaimed work item(s): ` +
+        retargeted.join(", "),
+    );
+  }
+  console.log(
+    `Next: npx --yes ${CHARTERMESH_GITHUB_REF} doctor --target "${plan.target}"`,
+  );
+}
+
+async function applyBootstrap(args: string[], plan: BootstrapPlan): Promise<void> {
   const approved = option(args, "--approve");
   if (!approved) {
     printBootstrapPlan(plan, args);
@@ -804,15 +2019,116 @@ function applyBootstrap(args: string[], plan: BootstrapPlan): void {
   if (approved !== plan.planHash) {
     throw new Error("Approval hash does not match the current bootstrap plan.");
   }
-  applyFileTransaction(
+  let receipt = findApplyOperation<BootstrapPlan>(plan.target, plan.planHash);
+  if (receipt?.stage === "complete") {
+    printAppliedBootstrapResult(
+      plan,
+      args,
+      receipt.result as Record<string, JsonValue>,
+    );
+    return;
+  }
+  const initialFileState = receipt
+    ? inspectApplyOperationFiles(receipt)
+    : "pending";
+  if (plan.hostBinding && initialFileState === "pending") {
+    const rebound = await inspectHost(plan.target, [
+      "--host",
+      plan.hostBinding.kind,
+      "--executable",
+      plan.hostBinding.executablePath,
+      "--executable-sha256",
+      plan.hostBinding.executableSha256,
+      "--expected-version",
+      plan.hostBinding.reportedVersion,
+      "--capability-snapshot-sha256",
+      plan.hostBinding.capabilitySnapshotSha256,
+      ...plan.hostBinding.args.flatMap((value) => ["--host-arg", value]),
+      ...(plan.hostBinding.directProtocol ? ["--direct"] : []),
+    ]);
+    if (
+      rebound.executableSha256 !== plan.hostBinding.executableSha256 ||
+      rebound.reportedVersion !== plan.hostBinding.reportedVersion ||
+      rebound.capabilitySnapshotSha256 !==
+        plan.hostBinding.capabilitySnapshotSha256
+    ) {
+      throw new Error(
+        "Host executable, reported version, or capabilities changed after planning; generate and approve a new configure-host plan.",
+      );
+    }
+  }
+  receipt ??= beginApplyOperation<BootstrapPlan>(
     plan.target,
     plan.planHash,
-    plan.files,
+    plan,
   );
-  const { database } = controlPlaneFor(plan.target);
-  database.close();
-  if (has(args, "--json")) {
-    writeJsonEnvelope(plan.operation, {
+  recoverFileTransaction(plan.target, plan.planHash, plan.files);
+  let fileState = inspectApplyOperationFiles(receipt);
+  if (fileState === "mixed" || fileState === "changed") {
+    throw new Error(
+      `Approved apply operation files are in '${fileState}' state; no additional write was attempted. Inspect the operation receipt and target files.`,
+    );
+  }
+  if (fileState === "pending") {
+    if (receipt.stage !== "approved") {
+      throw new Error(
+        `Apply receipt stage '${receipt.stage}' cannot have pending files.`,
+      );
+    }
+    applyFileTransaction(
+      plan.target,
+      plan.planHash,
+      plan.files,
+    );
+    fileState = inspectApplyOperationFiles(receipt);
+    if (fileState !== "committed") {
+      throw new Error("Approved files did not reach their committed hashes.");
+    }
+  }
+  if (receipt.stage === "approved") {
+    receipt = markApplyOperationFilesCommitted<BootstrapPlan>(
+      plan.target,
+      plan.planHash,
+      { fileCount: plan.files.length },
+    );
+  }
+  let kickoffWorkItemId: string | undefined;
+  let retargetedWorkItemIds: string[] = [];
+  if (receipt.stage === "files_committed") {
+    const { database, controlPlane } = controlPlaneFor(plan.target);
+    try {
+      if (plan.kickoff) {
+        const item = controlPlane.intake({
+          title: plan.kickoff.title,
+          summary: plan.kickoff.summary,
+          ownerRole: plan.kickoff.ownerRole,
+          executionTarget: plan.kickoff.executionTarget,
+          priority: plan.kickoff.priority,
+          decisionQuestion: plan.kickoff.decisionQuestion,
+          acceptanceCriteria: plan.kickoff.acceptanceCriteria,
+          actor: "human:local",
+          idempotencyKey: `kickoff:${plan.planHash}:intake`,
+        });
+        const triaged = controlPlane.triage({
+          id: item.id,
+          ownerRole: plan.kickoff.ownerRole,
+          executionTarget: plan.kickoff.executionTarget,
+          actor: "human:local",
+          idempotencyKey: `kickoff:${plan.planHash}:triage`,
+        });
+        kickoffWorkItemId = triaged.id;
+      }
+      if (plan.workRetargets?.length) {
+        retargetedWorkItemIds = controlPlane.retargetUnclaimedWork({
+          items: plan.workRetargets,
+          actor: "human:local",
+          idempotencyKey: `configure-host:${plan.planHash}:retarget`,
+        }).map(({ id }) => id);
+      }
+    } finally {
+      database.close();
+    }
+    const result: Record<string, JsonValue> = {
       applied: true,
       planHash: plan.planHash,
       files: plan.files.map(({ path, beforeHash, afterHash }) => ({
@@ -820,11 +2136,34 @@ function applyBootstrap(args: string[], plan: BootstrapPlan): void {
         beforeHash,
         afterHash,
       })),
-    });
-    return;
+      ...(kickoffWorkItemId ? { workItemId: kickoffWorkItemId } : {}),
+      ...(retargetedWorkItemIds.length > 0
+        ? { retargetedWorkItemIds }
+        : {}),
+    };
+    receipt = markApplyOperationDatabaseCommitted<BootstrapPlan>(
+      plan.target,
+      plan.planHash,
+      result,
+    );
   }
-  console.log(`Applied CharterMesh ${plan.operation} plan ${plan.planHash}.`);
-  console.log(`Next: chartermesh doctor --target "${plan.target}"`);
+  if (receipt.stage === "db_committed") {
+    receipt = completeApplyOperation<BootstrapPlan>(
+      plan.target,
+      plan.planHash,
+      receipt.result,
+    );
+  }
+  if (receipt.stage !== "complete") {
+    throw new Error(
+      `Apply operation stopped at unexpected stage '${receipt.stage}'.`,
+    );
+  }
+  printAppliedBootstrapResult(
+    plan,
+    args,
+    receipt.result as Record<string, JsonValue>,
+  );
 }
 
 function seedDemo(target: string): void {
@@ -875,15 +2214,39 @@ function seedDemo(target: string): void {
 }
 
 function doctor(target: string, args: string[]): number {
-  const recovered = recoverFileTransactions(target);
   const issues: string[] = [];
+  const recovery = pendingFileTransactionState(target);
+  if (recovery.pending) {
+    issues.push(
+      "An incomplete or invalid file transaction requires explicit 'chartermesh recover' inspection; doctor did not mutate it",
+    );
+  }
+  let pendingApplyOperations: Array<{ planHash: string; operation: string; stage: string }> = [];
+  try {
+    pendingApplyOperations = listPendingApplyOperations<BootstrapPlan>(target)
+      .map(({ planHash, plan, stage }) => ({
+        planHash,
+        operation: plan.operation,
+        stage,
+      }));
+    if (pendingApplyOperations.length > 0) {
+      const pending = pendingApplyOperations[0]!;
+      issues.push(
+        `Approved '${pending.operation}' operation ${pending.planHash} remains at stage '${pending.stage}'; resume its identical --approve command`,
+      );
+    }
+  } catch (error) {
+    issues.push(
+      `Apply operation receipt is invalid: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const paths = statePaths(target);
   let organization: ReturnType<typeof readOrganization> | undefined;
   let webSearchConfiguration: "disabled" | "configured" = "disabled";
   if (existsSync(paths.installation)) {
     try {
       const installed = JSON.parse(
-        readFileSync(paths.installation, "utf8"),
+        readBoundedRegularText(paths.installation, { maxBytes: 128 * 1024 }),
       ) as { charterMeshVersion?: string };
       if (installed.charterMeshVersion !== CHARTERMESH_VERSION) {
         issues.push(
@@ -898,7 +2261,9 @@ function doctor(target: string, args: string[]): number {
     issues.push("organization.json is missing");
   } else {
     try {
-      organization = parseOrgSpec(readFileSync(paths.organization, "utf8"));
+      organization = parseOrgSpec(
+        readBoundedRegularText(paths.organization, { maxBytes: 2 * 1024 * 1024 }),
+      );
     } catch (error) {
       issues.push(
         error instanceof Error
@@ -980,6 +2345,73 @@ function doctor(target: string, args: string[]): number {
           );
         }
       }
+      const runtimeAgentHosts = new Map(
+        (runtime.agentHosts ?? []).map((host) => [host.id, host]),
+      );
+      const organizationAgentHosts = new Map(
+        (organization?.spec.agentHosts ?? []).map((host) => [host.id, host]),
+      );
+      const interactiveProjectHostIds = new Set(
+        (organization?.spec.agentHosts ?? [])
+          .filter(({ adapter, enabled }) =>
+            enabled && adapter.endsWith("-project-session")
+          )
+          .map(({ id }) => id),
+      );
+      for (const host of runtime.agentHosts ?? []) {
+        const declared = organizationAgentHosts.get(host.id);
+        if (!declared) {
+          issues.push(
+            `Runtime agent host '${host.id}' is not declared in OrgSpec`,
+          );
+        } else if (
+          declared.adapter !== host.adapter ||
+          declared.executionHost !== "local" ||
+          !declared.enabled
+        ) {
+          issues.push(
+            `Runtime agent host '${host.id}' does not match an enabled local OrgSpec host`,
+          );
+        }
+        try {
+          if (sha256Executable(host.command) !== host.executableSha256) {
+            issues.push(
+              `AgentHost executable digest changed for '${host.id}'.`,
+            );
+          }
+        } catch {
+          issues.push(
+            `AgentHost executable is unavailable for '${host.id}'.`,
+          );
+        }
+        if (host.allowUnrestrictedRead !== true) {
+          issues.push(
+            `AgentHost '${host.id}' cannot start until unrestricted local reads are explicitly acknowledged`,
+          );
+        }
+        const policy =
+          organization?.spec.budgets.unknownCostPolicy ?? "warn";
+        if (["block", "estimate"].includes(policy)) {
+          issues.push(
+            policy === "block"
+              ? `AgentHost '${host.id}' has provider-managed cost but OrgSpec blocks unknown-cost runs`
+              : `AgentHost '${host.id}' cannot satisfy the OrgSpec estimate policy without host pricing evidence`,
+          );
+        }
+      }
+      for (const executionTarget of organization?.spec.executionTargets ?? []) {
+        if (executionTarget.kind !== "agent_host" || !executionTarget.enabled) {
+          continue;
+        }
+        if (
+          !runtimeAgentHosts.has(executionTarget.hostRef) &&
+          !interactiveProjectHostIds.has(executionTarget.hostRef)
+        ) {
+          issues.push(
+            `Execution target '${executionTarget.id}' references AgentHost '${executionTarget.hostRef}' without a runtime binding`,
+          );
+        }
+      }
     } catch (error) {
       issues.push(
         error instanceof Error
@@ -996,7 +2428,11 @@ function doctor(target: string, args: string[]): number {
     webSearch: webSearchConfiguration,
     runtimeConfiguration: issues.length === 0 ? "ready" : "attention_required",
     issues,
-    recovery: recovered,
+    recovery: {
+      automatic: false,
+      ...recovery,
+    },
+    applyOperations: { pending: pendingApplyOperations },
   };
   if (has(args, "--json")) {
     writeJsonEnvelope("doctor", result, issues.length === 0);
@@ -1022,7 +2458,9 @@ async function version(args: string[]): Promise<number> {
     try {
       installationVersion = String(
         (
-          JSON.parse(readFileSync(installation, "utf8")) as {
+          JSON.parse(
+            readBoundedRegularText(installation, { maxBytes: 128 * 1024 }),
+          ) as {
             charterMeshVersion?: string;
           }
         ).charterMeshVersion ?? "",
@@ -1212,7 +2650,7 @@ function backupCommand(target: string, args: string[]): void {
 }
 
 function restorePlan(target: string, args: string[]): RestorePlan {
-  recoverFileTransactions(target);
+  assertNoPendingFileTransactions(target);
   const id = option(args, "--backup");
   if (!id) throw new Error("restore requires --backup BACKUP_ID.");
   const paths = statePaths(target);
@@ -1403,7 +2841,12 @@ export interface SchedulerTickSummary {
 export async function runWork(
   target: string,
   id?: string,
-  options: { quiet?: boolean; json?: boolean; delegated?: boolean } = {},
+  options: {
+    quiet?: boolean;
+    json?: boolean;
+    delegated?: boolean;
+    agentHostFactory?: () => AgentHost;
+  } = {},
 ): Promise<RunWorkResult> {
   const runtime = readRuntime(target);
   const { database, controlPlane } = controlPlaneFor(target);
@@ -1411,6 +2854,9 @@ export async function runWork(
   let cancellationPoll: NodeJS.Timeout | undefined;
   let invocationId: string | undefined;
   let activeAttemptId: string | undefined;
+  let activeAgentHostRunId: string | undefined;
+  let activeAgentHost: AgentHost | undefined;
+  let agentHostBindingCreated = false;
   const runController = new AbortController();
   let removeSignalHandlers = () => {};
   let claim:
@@ -1424,12 +2870,54 @@ export async function runWork(
   try {
     controlPlane.recoverExpiredLeases();
     const organization = readOrganization(target);
-    const engine = configuredEngine(runtime, target);
-    const configuredProfile = runtime.modelEngines.find(
-      ({ id: engineId }) => engineId === engine.manifest.profileId,
+    const candidate =
+      (id ? controlPlane.get(id) : undefined) ??
+      controlPlane
+        .list()
+        .find(
+          ({ status, availability }) =>
+            ["ready", "changes_requested"].includes(status) &&
+            availability === "ready",
+        );
+    if (!candidate) throw new Error("No claimable work is available.");
+    const executionTarget = organization.spec.executionTargets.find(
+      ({ id: targetId }) => targetId === candidate.executionTarget,
     );
-    const costVisibility =
-      configuredProfile?.adapter === "fake"
+    if (!executionTarget || !executionTarget.enabled) {
+      throw new Error(
+        `Execution target '${candidate.executionTarget}' is unavailable.`,
+      );
+    }
+    const agentHostProfile =
+      executionTarget.kind === "agent_host"
+        ? runtime.agentHosts?.find(
+            ({ id: hostId }) => hostId === executionTarget.hostRef,
+          )
+        : undefined;
+    if (executionTarget.kind === "agent_host" && !agentHostProfile) {
+      const declaredHost = organization.spec.agentHosts.find(
+        ({ id: hostId }) => hostId === executionTarget.hostRef,
+      );
+      if (declaredHost?.adapter.endsWith("-project-session")) {
+        throw new Error(
+          `Execution target '${executionTarget.id}' is interactive-only; claim it through the configured CharterMesh MCP bridge from the coding host.`,
+        );
+      }
+      throw new Error(
+        `AgentHost '${executionTarget.hostRef}' is not configured in runtime.json.`,
+      );
+    }
+    const engine = agentHostProfile
+      ? undefined
+      : configuredEngine(runtime, target);
+    const configuredProfile = engine
+      ? runtime.modelEngines.find(
+          ({ id: engineId }) => engineId === engine.manifest.profileId,
+        )
+      : undefined;
+    const costVisibility = agentHostProfile
+      ? "unknown"
+      : configuredProfile?.adapter === "fake"
         ? "measured"
         : "pricing" in (configuredProfile ?? {}) && configuredProfile?.pricing
           ? "estimated"
@@ -1446,20 +2934,7 @@ export async function runWork(
           : "COST_POLICY_REQUIRES_PRICING",
       );
     }
-    const candidate =
-      (id ? controlPlane.get(id) : undefined) ??
-      controlPlane
-        .list()
-        .find(
-          ({ status, availability }) =>
-            ["ready", "changes_requested"].includes(status) &&
-            availability === "ready",
-        );
-    if (!candidate) throw new Error("No claimable work is available.");
     if (options.delegated) {
-      const executionTarget = organization.spec.executionTargets.find(
-        ({ id: targetId }) => targetId === candidate.executionTarget,
-      );
       if (!executionTarget || executionTarget.kind !== "managed_runner") {
         throw new Error("DELEGATION_TARGET_UNSUPPORTED");
       }
@@ -1495,6 +2970,9 @@ export async function runWork(
       try {
         if (!claim) return;
         controlPlane.heartbeat({
+          id: candidate.id,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
           leaseId: claim.leaseId,
           generation: claim.generation,
           actor: "runner:local",
@@ -1534,31 +3012,42 @@ export async function runWork(
         policy: role.tools,
         additionalTools: createWebSearchTools(runtime.webSearch),
         isApproved: (callHash, toolName) =>
-          controlPlane.isToolCallApproved(
-            candidate.id,
-            callHash,
-            toolName,
+          Boolean(
+            claim &&
+              controlPlane.isPendingToolExecutionReserved({
+                id: candidate.id,
+                runId: claim.runId,
+                attemptId: claim.attemptId,
+                leaseId: claim.leaseId,
+                generation: claim.generation,
+                callHash,
+                toolName,
+                actor: "runner:local",
+              }),
           ),
         prepareEvidence: (intent) => {
-          const attemptId = activeAttemptId ?? claim!.attemptId;
+          const evidenceAttemptId = activeAttemptId ?? claim!.attemptId;
           const receipt = controlPlane.prepareToolEvidence({
             id: candidate.id,
             runId: claim!.runId,
-            attemptId,
+            attemptId: claim!.attemptId,
+            evidenceAttemptId,
+            leaseId: claim!.leaseId,
+            generation: claim!.generation,
             callHash: intent.callHash,
             toolName: intent.toolName,
             inputHash: intent.inputHash,
             actor: "runner:local",
           });
-          evidenceReceiptAttempts.set(receipt.id, attemptId);
+          evidenceReceiptAttempts.set(receipt.id, evidenceAttemptId);
           return receipt;
         },
         onEvidence: (evidence, receipt) => {
           if (!receipt) {
             throw new Error("TOOL_EVIDENCE_RECEIPT_MISSING");
           }
-          const attemptId = evidenceReceiptAttempts.get(receipt.id);
-          if (!attemptId) {
+          const evidenceAttemptId = evidenceReceiptAttempts.get(receipt.id);
+          if (!evidenceAttemptId) {
             throw new Error("TOOL_EVIDENCE_RECEIPT_LINEAGE_MISSING");
           }
           controlPlane.recordToolEvidence({
@@ -1566,7 +3055,10 @@ export async function runWork(
             evidenceId: evidence.id,
             id: candidate.id,
             runId: claim!.runId,
-            attemptId,
+            attemptId: claim!.attemptId,
+            evidenceAttemptId,
+            leaseId: claim!.leaseId,
+            generation: claim!.generation,
             callHash: evidence.callHash,
             toolName: evidence.toolName,
             status: evidence.status,
@@ -1584,25 +3076,159 @@ export async function runWork(
       const approvedPending =
         controlPlane.approvedPendingToolCall(candidate.id);
       if (approvedPending) {
-        const replay = await toolRuntime.executeApprovedCall(
-          {
-            id: approvedPending.id,
-            name: approvedPending.toolName,
-            arguments: approvedPending.arguments,
-          },
-          { signal: runController.signal },
-        );
-        replayedEvidence.push(replay.evidence);
-        controlPlane.markPendingToolCallExecuted({
+        const pendingFence = {
           id: candidate.id,
-          callHash: approvedPending.callHash,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
+          generation: claim.generation,
           actor: "runner:local",
-          idempotencyKey:
-            `cli:pending-tool-executed:${candidate.id}:${approvedPending.callHash}`,
+        };
+        const evidenceEffectHash = (
+          evidence: Pick<
+            ToolExecutionEvidence,
+            "status" | "toolName" | "outputHash" | "paths"
+          >,
+        ) =>
+          evidence.outputHash ??
+          createHash("sha256")
+            .update(
+              JSON.stringify({
+                status: evidence.status,
+                toolName: evidence.toolName,
+                paths: evidence.paths,
+              }),
+            )
+            .digest("hex");
+        const asRuntimeEvidence = (
+          evidence: ReturnType<typeof controlPlane.listToolEvidence>[number],
+        ): ToolExecutionEvidence => ({
+          id: evidence.id,
+          callHash: evidence.callHash,
+          toolName: evidence.toolName,
+          status: evidence.status,
+          inputHash: evidence.inputHash,
+          outputHash: evidence.outputHash,
+          paths: evidence.paths,
+          durationMs: evidence.durationMs,
+          createdAt: evidence.createdAt,
         });
+        const durableEvidence = (evidenceId: string | null) =>
+          evidenceId
+            ? controlPlane.listToolEvidence(candidate.id).find(
+                ({ id: durableId }) => durableId === evidenceId,
+              ) ?? null
+            : null;
+        const executionClaim = controlPlane.reservePendingToolExecution({
+          ...pendingFence,
+          callHash: approvedPending.callHash,
+          idempotencyKey:
+            `cli:pending-tool-reserve:${claim.runId}:${approvedPending.callHash}`,
+        });
+        if (
+          process.env.NODE_ENV === "test" &&
+          process.env.CHARTERMESH_TEST_CRASH_AFTER_PENDING_RESERVATION === "1" &&
+          executionClaim.disposition === "reserved"
+        ) {
+          process.exit(87);
+        }
+        if (executionClaim.disposition === "executed") {
+          const evidence = durableEvidence(executionClaim.pending.evidenceId);
+          if (!evidence || evidence.status !== "succeeded") {
+            throw new Error("TOOL_EXECUTION_STATE_INVALID: executed call lacks durable succeeded evidence.");
+          }
+          replayedEvidence.push(asRuntimeEvidence(evidence));
+        } else if (executionClaim.disposition === "recovery_required") {
+          const previous = executionClaim.pending.reservation;
+          if (!previous) throw new Error("PENDING_TOOL_EXECUTION_STATE_INVALID");
+          const evidence = controlPlane.listToolEvidence(candidate.id).find(
+            (entry) =>
+              entry.runId === previous.runId &&
+              entry.attemptId === previous.attemptId &&
+              entry.callHash === approvedPending.callHash &&
+              entry.toolName === approvedPending.toolName &&
+              entry.status === "succeeded",
+          );
+          if (evidence) {
+            controlPlane.recoverCommittedPendingToolExecution({
+              ...pendingFence,
+              callHash: approvedPending.callHash,
+              previousReservationId: previous.id,
+              evidenceId: evidence.id,
+              effectHash: evidenceEffectHash(asRuntimeEvidence(evidence)),
+              idempotencyKey:
+                `cli:pending-tool-recover:${claim.runId}:${previous.id}`,
+            });
+            replayedEvidence.push(asRuntimeEvidence(evidence));
+          } else {
+            controlPlane.markPendingToolOutcomeUnknown({
+              ...pendingFence,
+              callHash: approvedPending.callHash,
+              previousReservationId: previous.id,
+              message:
+                "The previous executor ended without durable succeeded evidence; the approved tool call will not be replayed.",
+              idempotencyKey:
+                `cli:pending-tool-unknown:${claim.runId}:${previous.id}`,
+            });
+            throw new Error(
+              "TOOL_OUTCOME_UNKNOWN: an approved tool call may have started and will not be replayed automatically.",
+            );
+          }
+        } else {
+          const reservation = executionClaim.pending.reservation;
+          if (!reservation) throw new Error("PENDING_TOOL_EXECUTION_STATE_INVALID");
+          let replay;
+          try {
+            replay = await toolRuntime.executeApprovedCall(
+              {
+                id: approvedPending.id,
+                name: approvedPending.toolName,
+                arguments: approvedPending.arguments,
+              },
+              { signal: runController.signal },
+            );
+          } catch (error) {
+            const executionMessage =
+              error instanceof Error ? error.message : String(error);
+            controlPlane.markPendingToolOutcomeUnknown({
+              ...pendingFence,
+              callHash: approvedPending.callHash,
+              previousReservationId: reservation.id,
+              message:
+                "Approved tool execution did not produce durable succeeded evidence and will not be replayed automatically.",
+              idempotencyKey:
+                `cli:pending-tool-execute-unknown:${claim.runId}:${reservation.id}`,
+            });
+            throw new Error(
+              `TOOL_OUTCOME_UNKNOWN: approved tool execution was not durably proven (${executionMessage.slice(0, 500)}).`,
+            );
+          }
+          if (replay.evidence.status !== "succeeded") {
+            controlPlane.markPendingToolOutcomeUnknown({
+              ...pendingFence,
+              callHash: approvedPending.callHash,
+              previousReservationId: reservation.id,
+              message:
+                "Approved tool execution returned without succeeded evidence and will not be replayed automatically.",
+              idempotencyKey:
+                `cli:pending-tool-evidence-unknown:${claim.runId}:${reservation.id}`,
+            });
+            throw new Error("TOOL_OUTCOME_UNKNOWN: approved tool execution was not proven successful.");
+          }
+          controlPlane.settlePendingToolExecution({
+            ...pendingFence,
+            callHash: approvedPending.callHash,
+            reservationId: reservation.id,
+            evidenceId: replay.evidence.id,
+            effectHash: evidenceEffectHash(replay.evidence),
+            idempotencyKey:
+              `cli:pending-tool-settle:${claim.runId}:${reservation.id}`,
+          });
+          replayedEvidence.push(replay.evidence);
+        }
       }
       const modelId =
-        "config" in engine && engine.config?.model
+        engine && "config" in engine && engine.config?.model
           ? String(engine.config.model)
           : "deterministic-fixture";
       const requiredTools = controlPlane.requiredTools(candidate.id);
@@ -1688,14 +3314,173 @@ export async function runWork(
             "State checks, risks, next actions, and confidence explicitly.",
           ],
         },
-        organizationRevision: 1,
+        organizationRevision: organization.metadata.revision,
         workItemId: candidate.id,
         runId: claim.runId,
         attemptId: claim.attemptId,
         generation: claim.generation,
       };
       let result;
-      if (options.delegated) {
+      if (agentHostProfile) {
+        if (agentHostProfile.adapter !== "codex-app-server") {
+          throw new Error(
+            `AGENT_HOST_ADAPTER_UNSUPPORTED: ${agentHostProfile.adapter}`,
+          );
+        }
+        const host = options.agentHostFactory?.() ??
+          new CodexAppServerAgentHost({
+            id: agentHostProfile.id,
+            command: agentHostProfile.command,
+            ...(agentHostProfile.args
+              ? { args: agentHostProfile.args }
+              : {}),
+            executableSha256: agentHostProfile.executableSha256,
+            workingDirectory: target,
+            ...(agentHostProfile.model ? { model: agentHostProfile.model } : {}),
+            ...(agentHostProfile.reasoningEffort
+              ? { reasoningEffort: agentHostProfile.reasoningEffort }
+              : {}),
+            allowUnrestrictedRead:
+              agentHostProfile.allowUnrestrictedRead === true,
+            ...(agentHostProfile.environmentAllowlist
+              ? { environmentAllowlist: agentHostProfile.environmentAllowlist }
+              : {}),
+            timeoutMs: agentHostProfile.timeoutMs ?? 600_000,
+            approvalPolicy: "never",
+            sandbox:
+              role.tools.allow.includes("workspace.write_file") &&
+              !role.tools.approvalRequired?.includes("workspace.write_file")
+                ? "workspace_write"
+              : "read_only",
+          });
+        activeAgentHost = host;
+        const hostModelId = agentHostProfile.model ?? "host-managed";
+        invocationId = controlPlane.startInvocation({
+          attemptId: claim.attemptId,
+          engineId: agentHostProfile.id,
+          modelId: hostModelId,
+        }).id;
+        const handle = await host.start(
+          {
+            ...hostRequest,
+            workspacePath: target,
+            taskPacket: {
+              ...hostRequest.taskPacket,
+              executionProtocol: [
+                "Act as the assigned CharterMesh role inside the approved workspace.",
+                "Return exactly one JSON object and no Markdown fences.",
+                "The JSON object must use apiVersion chartermesh.dev/structured-artifact/v1alpha1 and contain summary, deliverable, checks, risks, nextActions, and confidence.",
+                "Checks may name only verification actually performed in this run; proposals belong in nextActions.",
+                "Never claim that a host permission prompt is CharterMesh human approval.",
+              ],
+            },
+          },
+          { signal: runController.signal },
+        );
+        activeAgentHostRunId = handle.hostRunId;
+        controlPlane.bindAgentHostRun({
+          workItemId: candidate.id,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
+          generation: claim.generation,
+          hostId: agentHostProfile.id,
+          hostSessionId: handle.hostSessionId,
+          hostRunId: handle.hostRunId,
+          actor: "runner:local",
+          idempotencyKey: `agent-host:bind:${claim.runId}`,
+        });
+        agentHostBindingCreated = true;
+        let approvalRequested = false;
+        let terminalSequence: number | undefined;
+        for await (const event of host.events(handle.hostRunId, {
+          signal: runController.signal,
+        })) {
+          if (event.type === "approval_required") {
+            approvalRequested = true;
+            controlPlane.checkpointAgentHostRun({
+              workItemId: candidate.id,
+              runId: claim.runId,
+              attemptId: claim.attemptId,
+              leaseId: claim.leaseId,
+              generation: claim.generation,
+              status: "waiting",
+              lastEventCursor: String(event.sequence),
+              errorCode: "AGENT_HOST_APPROVAL_UNRESOLVED",
+              actor: "runner:local",
+              idempotencyKey:
+                `agent-host:event:${claim.runId}:${event.sequence}`,
+            });
+          } else if (event.type === "terminal") {
+            terminalSequence = event.sequence;
+          }
+        }
+        const hostResult = await host.result(handle.hostRunId, {
+          signal: runController.signal,
+        });
+        if (approvalRequested) {
+          throw new Error(
+            "AGENT_HOST_APPROVAL_UNRESOLVED: the provider request was denied fail-closed; no human approval was inferred.",
+          );
+        }
+        if (hostResult.status !== "completed") {
+          throw new Error(
+            hostResult.status === "canceled"
+              ? "RUN_CANCELED"
+              : `AGENT_HOST_FAILED: ${hostResult.error?.code ?? "unknown"}`,
+          );
+        }
+        const artifact = parseStructuredArtifact(hostResult.outputText);
+        if (!artifact) {
+          throw new Error(
+            "STRUCTURED_ARTIFACT_INVALID: AgentHost output did not satisfy the artifact contract.",
+          );
+        }
+        controlPlane.checkpointAgentHostRun({
+          workItemId: candidate.id,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
+          generation: claim.generation,
+          status: "succeeded",
+          ...(terminalSequence !== undefined
+            ? { lastEventCursor: String(terminalSequence) }
+            : {}),
+          actor: "runner:local",
+          idempotencyKey: `agent-host:terminal:${claim.runId}:succeeded`,
+        });
+        result = {
+          hostRunId: hostResult.hostRunId,
+          inference: {
+            invocationId,
+            text: `${JSON.stringify(artifact, null, 2)}\n`,
+            toolCalls: [],
+            finishReason: "stop" as const,
+            usage: hostResult.usage,
+            providerIdentity: {
+              reportedModelId: agentHostProfile.model ?? null,
+              reportedSystemFingerprint: null,
+            },
+          },
+          toolEvidence: [],
+          artifactSubmission: {
+            content: `${JSON.stringify(artifact, null, 2)}\n`,
+            mediaType: "text/plain",
+            producerReport: {
+              apiVersion:
+                "chartermesh.dev/artifact-producer-report/v1alpha1" as const,
+              source: "model_reported" as const,
+              summary: artifact.summary,
+              deliverable: artifact.deliverable,
+              reportedChecks: artifact.checks,
+              reportedRisks: artifact.risks,
+              nextActions: artifact.nextActions,
+              confidence: artifact.confidence,
+            },
+          },
+        };
+      } else if (options.delegated) {
+        if (!engine) throw new Error("DELEGATION_ENGINE_UNAVAILABLE");
         const stageInvocations = new Map<string, string>();
         const controller = new DelegationController();
         result = await controller.run(hostRequest, {
@@ -1773,6 +3558,7 @@ export async function runWork(
           },
         });
       } else {
+        if (!engine) throw new Error("MANAGED_ENGINE_UNAVAILABLE");
         const runner = new BuiltInManagedRunner();
         invocationId = controlPlane.startInvocation({
           attemptId: claim.attemptId,
@@ -1811,6 +3597,9 @@ export async function runWork(
       }
       const submission = controlPlane.submitArtifact({
         id: candidate.id,
+        runId: claim.runId,
+        attemptId: claim.attemptId,
+        leaseId: claim.leaseId,
         content: result.artifactSubmission.content,
         mediaType: result.artifactSubmission.mediaType,
         producerReport: result.artifactSubmission.producerReport,
@@ -1835,16 +3624,32 @@ export async function runWork(
       return runResult;
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error);
+      if (activeAgentHost && activeAgentHostRunId) {
+        try {
+          await activeAgentHost.cancel(activeAgentHostRunId, {
+            code: "safety",
+            message:
+              "CharterMesh could not continue or durably checkpoint the active host run.",
+          });
+        } catch {
+          // Durable Control Plane failure settlement remains authoritative. A
+          // failed best-effort host cancellation is visible through that path.
+        }
+      }
       if (error instanceof ToolApprovalRequiredError && claim) {
         controlPlane.recordPendingToolCall({
           id: candidate.id,
           runId: claim.runId,
           attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
+          generation: claim.generation,
           callHash: error.callHash,
           toolName: error.toolName,
           arguments: error.call.arguments,
+          ...(error.summary ? { summary: error.summary } : {}),
           createdAt: new Date().toISOString(),
           actor: "runner:local",
+          idempotencyKey: `cli:pending:${candidate.id}:${error.callHash}`,
         });
         const pendingResult = {
           status: "approval_required" as const,
@@ -1868,6 +3673,10 @@ export async function runWork(
           ? "TOOL_APPROVAL_REQUIRED"
           : rawMessage.startsWith("REQUIRED_TOOL_EVIDENCE_MISSING")
             ? "REQUIRED_TOOL_EVIDENCE_MISSING"
+          : rawMessage.startsWith("AGENT_HOST_APPROVAL_UNRESOLVED")
+            ? "AGENT_HOST_APPROVAL_UNRESOLVED"
+          : rawMessage.startsWith("AGENT_HOST_FAILED")
+            ? "AGENT_HOST_FAILED"
           : rawMessage.startsWith("TOOL_OUTCOME_UNKNOWN")
             ? "TOOL_OUTCOME_UNKNOWN"
           : rawMessage.startsWith("TOOL_ITERATION_LIMIT")
@@ -1877,6 +3686,26 @@ export async function runWork(
                 rawMessage.toLowerCase().includes("canceled")
               ? "RUN_CANCELED"
               : "MODEL_INVOCATION_FAILED";
+      if (agentHostBindingCreated && activeAgentHostRunId) {
+        const binding = controlPlane.agentHostRunBinding(claim.runId);
+        if (
+          binding &&
+          !["succeeded", "failed", "canceled"].includes(binding.status)
+        ) {
+          controlPlane.checkpointAgentHostRun({
+            workItemId: candidate.id,
+            runId: claim.runId,
+            attemptId: claim.attemptId,
+            leaseId: claim.leaseId,
+            generation: claim.generation,
+            status: errorCode === "RUN_CANCELED" ? "canceled" : "failed",
+            errorCode,
+            actor: "runner:local",
+            idempotencyKey:
+              `agent-host:terminal:${claim.runId}:${errorCode.toLowerCase()}`,
+          });
+        }
+      }
       if (invocationId) {
         controlPlane.finishInvocation({
           id: invocationId,
@@ -1888,17 +3717,25 @@ export async function runWork(
           measurementStatus: "unknown",
         });
       }
-      if (errorCode === "RUN_CANCELED") {
+      const alreadySettled = ["failed", "canceled"].includes(
+        controlPlane.get(candidate.id).status,
+      );
+      if (errorCode === "RUN_CANCELED" && !alreadySettled) {
         controlPlane.cancelRun({
           id: candidate.id,
+          runId: claim.runId,
+          attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
           generation: claim.generation,
           actor: "runner:local",
           idempotencyKey:
             `cli:canceled:${candidate.id}:${claim.generation}`,
         });
-      } else {
+      } else if (!alreadySettled) {
         controlPlane.failRun({
           id: candidate.id,
+          runId: claim.runId,
+          leaseId: claim.leaseId,
           generation: claim.generation,
           attemptId: claim.attemptId,
           errorCode,
@@ -1908,6 +3745,9 @@ export async function runWork(
               : errorCode === "TOOL_APPROVAL_REQUIRED"
                 ? rawMessage
                 : errorCode === "REQUIRED_TOOL_EVIDENCE_MISSING"
+                  ? rawMessage
+                : errorCode === "AGENT_HOST_APPROVAL_UNRESOLVED" ||
+                    errorCode === "AGENT_HOST_FAILED"
                   ? rawMessage
                 : errorCode === "TOOL_OUTCOME_UNKNOWN"
                   ? "A tool returned, but its evidence could not be committed. Inspect the workspace before retrying."
@@ -2289,12 +4129,35 @@ function requestWork(target: string, args: string[]): void {
 function triageWork(target: string, args: string[]): void {
   const id = option(args, "--id");
   if (!id) throw new Error("triage requires --id.");
+  const organization = readOrganization(target);
+  const ownerRole = option(args, "--role") ?? "operator";
+  const role = organization.spec.roles.find(({ id }) => id === ownerRole);
+  if (!role) throw new Error(`Unknown OrgSpec role '${ownerRole}'.`);
+  const executionTarget = option(args, "--execution-target") ??
+    role.execution.preferred;
+  const selectedTarget = organization.spec.executionTargets.find(
+    ({ id }) => id === executionTarget,
+  );
+  if (!selectedTarget?.enabled) {
+    throw new Error(
+      `Execution target '${executionTarget}' is not an enabled OrgSpec target.`,
+    );
+  }
+  const roleTargets = new Set([
+    role.execution.preferred,
+    ...(role.execution.fallbacks ?? []),
+  ]);
+  if (!roleTargets.has(executionTarget)) {
+    throw new Error(
+      `Execution target '${executionTarget}' is not configured for role '${ownerRole}'.`,
+    );
+  }
   const { database, controlPlane } = controlPlaneFor(target);
   try {
     const item = controlPlane.triage({
       id,
-      ownerRole: option(args, "--role") ?? "operator",
-      executionTarget: option(args, "--execution-target") ?? "local",
+      ownerRole,
+      executionTarget,
       actor: "human:cli",
       idempotencyKey: option(args, "--idempotency-key") ?? randomUUID(),
     });
@@ -4201,6 +6064,10 @@ Commands:
   chartermesh version [--target PATH] [--check] [--json]
   chartermesh propose --target PATH [--profile lean|balanced|controlled] [--json]
   chartermesh bootstrap --target PATH [--profile balanced] [--engine fake] [--json]
+  chartermesh kickoff --target PATH --brief-file PATH [--title TEXT] \
+    [--acceptance TEXT] [--role operator] [--execution-target local] \
+    [--priority 70] [--engine fake] [--json]
+  chartermesh kickoff ... --approve PLAN_HASH
   chartermesh bootstrap --target PATH --engine openai-compatible \\
     --endpoint URL --model MODEL [--api-key-env ENV_NAME] \\
     [--structured-output prompt|json-schema] [--tool-calling] \\
@@ -4218,6 +6085,18 @@ Commands:
   chartermesh configure-engine --target PATH --engine command-process \\
     --command ABSOLUTE_EXECUTABLE [--command-arg ARG] [--pass-env ENV_NAME]
   chartermesh configure-engine ... --approve PLAN_HASH
+  chartermesh host doctor --host codex|claude [--direct]
+    [--executable ABSOLUTE_PATH]
+    [--host-arg ARG]
+    [--executable-sha256 SHA256] [--expected-version VERSION] [--json]
+  chartermesh configure-host --target PATH --host codex|claude \
+    [--executable ABSOLUTE_PATH] [--host-arg ARG] [--max-agents 4]
+    [--allow-unrestricted-read] [--activate-role ROLE] [--model MODEL]
+    [--reasoning-effort medium] [--pass-env ENV_NAME]
+    [--bridge-command COMMAND --bridge-arg ARG]
+  chartermesh configure-host ... --approve PLAN_HASH
+  chartermesh mcp serve (--target PATH | --find-project-root)
+    [--actor host:codex] [--role ROLE] [--execution-target TARGET]
   chartermesh doctor --target PATH [--json]
   chartermesh recover --target PATH [--json]
   chartermesh audit export --target PATH [--output RELATIVE_PATH] [--json]
@@ -4321,11 +6200,46 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (command === "bootstrap") {
-    applyBootstrap(args, bootstrapPlan(args));
+    const resumed = approvedOperationPlan(args, "bootstrap");
+    if (!resumed) assertNoUnfinishedApplyOperation(target);
+    await applyBootstrap(args, resumed ?? bootstrapPlan(args));
+    return 0;
+  }
+  if (command === "kickoff") {
+    const resumed = approvedOperationPlan(args, "kickoff");
+    if (!resumed) assertNoUnfinishedApplyOperation(target);
+    await applyBootstrap(args, resumed ?? kickoffPlan(args));
     return 0;
   }
   if (command === "configure-engine") {
-    applyBootstrap(args, runtimePlan(args));
+    const resumed = approvedOperationPlan(args, "configure-engine");
+    if (!resumed) assertNoUnfinishedApplyOperation(target);
+    await applyBootstrap(args, resumed ?? runtimePlan(args));
+    return 0;
+  }
+  if (command === "host") {
+    if ((args[1] ?? "doctor") !== "doctor") {
+      throw new Error("host requires doctor.");
+    }
+    return hostDoctorCommand(target, args);
+  }
+  if (command === "configure-host") {
+    const resumed = approvedOperationPlan(args, "configure-host");
+    if (!resumed) assertNoUnfinishedApplyOperation(target);
+    await applyBootstrap(args, resumed ?? await configureHostPlan(args));
+    return 0;
+  }
+  if (command === "mcp") {
+    if (args[1] !== "serve") throw new Error("mcp requires serve.");
+    const mcpTarget = has(args, "--find-project-root")
+      ? discoverMcpProjectRoot()
+      : target;
+    await runControlPlaneMcpStdio({
+      target: mcpTarget,
+      ...(option(args, "--actor") ? { actor: option(args, "--actor") } : {}),
+      allowedRoles: options(args, "--role"),
+      allowedExecutionTargets: options(args, "--execution-target"),
+    });
     return 0;
   }
   if (command === "doctor") return doctor(target, args);

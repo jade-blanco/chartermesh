@@ -49,6 +49,8 @@ export {
   ToolRuntime,
   createWorkspaceToolRuntime,
   createWorkspaceTools,
+  hashBoundedRegularFile,
+  summarizeWorkspaceWriteRequest,
   toolCallHash,
   verifyToolRuntimeReceipt,
   type ApprovedToolCallResult,
@@ -61,12 +63,14 @@ export {
   type ToolExecutionStatus,
   type ToolLoopResult,
   type ToolRuntimeOptions,
+  type WorkspaceWriteRequestSummary,
 } from "./tool-runtime.ts";
 export {
   RuntimeConfigParseError,
   parseRuntimeConfig,
   validateRuntimeConfigSchema,
   type ModelPricing,
+  type RuntimeAgentHost,
   type RuntimeConfig,
   type RuntimeModelEngine,
 } from "./runtime-config.ts";
@@ -93,3 +97,28 @@ export {
   validateWebSearchConfig,
   type SearxngWebSearchConfig,
 } from "./web-search.ts";
+export {
+  HOST_PROJECTION_REQUIRED_CAPABILITIES,
+  createHostProjectionPlan,
+  discoverHost,
+  validateHostCapabilitySnapshot,
+  type BoundHostCapabilitySnapshot,
+  type HostCapabilityEntry,
+  type HostCapabilitySnapshotInput,
+  type HostDiscoveryIssue,
+  type HostDiscoveryProbes,
+  type HostDiscoveryRequest,
+  type HostDiscoveryResult,
+  type HostExecutableBinding,
+  type HostKind,
+  type HostProjectionOperation,
+  type HostProjectionPlan,
+  type HostProjectionRequest,
+  type HostProjectionRole,
+} from "./host-integration.ts";
+export {
+  assertNoLinkedPathComponents,
+  readBoundedRegularText,
+  resolveProjectStatePaths,
+  type ProjectStatePaths,
+} from "./project-state.ts";

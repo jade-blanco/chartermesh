@@ -329,7 +329,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
         artifactInstructions,
         "",
         "Tool argument boundary:",
-        "- For `workspace.write_file`, put the exact raw UTF-8 file text in `content`.",
+        "- For `workspace.write_file` content mode, put the exact raw UTF-8 file text in `content` and bind `beforeSha256` to the complete current-file hash from `workspace.read_file`; use null only when the path is absent.",
         "- For a small change to an existing file, prefer replacement mode: use the complete-file SHA-256 returned by `workspace.read_file` as `expectedSha256`, provide bounded `replacements`, and omit `content`.",
         "- Each replacement must copy `oldText` exactly from the read result and state its `expectedOccurrences` (normally 1).",
         "- JSON-escape that string exactly once for transport. Do not JSON-encode the file text a second time.",
@@ -350,7 +350,7 @@ export class BuiltInManagedRunner implements ManagedRunner {
         role: "system" as const,
         content: runtimeCompiled
           ? "You are a bounded CharterMesh worker. Follow the task packet and return a concise human-readable deliverable. The runtime owns the final artifact envelope. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened."
-          : "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran. Tool arguments are parsed JSON values: prefer SHA-bound workspace.write_file replacements for small edits; full content must be raw file text after one JSON transport encoding, never a second JSON-encoded string.",
+          : "You are a bounded CharterMesh worker. Follow the task packet and return only the requested JSON object. Never claim an action, inspection, test, or external effect unless the current invocation received direct evidence that it happened. Successful JSON generation is not evidence that project checks ran. Tool arguments are parsed JSON values: prefer SHA-bound workspace.write_file replacements for small edits; full content must bind beforeSha256 to the current complete-file hash (or null only for an absent path) and be raw file text after one JSON transport encoding, never a second JSON-encoded string.",
       },
       { role: "user" as const, content: prompt },
     ];

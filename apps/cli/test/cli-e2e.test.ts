@@ -704,6 +704,11 @@ test("an approval-gated tool call waits without failing and resumes on a new run
     database,
     join(target, ".chartermesh", "artifacts"),
   );
+  const pendingRecord = controlPlane.listPendingToolCalls(workId)[0];
+  assert.equal(pendingRecord?.summary?.changeCount, 1);
+  assert.equal(pendingRecord?.summary?.changes[0]?.path, "approval-fixture.txt");
+  assert.equal(pendingRecord?.summary?.changes[0]?.beforeSha256, null);
+  assert.equal(pendingRecord?.summary?.changes[0]?.byteSize, 9);
   assert.deepEqual(
     {
       status: controlPlane.get(workId).status,
@@ -781,6 +786,134 @@ test("an approval-gated tool call waits without failing and resumes on a new run
   );
 });
 
+test("a crash after generic tool reservation never replays an unproven effect", () => {
+  const target = mkdtempSync(
+    join(tmpdir(), "chartermesh-command-approval-crash-"),
+  );
+  const fixture = resolve(
+    "adapters",
+    "model-engines",
+    "command-process",
+    "test",
+    "fixtures",
+    "approval-engine.mjs",
+  );
+  const bootstrapArgs = [
+    "bootstrap",
+    "--target",
+    target,
+    "--engine",
+    "command-process",
+    "--command",
+    process.execPath,
+    "--command-arg",
+    fixture,
+    "--model",
+    "approval-fixture",
+    "--json",
+  ];
+  const preview = JSON.parse(cli(bootstrapArgs).stdout);
+  assert.equal(
+    cli([...bootstrapArgs, "--approve", preview.data.planHash]).status,
+    0,
+  );
+  const workId = JSON.parse(
+    cli([
+      "request",
+      "Prove reserved generic calls are not replayed",
+      "--target",
+      target,
+      "--json",
+    ]).stdout,
+  ).data.id;
+  assert.equal(
+    cli([
+      "triage",
+      "--id",
+      workId,
+      "--role",
+      "operator",
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+  const first = JSON.parse(
+    cli(["run", "--id", workId, "--target", target, "--json"]).stdout,
+  ).data;
+  const packetHash = JSON.parse(
+    cli([
+      "decision-packet",
+      "--id",
+      workId,
+      "--target",
+      target,
+      "--json",
+    ]).stdout,
+  ).data.binding.packetHash;
+  assert.equal(
+    cli([
+      "approve-tool",
+      "--id",
+      workId,
+      "--call-hash",
+      first.callHash,
+      "--tool",
+      first.toolName,
+      "--packet-hash",
+      packetHash,
+      "--target",
+      target,
+    ]).status,
+    0,
+  );
+
+  const crashed = cli(
+    ["run", "--id", workId, "--target", target, "--json"],
+    {
+      NODE_ENV: "test",
+      CHARTERMESH_TEST_CRASH_AFTER_PENDING_RESERVATION: "1",
+    },
+  );
+  assert.equal(crashed.status, 87, crashed.stderr);
+  assert.equal(existsSync(join(target, "approval-fixture.txt")), false);
+
+  let database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  let controlPlane = new ControlPlane(
+    database,
+    join(target, ".chartermesh", "artifacts"),
+  );
+  assert.equal(controlPlane.listPendingToolCalls(workId)[0]?.status, "executing");
+  database
+    .prepare("UPDATE leases SET expires_at = ? WHERE released_at IS NULL")
+    .run("2000-01-01T00:00:00.000Z");
+  database.close();
+
+  const recoveryPass = cli(["run", "--id", workId, "--target", target, "--json"]);
+  assert.equal(recoveryPass.status, 1);
+  assert.equal(
+    cli(["retry", "--id", workId, "--target", target]).status,
+    0,
+  );
+  const retried = cli(["run", "--id", workId, "--target", target, "--json"]);
+  assert.equal(retried.status, 1);
+  assert.match(retried.stdout + retried.stderr, /TOOL_OUTCOME_UNKNOWN/u);
+  assert.equal(existsSync(join(target, "approval-fixture.txt")), false);
+
+  database = openControlPlaneDatabase(
+    join(target, ".chartermesh", "state.db"),
+  );
+  controlPlane = new ControlPlane(
+    database,
+    join(target, ".chartermesh", "artifacts"),
+  );
+  assert.equal(controlPlane.listPendingToolCalls(workId)[0]?.status, "outcome_unknown");
+  assert.equal(controlPlane.get(workId).status, "failed");
+  database.close();
+});
+
 test("proposal and workflow commands expose versioned JSON for coding agents", () => {
   const target = mkdtempSync(join(tmpdir(), "chartermesh-json-"));
   writeFileSync(join(target, "package.json"), '{"scripts":{"test":"node --test"}}');
@@ -851,7 +984,7 @@ test("proposal and workflow commands expose versioned JSON for coding agents", (
   assert.equal(evaluationEnvelope.data.passedCases, 3);
 });
 
-test("doctor automatically recovers an interrupted engine replacement", () => {
+test("doctor reports an interrupted replacement, explicit recover rolls back, and exact approval resumes", () => {
   const target = mkdtempSync(join(tmpdir(), "chartermesh-crash-recovery-"));
   const initialArgs = [
     "bootstrap",
@@ -901,16 +1034,50 @@ test("doctor automatically recovers an interrupted engine replacement", () => {
     "openai-compatible",
   );
 
+  const blockedPreview = cli(configure);
+  assert.equal(blockedPreview.status, 1);
+  assert.match(blockedPreview.stderr, /unfinished at stage 'approved'/u);
+  assert.equal(
+    JSON.parse(
+      readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+    ).modelEngines[0].adapter,
+    "openai-compatible",
+  );
+
   const doctor = cli(["doctor", "--target", target, "--json"]);
-  assert.equal(doctor.status, 0, doctor.stdout + doctor.stderr);
+  assert.equal(doctor.status, 1, doctor.stdout + doctor.stderr);
   const result = JSON.parse(doctor.stdout);
-  assert.equal(result.data.recovery[0].action, "rolled_back");
+  assert.equal(result.error.recovery.automatic, false);
+  assert.equal(result.error.recovery.pending, true);
+  assert.equal(result.error.applyOperations.pending[0].planHash, hash);
+  assert.equal(
+    JSON.parse(
+      readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+    ).modelEngines[0].adapter,
+    "openai-compatible",
+  );
+
+  const recovered = cli(["recover", "--target", target, "--json"]);
+  assert.equal(recovered.status, 0, recovered.stdout + recovered.stderr);
+  assert.equal(JSON.parse(recovered.stdout).data.recovered[0].action, "rolled_back");
   assert.equal(
     JSON.parse(
       readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
     ).modelEngines[0].adapter,
     "fake",
   );
+
+  const resumed = cli([...configure, "--approve", hash]);
+  assert.equal(resumed.status, 0, resumed.stdout + resumed.stderr);
+  assert.equal(
+    JSON.parse(
+      readFileSync(join(target, ".chartermesh", "runtime.json"), "utf8"),
+    ).modelEngines[0].adapter,
+    "openai-compatible",
+  );
+  const healthy = cli(["doctor", "--target", target, "--json"]);
+  assert.equal(healthy.status, 0, healthy.stdout + healthy.stderr);
+  assert.deepEqual(JSON.parse(healthy.stdout).data.applyOperations.pending, []);
 });
 
 test("Control Plane restore requires the exact preview hash and keeps a safety backup", () => {

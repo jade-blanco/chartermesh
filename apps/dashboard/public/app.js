@@ -444,7 +444,13 @@ function inspectorTitle(item) {
   const pending = activePendingTool(item);
   if (pending) {
     const args = objectValue(pending.arguments);
-    const path = typeof args.path === "string" ? args.path : "도구 변경";
+    const changeCount = Number(pending.summary?.changeCount ?? 0);
+    const path =
+      changeCount > 0
+        ? `${changeCount.toLocaleString("ko-KR")}개 파일`
+        : typeof args.path === "string"
+          ? args.path
+          : "도구 변경";
     return `${path} 변경 결재`;
   }
   return state.decisionPacket?.kind === "artifact_review"
@@ -569,8 +575,39 @@ function renderToolApproval(item) {
   const replacements = Array.isArray(args.replacements)
     ? args.replacements
     : null;
+  const changeSet = objectValue(args.changeSet);
+  const changes = Array.isArray(changeSet.changes)
+    ? changeSet.changes.filter(
+        (change) =>
+          change &&
+          typeof change === "object" &&
+          !Array.isArray(change) &&
+          typeof change.path === "string" &&
+          typeof change.content === "string",
+      )
+    : [];
+  const summaryChanges = Array.isArray(pending.summary?.changes)
+    ? pending.summary.changes
+    : [];
+  const isChangeSet = changes.length > 0;
   const content =
-    typeof args.content === "string"
+    isChangeSet
+      ? changes
+          .map((change, index) => {
+            const summary = summaryChanges.find(
+              (entry) => entry.path === change.path,
+            );
+            return [
+              `===== 파일 ${index + 1}/${changes.length}: ${change.path} =====`,
+              `승인 전 SHA-256: ${change.beforeSha256 ?? "없음(새 파일)"}`,
+              `승인 후 SHA-256: ${summary?.afterSha256 ?? "요약 없음"}`,
+              `UTF-8 크기: ${(summary?.byteSize ?? new TextEncoder().encode(change.content).byteLength).toLocaleString("ko-KR")}바이트`,
+              "",
+              change.content,
+            ].join("\n");
+          })
+          .join("\n\n")
+      : typeof args.content === "string"
       ? args.content
       : replacements
         ? [
@@ -589,7 +626,9 @@ function renderToolApproval(item) {
         ? args.unparsed
         : JSON.stringify(args, null, 2);
   const path =
-    typeof args.path === "string"
+    isChangeSet
+      ? `${changes.length.toLocaleString("ko-KR")}개 파일`
+      : typeof args.path === "string"
       ? args.path
       : unparsed
         ? "파싱되지 않은 도구 인자"
@@ -600,25 +639,36 @@ function renderToolApproval(item) {
     `${path} 변경 승인`;
   document.querySelector("#tool-name").textContent = pending.toolName;
   document.querySelector("#tool-size").textContent =
-    replacements
+    isChangeSet
+      ? `${changes.length.toLocaleString("ko-KR")}개 파일 · ${(pending.summary?.totalBytes ?? byteSize).toLocaleString("ko-KR")}바이트 · 원자적 적용`
+      : replacements
       ? `${replacements.length.toLocaleString("ko-KR")}개 정확한 치환 · SHA 고정`
       : `${byteSize.toLocaleString("ko-KR")}바이트 · ${content.split(/\r?\n/).length.toLocaleString("ko-KR")}줄`;
   document.querySelector("#tool-call-hash").textContent = pending.callHash;
   document.querySelector("#tool-packet-hash").textContent =
     state.decisionPacket?.binding?.packetHash ?? "패킷 없음";
   document.querySelector("#tool-content").textContent = content;
-  document.querySelector("#tool-impact").textContent = replacements
-    ? `프로젝트 내부의 "${path}" 파일에서 기존 코드 ${replacements.length.toLocaleString("ko-KR")}곳만 정확히 찾아 교체합니다. 파일 전체를 덮어쓰지 않으며 다른 파일은 변경하지 않습니다.`
-    : `프로젝트 내부의 "${path}" 파일 내용을 ${byteSize.toLocaleString("ko-KR")}바이트 규모로 변경합니다. 정확한 원문은 아래 기술 상세에서 확인할 수 있습니다.`;
-  const safeguards = replacements
+  document.querySelector("#tool-impact").textContent = isChangeSet
+    ? `프로젝트 내부 ${changes.length.toLocaleString("ko-KR")}개 파일을 하나의 승인 단위로 변경합니다. 모든 경로·승인 전 해시·승인 후 전체 바이트는 아래 기술 상세에 함께 표시됩니다.`
+    : replacements
+      ? `프로젝트 내부의 "${path}" 파일에서 기존 코드 ${replacements.length.toLocaleString("ko-KR")}곳만 정확히 찾아 교체합니다. 파일 전체를 덮어쓰지 않으며 다른 파일은 변경하지 않습니다.`
+      : `프로젝트 내부의 "${path}" 파일 내용을 ${byteSize.toLocaleString("ko-KR")}바이트 규모로 변경합니다. 정확한 원문은 아래 기술 상세에서 확인할 수 있습니다.`;
+  const safeguards = isChangeSet
     ? [
+        "표시된 모든 파일의 현재 SHA-256 또는 부재 상태가 승인 시점과 같을 때만 실행합니다.",
+        "한 파일이라도 달라졌으면 변경 묶음 전체를 적용하지 않습니다.",
+        "승인된 전체 바이트를 복구 가능한 파일 트랜잭션으로 원자적으로 적용합니다.",
+        "CharterMesh 제어 파일과 프로젝트 밖 경로는 변경 묶음에 포함할 수 없습니다.",
+      ]
+    : replacements
+      ? [
         typeof args.expectedSha256 === "string"
           ? "검토한 파일과 현재 파일의 SHA-256이 같을 때만 실행합니다."
           : "현재 파일의 SHA-256 고정 정보가 없습니다.",
         "각 교체 대상이 지정된 횟수만큼 정확히 존재할 때만 실행합니다.",
         "하나라도 일치하지 않으면 파일을 전혀 변경하지 않습니다.",
-      ]
-    : [
+        ]
+      : [
         "사람이 이 정확한 호출 해시를 승인하기 전에는 실행되지 않습니다.",
         "프로젝트 경로 밖의 파일에는 접근할 수 없습니다.",
       ];

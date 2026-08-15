@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import test from "node:test";
 import {
   parseRuntimeConfig,
@@ -94,5 +95,79 @@ test("runtime parser validates optional web search security bounds", () => {
         }),
       ),
     /HTTPS or loopback HTTP/u,
+  );
+});
+
+test("runtime parser validates optional pinned agent hosts", () => {
+  const parsed = parseRuntimeConfig(
+    JSON.stringify({
+      ...valid,
+      agentHosts: [
+        {
+          id: "codex-local",
+          adapter: "codex-app-server",
+          command: resolve("codex"),
+          executableSha256: "a".repeat(64),
+          args: ["--profile", "chartermesh"],
+          model: "gpt-5.6-terra",
+          reasoningEffort: "medium",
+          allowUnrestrictedRead: true,
+          timeoutMs: 120_000,
+        },
+      ],
+    }),
+  );
+  assert.equal(parsed.agentHosts?.[0]?.adapter, "codex-app-server");
+  assert.deepEqual(parsed.agentHosts?.[0]?.args, ["--profile", "chartermesh"]);
+  assert.throws(
+    () =>
+      parseRuntimeConfig(
+        JSON.stringify({
+          ...valid,
+          agentHosts: [
+            {
+              id: "model",
+              adapter: "codex-app-server",
+              command: resolve("codex"),
+              executableSha256: "a".repeat(64),
+            },
+          ],
+        }),
+      ),
+    /unique across adapter kinds/u,
+  );
+  assert.throws(
+    () =>
+      parseRuntimeConfig(
+        JSON.stringify({
+          ...valid,
+          agentHosts: [
+            {
+              id: "codex-local",
+              adapter: "codex-app-server",
+              command: resolve("codex"),
+              executableSha256: "unpinned",
+            },
+          ],
+        }),
+      ),
+    /pattern/u,
+  );
+  assert.throws(
+    () =>
+      parseRuntimeConfig(
+        JSON.stringify({
+          ...valid,
+          agentHosts: [
+            {
+              id: "codex-local",
+              adapter: "codex-app-server",
+              command: "codex",
+              executableSha256: "a".repeat(64),
+            },
+          ],
+        }),
+      ),
+    /absolute executable path/u,
   );
 });

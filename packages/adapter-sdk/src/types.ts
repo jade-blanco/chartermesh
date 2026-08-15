@@ -33,7 +33,7 @@ export interface AgentHostManifest {
   kind: "agent_host";
   profileId: string;
   adapter: string;
-  contractVersion: "v1alpha1";
+  contractVersion: "v1alpha2";
   permissionCeiling: PermissionClass;
   engineBinding: "host_managed";
   modelCapabilities?: CapabilityDescriptor[];
@@ -131,20 +131,149 @@ export interface HostRunRequest {
   runId: string;
   attemptId: string;
   generation: number;
+  workspacePath?: string;
 }
+
+export type HostRunStatus =
+  | "starting"
+  | "running"
+  | "waiting_for_approval"
+  | "completed"
+  | "failed"
+  | "canceled";
 
 export interface HostRunHandle {
   hostRunId: string;
+  hostSessionId?: string;
   status: "starting" | "running" | "waiting_for_approval";
+}
+
+export interface AgentHostRunHandle extends HostRunHandle {
+  hostSessionId: string;
+}
+
+export interface HostResumeRequest extends HostRunRequest {
+  hostSessionId: string;
+}
+
+/**
+ * The signal owns the lifetime of the created host run, not only the start or
+ * resume handshake. Aborting it after the handle resolves requests run
+ * cancellation. Idempotent callers reuse the signal from the creating call.
+ */
+export interface AgentHostRunOptions {
+  signal?: AbortSignal;
+}
+
+export interface AgentHostDiagnostic {
+  code: string;
+  severity: "info" | "warning" | "error";
+  message: string;
+}
+
+export interface AgentHostDiscovery {
+  available: boolean;
+  profileId: string;
+  adapter: string;
+  providerVersion: string | null;
+  protocolVersion: string | null;
+  capabilities: CapabilityDescriptor[];
+  diagnostics: AgentHostDiagnostic[];
+}
+
+export type HostApprovalKind =
+  | "command_execution"
+  | "file_change"
+  | "permission"
+  | "user_input"
+  | "unknown";
+
+export interface HostApprovalRequest {
+  requestId: string;
+  kind: HostApprovalKind;
+  summary: string;
+  actionable: boolean;
+  itemId?: string;
+}
+
+export interface HostRunError {
+  code: string;
+  message: string;
+  retryable: boolean | null;
+}
+
+export type HostRunUsage = ModelUsage;
+
+export interface HostRunResult {
+  hostRunId: string;
+  hostSessionId: string;
+  status: "completed" | "failed" | "canceled";
+  outputText: string;
+  usage: HostRunUsage;
+  error: HostRunError | null;
+  cancelReason: HostCancelReason | null;
+}
+
+interface HostRunEventBase {
+  hostRunId: string;
+  hostSessionId: string;
+  sequence: number;
+  occurredAt: string;
+}
+
+export type HostRunEvent =
+  | (HostRunEventBase & {
+      type: "status";
+      status: HostRunStatus;
+    })
+  | (HostRunEventBase & {
+      type: "output_delta";
+      delta: string;
+    })
+  | (HostRunEventBase & {
+      type: "approval_required";
+      approval: HostApprovalRequest;
+    })
+  | (HostRunEventBase & {
+      type: "warning";
+      warning: HostRunError;
+    })
+  | (HostRunEventBase & {
+      type: "terminal";
+      result: HostRunResult;
+    });
+
+export interface HostCancelReason {
+  code:
+    | "user_requested"
+    | "superseded"
+    | "timeout"
+    | "shutdown"
+    | "safety"
+    | "unknown";
+  message?: string;
 }
 
 export interface AgentHost {
   readonly manifest: AgentHostManifest;
+  discover(options?: { signal?: AbortSignal }): Promise<AgentHostDiscovery>;
   start(
     request: HostRunRequest,
+    options?: AgentHostRunOptions,
+  ): Promise<AgentHostRunHandle>;
+  resume(
+    request: HostResumeRequest,
+    options?: AgentHostRunOptions,
+  ): Promise<AgentHostRunHandle>;
+  events(
+    hostRunId: string,
     options?: { signal?: AbortSignal },
-  ): Promise<HostRunHandle>;
-  cancel(hostRunId: string): Promise<void>;
+  ): AsyncIterable<HostRunEvent>;
+  result(
+    hostRunId: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<HostRunResult>;
+  cancel(hostRunId: string, reason?: HostCancelReason): Promise<void>;
 }
 
 export interface ManagedRunner {

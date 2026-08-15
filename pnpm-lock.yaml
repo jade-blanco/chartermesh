@@ -8,6 +8,8 @@ importers:
 
   .: {}
 
+  adapters/agent-hosts/codex: {}
+
   adapters/model-engines/command-process: {}
 
   adapters/model-engines/fake: {}

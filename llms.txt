@@ -6,7 +6,10 @@ work.
 When asked to apply this repository to another project, read BOOTSTRAP.md and
 use its inspect -> plan -> exact human approval -> apply -> verify protocol.
 With only the GitHub URL, the package-ready entry point is
-`npx --yes github:jade-blanco/chartermesh` after package-download approval.
+`npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1` after package-download
+approval. The GitHub form requires Git, npm lifecycle scripts for the
+dependency-free prepare build, and normal network access. The tag selects a
+version but is movable and is not a cryptographic commit attestation.
 Tool execution is governed by OrgSpec allowlists, relative workspace roots,
 exact-call human approvals, evidence hashes, and bounded iterations.
 Any local executable can connect through the shell-free command-process JSON
@@ -22,13 +25,32 @@ Decision Packet v1alpha2 separately binds exact artifact bytes/media type and
 the canonical producer-report sidecar. Producer-reported checks remain
 claimed, including in experimental runtime_compiled mode. Human decision
 surfaces must show the exact bounded artifact preview as well as the packet;
-the projection is not a substitute for the deliverable. SQLite schema v12
-stores report JSON, hash, and byte size. runtime_compiled is currently a
+the projection is not a substitute for the deliverable. SQLite schema v15
+stores report identity, AgentHost lineage, exact actor/request idempotency, and
+governed change-set reservation/settlement state. runtime_compiled is currently a
 BuiltInManagedRunner API option, not a CLI/runtime.json setting.
-Approved bootstrap plans also install four provider-neutral Apache-2.0 Agent
-Skills. External MCP servers remain uninstalled and disabled. Optional
+Approved bootstrap plans also install five provider-neutral Apache-2.0 Agent
+Skills, including `tool-grounded-implementation`. External MCP servers remain
+uninstalled and disabled. Optional
 SearXNG web.search requires a reviewed HTTPS/loopback endpoint, a tool-calling
 engine, an OrgSpec allowlist entry, and exact per-query human approval.
+
+Fresh projects can use one approved kickoff plan for files, the project brief,
+acceptance criteria, and the first WorkItem. A second configure-host plan can
+project Codex or Claude roles plus a local stdio MCP bridge. Each bridge process
+has a unique non-human actor and exact WorkItem/Run/Attempt/lease/generation
+fences; it has no approval authority. Projected roles request one bounded,
+content-addressed multi-file change set, then a separately controlled human
+reviews its stored bytes and approves the exact call and Decision Packet. A new
+claim can apply only that stored set through a recoverable transaction.
+Provider-native parent permissions can override projected child defaults, and
+`human:*` is a procedural local policy boundary rather than cryptographic proof
+against a process with CLI/database access. This pre-alpha is not a production
+authorization or OS-sandbox system.
+
+One project MCP bridge serves the aggregate allowed role set. Generated agents
+must claim only their own `ownerRole`, but native subagent identity is not
+authenticated at the shared bridge, so cross-role separation is procedural.
 
 The evaluate-decision-review command is dry by default. Its live mode requires
 the exact plan hash and an attested Codex executable/model binding for 20

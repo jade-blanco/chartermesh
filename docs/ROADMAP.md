@@ -1,7 +1,8 @@
 # Implementation roadmap
 
-Current milestone: `0.0.8-alpha.1`, verifiable Decision Packets, safe
-decision-review resume, and provider-neutral local operations.
+Current milestone: `0.0.9-alpha.1`, verifiable Decision Packets, safe
+decision-review resume, provider-neutral local operations, and the first
+bounded coding-agent host integration.
 
 ## Completed foundation
 
@@ -12,6 +13,8 @@ decision-review resume, and provider-neutral local operations.
 - Universal `BOOTSTRAP.md` application protocol
 - Project-aware lean/balanced/controlled proposals
 - Exact hash-bound plan and crash-recoverable journaled apply
+- Cross-resource operation receipts that resume approved file and Control
+  Plane settlement without duplicate kickoff work
 - SQLite Control Plane with idempotency, append-only events, transactional
   outbox, runs, attempts, leases, artifacts, approvals, and usage
 - Fencing, heartbeat, lease recovery, visible failure, retry, and budgets
@@ -23,7 +26,7 @@ decision-review resume, and provider-neutral local operations.
 - Synthetic model evaluation
 - Common Tool Runtime with OrgSpec allowlist, exact-call approval, workspace
   roots, evidence, and bounded iterations
-- Crash-recoverable file transactions and automatic journal recovery
+- Crash-recoverable file transactions, no-write diagnostics, and explicit journal recovery
 - Cross-process claim, idempotency, and SQLite lock stress suites
 - Dependency-free JavaScript package build and clean-consumer install test
 - Offline installation-version matching and explicit latest-release check
@@ -50,6 +53,14 @@ decision-review resume, and provider-neutral local operations.
 - Experimental provider-neutral depth-1 delegation with planner, implementer,
   verifier, and synthesizer child Attempts
 - Paired single-versus-delegated small-model collaboration evaluation
+- Project-brief `kickoff` with one approved file plan and initial triaged work
+- Local stdio MCP server over the authoritative Control Plane with unique
+  session actors, exact run fencing, bounded governed change sets, and no
+  human approval authority
+- Hash-pinned Codex/Claude discovery plus deterministic project role, MCP, and
+  instruction projection
+- Codex app-server AgentHost v1alpha2 discovery/start/resume/events/result/cancel
+  contract with durable run/session/turn binding and fail-closed approvals
 
 ## Next: execution hardening
 
@@ -62,10 +73,12 @@ decision-review resume, and provider-neutral local operations.
 
 ## Next: integration surfaces
 
-- MCP server over the same Control Plane application service
-- Provider-neutral MCP client lifecycle with capability projection,
-  supply-chain pinning, cancellation, approval, and evidence
-- Optional external AgentHost adapters
+- Resumable Control Plane approval callbacks for provider-native file and
+  command requests; current Codex adapter cancels them fail-closed
+- Direct Claude AgentHost adapter and compatibility tests; current Claude
+  support is project-role and MCP projection only
+- Provider-neutral MCP client lifecycle beyond local stdio, with credential
+  binding and transport cancellation
 - Projection of native AgentHost children into the same parent/child ledger
 - Runtime capability discovery and drift reporting
 - Registry release automation and clean-machine install/uninstall matrix

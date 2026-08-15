@@ -261,7 +261,10 @@ test("decision-review live mode rejects a reparse-point state root", (t) => {
     plan.planHash,
   ]);
   assert.equal(rejected.status, 1, rejected.stdout + rejected.stderr);
-  assert.match(rejected.stdout, /DECISION_REVIEW_STATE_REPARSE_POINT_REJECTED/u);
+  assert.match(
+    rejected.stdout,
+    /DECISION_REVIEW_STATE_REPARSE_POINT_REJECTED|PROJECT_STATE_LINK_REJECTED/u,
+  );
   assert.deepEqual(readdirSync(outside), []);
 });
 

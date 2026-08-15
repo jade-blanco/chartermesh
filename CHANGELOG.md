@@ -1,7 +1,42 @@
 # Changelog
 
+## 0.0.9-alpha.1 — 2026-08-15
+
+- Migrated the SQLite Control Plane to schema v15 with safety backups. Command
+  replay is bound to the exact actor and canonical request, and governed
+  change-set execution has durable reservation and settlement state.
+- Added a single approved `kickoff` plan that installs CharterMesh from a
+  project brief and creates the first triaged, acceptance-bound WorkItem.
+- Added a dependency-free local MCP server over the same Control Plane. Each
+  bridge process receives a unique non-human actor; every mutation is fenced
+  by its exact WorkItem, Run, Attempt, lease, and generation. The bridge
+  exposes bounded content-addressed workspace change sets while withholding
+  human approval and organization-apply authority.
+- Added hash-pinned Codex/Claude host discovery and exact-plan projection of
+  namespaced project instructions, roles, and required MCP configuration
+  without making host task lists authoritative. Projection-only capabilities
+  are explicitly declared compatibility, followed by a mandatory live MCP
+  health gate.
+- Added the first external AgentHost vertical slice through Codex app-server:
+  `v1alpha2` discovery/resume/events/result/cancel, an initialize-only exact
+  protocol check, session/turn ids, structured result submission, durable
+  Control Plane bindings, and fail-closed provider approval requests. Direct
+  activation also binds an explicit acknowledgement of Codex's host-user read
+  scope. Claude currently uses the shared MCP/project projection path and does
+  not claim direct AgentHost run activation.
+- Added recoverable cross-resource apply receipts so an approved kickoff or
+  host plan resumes the same file and Control Plane operation after a crash
+  instead of duplicating or stranding initial work.
+- Hardened managed state/config paths and file transactions against linked or
+  reparse-point ancestors (including Windows 8.3 aliases), ambiguous TOML
+  merges, duplicate/control targets, crafted journals, staging races, and
+  bounded-read failures. No-write plans and doctor now report incomplete
+  transactions; only exact approved resume or explicit recovery mutates them.
+
 ## 0.0.8-alpha.1 — 2026-08-07
 
+- Added the tool-grounded implementation skill, bringing the provider-neutral
+  Apache-2.0 portable skill bundle to five packages.
 - Reframed the primary product surface around verifiable human decisions and
   separate human, role, waiting, and history attention queues.
 - Added Decision Packet v1alpha2 with exact artifact/media-type identity, a

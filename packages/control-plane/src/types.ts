@@ -53,6 +53,20 @@ export interface WorkItem {
   updatedAt: string;
 }
 
+/**
+ * Opaque credentials returned by a successful WorkItem claim.
+ *
+ * All untrusted worker mutations must present the complete tuple. A generation
+ * by itself is not a credential: another actor can observe it, and IDs from
+ * unrelated runs must never be mix-and-matched.
+ */
+export interface ActiveRunFence {
+  runId: string;
+  attemptId: string;
+  leaseId: string;
+  generation: number;
+}
+
 export interface UserAction {
   id: string;
   workItemId: string;
@@ -343,9 +357,48 @@ export interface PendingToolCall {
   callHash: string;
   toolName: string;
   arguments: unknown;
-  status: "approval_required" | "executed" | "denied";
+  summary: PendingToolCallSummary | null;
+  status:
+    | "approval_required"
+    | "executing"
+    | "executed"
+    | "denied"
+    | "precondition_failed"
+    | "outcome_unknown"
+    | "outcome_acknowledged";
   createdAt: string;
   executedAt: string | null;
+  reservation: PendingToolExecutionReservation | null;
+  evidenceId: string | null;
+  effectHash: string | null;
+  outcomeMessage: string | null;
+}
+
+export interface PendingToolCallSummary {
+  title: string;
+  changeCount: number;
+  totalBytes: number;
+  changes: Array<{
+    path: string;
+    beforeSha256: string | null;
+    afterSha256: string;
+    byteSize: number;
+  }>;
+}
+
+export interface PendingToolExecutionReservation {
+  id: string;
+  runId: string;
+  attemptId: string;
+  leaseId: string;
+  generation: number;
+  actor: string;
+  reservedAt: string;
+}
+
+export interface PendingToolExecutionClaim {
+  pending: PendingToolCall;
+  disposition: "reserved" | "recovery_required" | "executed";
 }
 
 export interface ToolExecutionEvidenceRecord {
@@ -410,6 +463,22 @@ export interface AttemptRecord {
   finishedAt: string | null;
   errorCode: string | null;
   errorMessage: string | null;
+}
+
+export interface AgentHostRunBinding {
+  id: string;
+  workItemId: string;
+  runId: string;
+  attemptId: string;
+  hostId: string;
+  hostSessionId: string;
+  hostRunId: string;
+  status: "running" | "waiting" | "succeeded" | "failed" | "canceled";
+  lastEventCursor: string | null;
+  errorCode: string | null;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
 }
 
 export interface OutboxDelivery {

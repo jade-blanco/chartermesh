@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import {
   validateJsonSchemaDocument,
   type JsonSchemaIssue,
@@ -43,6 +44,19 @@ export type RuntimeModelEngine =
       pricing?: ModelPricing;
     };
 
+export interface RuntimeAgentHost {
+  id: string;
+  adapter: "codex-app-server";
+  command: string;
+  executableSha256: string;
+  args?: string[];
+  model?: string;
+  reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+  allowUnrestrictedRead?: boolean;
+  environmentAllowlist?: string[];
+  timeoutMs?: number;
+}
+
 export interface RuntimeConfig {
   apiVersion: "chartermesh.dev/runtime/v1alpha1";
   modelEngines: RuntimeModelEngine[];
@@ -51,6 +65,7 @@ export interface RuntimeConfig {
     adapter: "builtin-managed-runner";
     modelEngineRef: string;
   }>;
+  agentHosts?: RuntimeAgentHost[];
   webSearch?: SearxngWebSearchConfig;
 }
 
@@ -120,11 +135,30 @@ export function parseRuntimeConfig(text: string): RuntimeConfig {
       "Runtime configuration managed runner ids must be unique.",
     );
   }
+  const hostIds = (config.agentHosts ?? []).map(({ id }) => id);
+  if (new Set(hostIds).size !== hostIds.length) {
+    throw new RuntimeConfigParseError(
+      "Runtime configuration agent host ids must be unique.",
+    );
+  }
+  const allRuntimeIds = [...engineIds, ...runnerIds, ...hostIds];
+  if (new Set(allRuntimeIds).size !== allRuntimeIds.length) {
+    throw new RuntimeConfigParseError(
+      "Runtime configuration ids must be unique across adapter kinds.",
+    );
+  }
   for (const runner of config.managedRunners) {
     if (!engineIds.includes(runner.modelEngineRef)) {
       throw new RuntimeConfigParseError(
         `Managed runner '${runner.id}' references unknown model engine ` +
           `'${runner.modelEngineRef}'.`,
+      );
+    }
+  }
+  for (const host of config.agentHosts ?? []) {
+    if (!isAbsolute(host.command)) {
+      throw new RuntimeConfigParseError(
+        `Agent host '${host.id}' command must be an absolute executable path.`,
       );
     }
   }

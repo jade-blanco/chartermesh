@@ -303,6 +303,9 @@ export function createControlPlaneWorkflowStudyPersistence(input: {
           );
           input.controlPlane.submitArtifact({
             id: work.id,
+            runId: claim.runId,
+            attemptId: claim.attemptId,
+            leaseId: claim.leaseId,
             content,
             mediaType:
               "application/vnd.chartermesh.collaboration-study-trial+json",

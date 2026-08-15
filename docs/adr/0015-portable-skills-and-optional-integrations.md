@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-30
+- Amended: 2026-08-14 (record the fifth bundled implementation skill)
 
 ## Context
 
@@ -18,9 +19,10 @@ common Tool Runtime remains the execution authorization boundary.
 
 ## Decision
 
-1. CharterMesh authors and bundles four Apache-2.0 Agent Skills using the open
+1. CharterMesh authors and bundles five Apache-2.0 Agent Skills using the open
    `SKILL.md` package format: web research, repository diagnostics,
-   small-model evidence discipline, and integration review.
+   small-model evidence discipline, tool-grounded implementation, and
+   integration review.
 2. Exact bootstrap plans copy these packages into
    `.chartermesh/skills/` and add an `AGENT-ENTRYPOINT.md`. A model reads only
    the relevant skill; skill text never grants permission.

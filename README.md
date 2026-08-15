@@ -42,7 +42,7 @@ through the core OrgSpec schema.
 `BuiltInManagedRunner` API; there is no CLI or `runtime.json` selector for it
 in this slice.
 
-## 0.0.8-alpha.1 runnable slice
+## 0.0.9-alpha.1 runnable slice
 
 - Project-aware `lean`, `balanced`, and `controlled` proposals
 - Exact plan-hash approval and crash-recoverable journaled apply
@@ -62,7 +62,8 @@ in this slice.
 - Decision Packet v1alpha2 with exact artifact/media-type identity, a
   separately hashed producer-report sidecar, and model-reported checks kept as
   `claimed` even when the runtime compiles the envelope
-- SQLite schema v12 persistence for producer-report JSON, hash, and byte size;
+- SQLite schema v15 persistence for producer-report JSON, durable AgentHost
+  run/session bindings, and actor-and-request-bound idempotency replay;
   migrated v11 artifacts remain valid with no report
 - Fake, generic OpenAI-compatible, and shell-free, executable-hash-pinned
   command-process engines with dedicated working directories
@@ -83,20 +84,39 @@ in this slice.
   Decision Packet review presentations under an exact live plan hash
 - Synthetic local-model evaluation for comparing small models
 - Buildable dependency-free npm package and clean-install verification
-- Four bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan
+- Five bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan
 - Agent-readable capability catalog with every external integration disabled
   by default
 - Optional approval-gated SearXNG `web.search` with bounded network behavior
 - Evidence-grounding instructions validated with a local Gemma 4 workflow
+- Project-brief `kickoff` that creates the approved files and first triaged
+  WorkItem together
+- Local stdio MCP bridge with a unique non-human session actor, exact
+  role/target/run fencing, governed workspace change-set requests, and no human
+  approval authority
+- Exact-plan Codex/Claude role and MCP projection, plus a hash-pinned Codex
+  app-server AgentHost adapter with fail-closed native approval requests
 
 This is pre-alpha software, not a production authorization system.
+`human:*` authority is a Control Plane policy boundary, not cryptographic proof
+of a person against a local process that can invoke the CLI or edit the
+database. Keep the primary coding host away from approval credentials and make
+approval decisions in a separately controlled human session. Generated child
+role permissions can be overridden by a parent Codex/Claude session, so start
+that parent without native write/shell authority; this is not an OS sandbox.
 
 ## Requirements
 
 - Node.js 24 or newer
+- Git 2.x when installing directly from the GitHub `npx` ref
 - pnpm 11 for source verification
 
-There are no runtime npm dependencies in this slice.
+There are no runtime npm dependencies in this slice. The GitHub `npx` form
+still invokes the local Git client; a future registry or standalone-binary
+release may remove that prerequisite. It also relies on npm's normal lifecycle
+scripts to run the repository's dependency-free `prepare` build. Environments
+that globally disable install scripts must use a reviewed prebuilt package or
+source checkout instead; `ignore-scripts` GitHub installs are unsupported.
 
 ## Portable skills and free integrations
 
@@ -106,6 +126,7 @@ Every approved bootstrap installs these provider-neutral Agent Skills under
 - `web-research`
 - `repository-diagnostics`
 - `small-model-evidence`
+- `tool-grounded-implementation`
 - `integration-review`
 
 They follow the open `SKILL.md` package format and are Apache-2.0. Skill text
@@ -152,12 +173,118 @@ On a machine with Node.js 24 or newer, a human, coding agent, or shell can run
 CharterMesh without manually checking out this source tree:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 propose --target C:\path\to\project --profile balanced --json
-npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 bootstrap --target C:\path\to\project --profile balanced --engine fake --json
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 propose --target C:\path\to\project --profile balanced --json
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 bootstrap --target C:\path\to\project --profile balanced --engine fake --json
 ```
 
-The tag-pinned form above is the reproducible friend-trial path. Omit
-`#v0.0.8-alpha.1` only when you intentionally want the latest `main` branch.
+The tag-pinned form above selects the friend-trial version, but a Git tag is
+movable and is not a cryptographic commit attestation. Omit `#v0.0.9-alpha.1`
+only when you intentionally want the latest `main` branch.
+
+For a completely new project, put the request in a brief file and use
+`kickoff` instead of separately bootstrapping and creating the first task:
+
+```powershell
+$Target = "C:\path\to\new-project"
+New-Item -ItemType Directory -Force -Path $Target | Out-Null
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 kickoff `
+  --target $Target `
+  --brief-file C:\path\to\project-brief.md `
+  --profile controlled `
+  --engine fake `
+  --json
+```
+
+The preview writes nothing. Repeat that identical command with
+`--approve PLAN_HASH`; it then installs the reviewed configuration, stores the
+brief, and creates one triaged WorkItem with explicit acceptance criteria.
+
+### Connect the project to Codex or Claude Code
+
+First inspect the installed host without making a model call or changing the
+project:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 host doctor `
+  --host codex `
+  --target $Target `
+  --json
+```
+
+This reports the executable hash and a CharterMesh-declared compatibility
+snapshot derived from the host kind and reported version; it is not a live
+feature probe. The later approved host plan persists both. Projection-only
+checks create no model turn and do not require the experimental direct
+protocol. Use `host doctor --direct` only to test the exact Codex app-server
+protocol used by direct execution. The post-projection MCP health check below
+is therefore mandatory.
+
+Then generate a second exact plan. This projects the OrgSpec roles and a
+tag-pinned CharterMesh MCP command into the host's project configuration:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 configure-host `
+  --host codex `
+  --target $Target `
+  --allow-unrestricted-read `
+  --max-agents 4 `
+  --json
+```
+
+Repeat with `--approve PLAN_HASH`. Use `--host claude` for Claude Code. Both
+hosts then read and mutate the same CharterMesh Control Plane through local
+stdio MCP; their native task lists are not authoritative and the MCP server
+cannot perform a human approval. Projected role files deny native shell and
+write tools by default, but a parent host policy can override child settings.
+Start the parent without native write/shell authority. Roles request one
+bounded content-addressed change set through MCP, a human reviews and approves
+its exact bytes with `approve-tool`, and a newly claimed run executes only the
+stored approved set while recording evidence. This default project mode does
+not activate a direct host runtime target.
+
+One project bridge serves the aggregate configured OrgSpec roles. Generated
+profiles are instructed to claim only their own `ownerRole`, but a shared MCP
+connection cannot authenticate the native subagent identity. Treat cross-role
+separation as procedural in this alpha, not as an authorization boundary.
+
+After applying the host plan, close the pre-projection host session and start a
+new Codex or Claude Code session from the project root. Trust the project so
+Codex loads `.codex/config.toml`; in Claude Code, approve the project MCP server
+once and inspect it with `/mcp`. Verify that `chartermesh_status` and
+`chartermesh_work_next` are available before assigning work. A running session
+is not assumed to hot-reload generated roles or MCP configuration.
+
+The generated bridge command is tag-pinned but does not cryptographically
+attest the `npx` launcher or the remote commit behind a movable Git tag. For a
+higher-assurance setup, bind a reviewed local bridge command or a commit-SHA
+distribution in the approved host plan.
+
+Codex can additionally be selected as a direct execution target by including
+`--activate-role operator --allow-unrestricted-read` in both the preview and
+approved command. The acknowledgement is required because Codex's read-only
+sandbox does not confine reads to the project directory. That path uses the
+hash-pinned experimental app-server adapter and may consume the user's Codex
+quota. Claude direct AgentHost execution is not implemented in this alpha;
+its supported path is the projected roles plus shared MCP bridge.
+
+Use repeated `--pass-env NAME` only when direct Codex needs a reviewed
+API-key, proxy, or certificate environment variable. Values are inherited at
+runtime and are never stored in the plan. Host-user ChatGPT authentication
+normally needs no pass-through variable.
+
+For a coding-agent handoff, this prompt is sufficient even for an empty
+project folder:
+
+> Use https://github.com/jade-blanco/chartermesh at tag v0.0.9-alpha.1. Treat
+> this message as the project brief and apply the `kickoff` flow to the empty
+> project folder. Read `BOOTSTRAP.md`, inspect first, show every file and the
+> exact plan hash, and do not write to the target until I approve that same
+> hash. After approval run `doctor`, run `host doctor` for the coding host you
+> are using, create a `configure-host` plan, and again wait for my exact hash
+> approval. For Codex projection include `--allow-unrestricted-read`. Start a
+> new trusted host session from the project root after applying the host plan,
+> verify the CharterMesh MCP tools, and never treat a model review or host
+> permission prompt as my CharterMesh approval.
 
 `bootstrap` returns the exact plan hash and still performs no target writes.
 After a human approves that value, repeat the same command with
@@ -202,8 +329,10 @@ node bin/chartermesh.mjs dashboard --target C:\path\to\project
 
 The fake engine is deterministic, free, and offline.
 
-`doctor` automatically compares the target's pinned installation version with
-the running CLI and recovers any incomplete apply journal. Use
+`doctor` compares the target's pinned installation version with the running CLI
+and reports any incomplete apply journal without mutating it. Inspect the
+evidence, then use explicit `recover` or repeat the exact already-approved apply
+command to resume it. Use
 `chartermesh version --check` for an explicit network check of the latest
 published GitHub release, including prereleases.
 
@@ -240,6 +369,8 @@ Credential values are never written to CharterMesh files. Plain HTTP with a
 credential is rejected unless the endpoint is loopback.
 
 See [`docs/LLM-CONNECTIONS.md`](docs/LLM-CONNECTIONS.md).
+For Codex/Claude project roles, MCP, and the direct Codex host boundary, see
+[`docs/CODING-HOSTS.md`](docs/CODING-HOSTS.md).
 
 To connect an arbitrary local engine wrapper without a vendor API:
 
@@ -491,7 +622,11 @@ node bin/chartermesh.mjs tool-evidence --id work-000001 --target TARGET --json
 The unapproved call waits without changing the WorkItem to failed. Exact human
 approval returns it to ready, and the next `run` uses a new fenced generation.
 Exact human rejection cancels the WorkItem without executing the call and
-preserves the decision evidence.
+preserves the decision evidence. Every full-content write binds the exact
+current `beforeSha256` (or explicit absence), rejects nested CharterMesh/Git/
+host-control paths, and applies through the recoverable file transaction. A
+durable execution reservation prevents automatic replay after a crash; an
+unprovable effect becomes `TOOL_OUTCOME_UNKNOWN` for human inspection.
 
 ## Local files added to a target
 

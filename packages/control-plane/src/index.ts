@@ -30,6 +30,8 @@ export {
 export type {
   AuditRecord,
   AcceptanceCriterion,
+  ActiveRunFence,
+  AgentHostRunBinding,
   ArtifactReviewDecision,
   ArtifactProducerReport,
   ArtifactEvidence,
@@ -39,6 +41,9 @@ export type {
   OutboxDelivery,
   OutboxRecord,
   PendingToolCall,
+  PendingToolCallSummary,
+  PendingToolExecutionClaim,
+  PendingToolExecutionReservation,
   RuntimeBudgets,
   Availability,
   DashboardProjection,

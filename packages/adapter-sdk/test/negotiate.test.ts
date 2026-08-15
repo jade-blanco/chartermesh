@@ -86,7 +86,7 @@ test("a host-managed agent runtime rejects injected engines", () => {
     kind: "agent_host",
     profileId: "external-host",
     adapter: "external-agent-host",
-    contractVersion: "v1alpha1",
+    contractVersion: "v1alpha2",
     permissionCeiling: "workspace_write",
     engineBinding: "host_managed",
     capabilities: [

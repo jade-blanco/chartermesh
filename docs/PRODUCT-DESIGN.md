@@ -1119,6 +1119,21 @@ desired schedule 정본은 Control Plane에 두고 외부 task id, 적용 revisi
 공식 programmatic schedule 관리 계약이 없는 surface는 자동 설치를
 가장하지 않고 검증 가능한 `UserAction`으로 변환한다.
 
+`0.0.9-alpha.1`의 첫 수직 슬라이스는 설치된 Codex 실행 파일과 capability
+snapshot을 계획 해시에 결박하고, 프로젝트 custom agent·`AGENTS.md`·로컬
+stdio MCP를 투영한다. app-server의 thread id와 turn id는 Control Plane
+Run/Attempt에 별도로 저장한다. projection-only discovery는 executable과
+capability snapshot만 검증하고, strict app-server handshake는 직접 역할
+활성화 또는 `host doctor --direct`에만 적용한다. 모델 호출 기록은 host 시작 전에 `running`으로
+만들며 lease 만료 시 host binding과 함께 abandoned/failed로 정리한다.
+provider-native command/file/permission 요청은 아직 정확 호출을 승인한 뒤 같은
+turn을 재개하는 callback이 없으므로 자동 승인하지 않고 `cancel` 또는 빈 권한으로
+응답한 뒤 가시적 실패로 남긴다. 따라서 이 단계는 “완전한 native host”가 아니라
+검증 가능한 bounded AgentHost 단계다.
+Codex의 read-only sandbox는 프로젝트 밖 읽기를 가두는 보안 경계가 아니므로,
+직접 역할 활성화는 이 제한을 명시한 `--allow-unrestricted-read`를 별도 계획 해시에
+결박한다. 프로젝트 범위 읽기 격리가 필요하면 외부 OS sandbox가 추가로 필요하다.
+
 ### 7.4 Claude Code adapter
 
 초기 지원 범위:
@@ -1136,6 +1151,38 @@ desired schedule 정본은 Control Plane에 두고 외부 task id, 적용 revisi
 agent team의 shared task list도 제품 WorkItem 원장으로 사용하지 않으며,
 team member의 병렬 쓰기는 별도 worktree 또는 명시적 파일 소유권이 없으면
 거부한다.
+
+`0.0.9-alpha.1`에서 Claude Code는 project agent·`CLAUDE.md`·`.mcp.json`
+투영과 공통 Control Plane MCP까지만 구현한다. Claude SDK/session을 직접
+`chartermesh run` 대상으로 기동하는 adapter는 아직 구현되지 않았으며 Codex
+수직 슬라이스의 성공을 Claude 지원으로 일반화하지 않는다.
+
+Codex·Claude project role 파일은 네이티브 shell/write를 거부하는 capability
+profile이다. 부모 host session의 실제 permission 정책이 child 설정을 덮어쓸 수
+있으므로 절차적 pre-alpha 경계이며, 적대적 로컬 프로세스 격리에는 외부 OS
+sandbox가 필요하다. `controlled` 조직안은 operator와 verifier를 투영하지만, host-native
+subagent session이나 handoff를 자동으로 child WorkItem 원장에 복제하지는 않는다.
+MCP bridge는 프로세스마다 새로운 non-human actor를 만들고, 허용 role·execution
+target과 정확한 WorkItem/Run/Attempt/Lease/generation tuple을 mutation에 결박한다.
+재시작한 bridge는 이전 actor의 lease를 재사용하지 않고 만료·복구·재claim을
+거친다.
+
+하나의 project bridge가 여러 허용 role을 aggregate하므로 host-native subagent의
+실제 신원을 MCP 호출에서 인증하지는 못한다. 생성된 profile은 자기 `ownerRole`만
+claim하도록 지시하지만, role 간 분리는 현재 절차적 경계다. 공유 bridge actor와
+route set, run/lease/generation fence만 강제 보안 경계로 본다.
+
+프로젝트 구현 변경은 여러 파일의 상대 경로, 승인 전 hash 또는 명시적 부재,
+승인 후 전체 바이트를 하나의 제한된 content-addressed change set으로 묶는다.
+요청 run은 exact call과 Decision Packet을 남기고 approval wait로 전환한다. 별도
+human session이 그 hash를 승인한 뒤 새 run이 저장된 바이트만 복구 가능한 파일
+transaction으로 적용하고 Control Plane receipt/evidence를 settle한다. 중간 종료나
+동시 실행은 재적용이 아니라 journal/receipt 기반 finalize 또는 명시적
+`TOOL_OUTCOME_UNKNOWN`으로 귀결되어야 한다. MCP에는 approval resolve 권한이 없다.
+
+현재 `human:*` 판정은 로컬 Control Plane의 절차적 권한 경계다. CLI/DB에 직접
+접근 가능한 악성 로컬 프로세스에 대해 사람임을 암호학적으로 증명하지 않으므로,
+production authorization system이나 OS security boundary로 주장하지 않는다.
 
 ### 7.5 Generic ModelEngine과 ManagedRunner
 
@@ -1856,7 +1903,7 @@ publication remain separate work.
 
 This amendment supersedes the 0.0.6 implementation-status paragraph above:
 
-- Exact bootstrap plans now install four provider-neutral Apache-2.0 Agent
+- Exact bootstrap plans now install five provider-neutral Apache-2.0 Agent
   Skills under `.chartermesh/skills/` and one common agent entrypoint. They
   follow the portable `SKILL.md` format and grant no execution permission.
 - A versioned, agent-readable catalog distinguishes built-ins, opt-in

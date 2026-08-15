@@ -10,6 +10,9 @@ CharterMesh는 특정 LLM 공급자나 코딩 에이전트에 종속되지 않�
 > 현재 버전은 pre-alpha입니다. 실제 배포·금전 결제·중요 데이터 변경을
 > 무인으로 맡기는 용도가 아니라, 사람이 계획과 변경 내용을 검토하는
 > 로컬 작업 환경으로 사용하세요.
+> `human:*` 표시는 Control Plane 정책상의 사람 역할이며, CLI나 SQLite에
+> 직접 접근할 수 있는 로컬 프로세스에 대해 사람임을 암호학적으로 증명하지는
+> 않습니다. 승인 세션은 코딩 에이전트와 분리해서 관리하세요.
 
 ## 1. CharterMesh가 하는 일
 
@@ -70,28 +73,109 @@ https://github.com/jade-blanco/chartermesh
 일반적인 “적용해줘” 요청은 검사와 계획 생성까지 허용할 뿐, 아직 만들어지지
 않은 계획의 쓰기 승인은 아닙니다.
 
+### 2.1 완전히 새 프로젝트 폴더에서 시작하기
+
+빈 폴더라면 요구사항을 짧은 브리프 파일로 만든 뒤 `bootstrap` 대신
+`kickoff`를 사용합니다. 이 명령은 설치 파일뿐 아니라 프로젝트 브리프와
+첫 번째 작업, 수락 기준까지 하나의 계획 해시에 묶습니다.
+
+```powershell
+$CM = "github:jade-blanco/chartermesh#v0.0.9-alpha.1"
+$Target = "C:\path\to\new-project"
+New-Item -ItemType Directory -Force -Path $Target | Out-Null
+npx --yes $CM kickoff `
+  --target $Target `
+  --brief-file C:\path\to\project-brief.md `
+  --profile controlled `
+  --engine fake `
+  --json
+```
+
+미리보기는 대상 폴더에 쓰지 않습니다. 출력된 해시를 검토한 다음 모든
+옵션을 그대로 반복하고 `--approve PLAN_HASH`를 붙입니다. 적용되면
+`.chartermesh/PROJECT-BRIEF.md`와 첫 `operator` WorkItem이 함께 생성됩니다.
+승인된 설치에는 `web-research`, `repository-diagnostics`,
+`small-model-evidence`, `tool-grounded-implementation`, `integration-review`
+등 5개의 Apache-2.0 공급자 중립 Agent Skill도 포함됩니다.
+
+Codex나 Claude Code 세션에서 팀 역할을 사용하려면 설치 뒤 먼저 모델 호출이
+없는 호스트 검사를 실행합니다.
+
+```powershell
+npx --yes $CM host doctor `
+  --host codex --target $Target --json
+
+npx --yes $CM configure-host `
+  --host codex --target $Target `
+  --allow-unrestricted-read --max-agents 4 --json
+```
+
+두 번째 명령도 별도 계획이므로 정확한 해시를 다시 승인해야 합니다.
+`--host claude`를 사용하면 Claude Code용 역할과 MCP 설정을 만듭니다. 두
+호스트 모두 같은 로컬 Control Plane을 사용하며, MCP에는 사람 승인 권한이
+없습니다. 투영 전용 `host doctor`는 실행 파일과 CharterMesh가 선언한 호환성
+hash를 보고할 뿐 각 기능을 실시간 탐지하거나 Codex app-server를 시작하지
+않습니다. 직접 실행 프로토콜까지 검사할 때만 `host doctor --direct`를 사용합니다.
+
+호스트 계획을 승인·적용한 뒤에는 기존 세션을 닫고 프로젝트 루트에서 새
+Codex 또는 Claude Code 세션을 시작합니다. Codex에서는 프로젝트를 신뢰해
+`.codex/config.toml`을 읽게 하고, Claude Code에서는 프로젝트 MCP를 한 번
+승인한 뒤 `/mcp`로 확인합니다. `chartermesh_status`와
+`chartermesh_work_next`가 보여야 합니다. 이 투영 후 상태 확인은 필수이며,
+기존 세션의 역할·MCP 자동 재로딩은 가정하지 않습니다.
+
+투영된 역할 파일은 네이티브 셸·쓰기 도구를 기본 차단하지만 부모 호스트 세션이
+하위 권한을 덮어쓸 수 있습니다. 부모 세션도 네이티브 쓰기·셸 권한 없이
+시작하고 이를 OS 보안경계가 아닌 pre-alpha 절차적 경계로 취급하세요. 구현 변경은 여러 파일의
+경로, 승인 전 hash(또는 파일 없음), 승인 후 전체 내용을 하나의 제한된
+change set으로 MCP에 요청합니다. 사람은 한 Decision Packet만 검토해
+`approve-tool`로 승인하고, 새 claim이 저장된 정확한 바이트만 복구 가능한
+트랜잭션으로 적용한 뒤 증거를 기록합니다.
+
+현재 한 프로젝트 MCP bridge가 허용된 OrgSpec 역할 집합을 함께 제공합니다.
+각 투영 역할은 자기 `ownerRole` 작업만 claim하도록 지시되지만, 공유 bridge는
+호출한 네이티브 하위 에이전트의 신원을 인증하지 못합니다. 따라서 역할 간
+분리는 이 alpha에서 절차적 경계이며, 공통 세션·run·lease fence는 계속 강제됩니다.
+
+현재 직접 `chartermesh run` 실행 대상이 될 수 있는 호스트는 Codex
+app-server뿐입니다. 원할 때만 계획과 승인 명령 양쪽에
+`--activate-role operator`를 추가하세요. 이미 Codex 투영 계획에 포함된
+`--allow-unrestricted-read`는 읽기 전용 샌드박스가 프로젝트 밖 읽기까지
+제한하지는 않는다는 사실에 대한 명시적 확인입니다. 이 경로는 사용자 Codex 사용량을
+소비할 수 있습니다. Claude Code는 현재 프로젝트 역할과 MCP 연동까지만
+지원하며 직접 AgentHost 실행을 지원한다고 간주하면 안 됩니다.
+
 ## 3. 직접 설치하기
 
 ### 3.1 준비 사항
 
 - Node.js 24 이상
+- GitHub `npx` 경로로 설치할 때 Git 2.x
 - GitHub 패키지를 받을 수 있는 네트워크
 - CharterMesh를 적용할 프로젝트 경로
 
 소스 개발과 전체 검증에는 pnpm 11이 추가로 필요하지만, 설치된
-CharterMesh의 런타임에는 별도 npm 의존성이 없습니다.
+CharterMesh의 런타임에는 별도 npm 의존성이 없습니다. GitHub `npx` 방식은
+의존성 없는 `prepare` 빌드를 위해 npm lifecycle script가 켜져 있어야 합니다.
+조직 정책으로 `ignore-scripts`를 강제한다면 검토된 사전 빌드 패키지나 소스
+체크아웃을 사용해야 합니다.
 
 아래 예시는 PowerShell을 기준으로 합니다.
 
 ```powershell
+$CM = "github:jade-blanco/chartermesh#v0.0.9-alpha.1"
 $Target = "C:\path\to\your-project"
 ```
+
+이 태그는 친구 시험용 버전을 선택하지만 Git 태그 자체는 이동할 수 있으며
+특정 commit을 암호학적으로 증명하지 않습니다. 더 강한 공급망 경계가 필요하면
+검토한 로컬 설치나 commit SHA로 고정한 배포물을 사용하세요.
 
 ### 3.2 소스 체크아웃 없이 실행
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh version --json
-npx --yes github:jade-blanco/chartermesh propose `
+npx --yes $CM version --json
+npx --yes $CM propose `
   --target $Target `
   --profile balanced
 ```
@@ -119,7 +203,7 @@ node bin/chartermesh.mjs propose --target $Target --profile balanced
 처음에는 무료·결정적·오프라인인 `fake` 엔진을 권장합니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh bootstrap `
+npx --yes $CM bootstrap `
   --target $Target `
   --profile balanced `
   --engine fake
@@ -135,7 +219,7 @@ npx --yes github:jade-blanco/chartermesh bootstrap `
 미리보기는 대상에 쓰지 않습니다. 내용을 검토한 뒤 정확한 해시를 승인합니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh bootstrap `
+npx --yes $CM bootstrap `
   --target $Target `
   --profile balanced `
   --engine fake `
@@ -148,21 +232,24 @@ npx --yes github:jade-blanco/chartermesh bootstrap `
 ### 3.5 설치 확인
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh doctor --target $Target
+npx --yes $CM doctor --target $Target
 ```
 
-`doctor`는 다음을 확인하지만 모델을 호출하지는 않습니다.
+`doctor`는 다음을 확인하지만 모델을 호출하거나 파일을 복구하지는 않습니다.
 
 - 설치 버전과 구성 파일
 - OrgSpec과 runtime 스키마
 - 역할·엔진·러너 참조
 - 어댑터별 설정
-- 중단된 파일 교체 journal의 안전한 복구
+- 중단된 파일 교체 journal의 존재와 명시적 복구 필요 여부
+
+미완료 journal이 있으면 증거를 검토한 뒤 `recover`를 명시적으로 실행하거나,
+정확히 승인했던 동일한 적용 명령을 반복해 그 작업을 재개해야 합니다.
 
 ## 4. 대시보드 시작과 읽는 법
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh dashboard `
+npx --yes $CM dashboard `
   --target $Target `
   --port 4173
 ```
@@ -229,8 +316,8 @@ loopback에만 바인딩됩니다. 명령을 실행한 터미널을 종료하면
 ### 5.1 데모로 전체 흐름 확인
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh seed-demo --target $Target
-npx --yes github:jade-blanco/chartermesh dashboard --target $Target
+npx --yes $CM seed-demo --target $Target
+npx --yes $CM dashboard --target $Target
 ```
 
 데모는 실제 유료 모델 없이 요청, 실행, 산출물 검토 흐름을 확인하기 위한
@@ -239,7 +326,7 @@ npx --yes github:jade-blanco/chartermesh dashboard --target $Target
 ### 5.2 CLI에서 새 작업 만들기
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh request `
+npx --yes $CM request `
   "릴리스 노트 작성" `
   --summary "변경 내용을 확인하고 사람이 검토할 간결한 릴리스 노트를 작성한다." `
   --target $Target
@@ -250,7 +337,7 @@ npx --yes github:jade-blanco/chartermesh request `
 ### 5.3 담당 역할 지정
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh triage `
+npx --yes $CM triage `
   --id work-000001 `
   --role operator `
   --target $Target
@@ -262,7 +349,7 @@ npx --yes github:jade-blanco/chartermesh triage `
 ### 5.4 실행
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh run `
+npx --yes $CM run `
   --id work-000001 `
   --target $Target
 ```
@@ -278,7 +365,7 @@ npx --yes github:jade-blanco/chartermesh run `
 먼저 현재 결정 패킷을 확인합니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh decision-packet `
+npx --yes $CM decision-packet `
   --id work-000001 `
   --target $Target `
   --json
@@ -287,7 +374,7 @@ npx --yes github:jade-blanco/chartermesh decision-packet `
 승인:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh decide `
+npx --yes $CM decide `
   --id work-000001 `
   --decision approve `
   --artifact-hash ARTIFACT_SHA256 `
@@ -299,7 +386,7 @@ npx --yes github:jade-blanco/chartermesh decide `
 수정 요청:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh decide `
+npx --yes $CM decide `
   --id work-000001 `
   --decision changes_requested `
   --artifact-hash ARTIFACT_SHA256 `
@@ -311,7 +398,7 @@ npx --yes github:jade-blanco/chartermesh decide `
 수정 요청 뒤에는 `retry`가 아니라 다시 `run`합니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh run `
+npx --yes $CM run `
   --id work-000001 `
   --target $Target
 ```
@@ -319,7 +406,7 @@ npx --yes github:jade-blanco/chartermesh run `
 거절:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh decide `
+npx --yes $CM decide `
   --id work-000001 `
   --decision reject `
   --artifact-hash ARTIFACT_SHA256 `
@@ -331,22 +418,23 @@ npx --yes github:jade-blanco/chartermesh decide `
 ### 5.6 승인된 작업 완료
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh complete `
+npx --yes $CM complete `
   --id work-000001 `
   --target $Target
 ```
 
 ## 6. 프로젝트 파일 변경 승인
 
-모델이 `workspace.write_file`을 요청해도 CharterMesh는 즉시 실행하지
-않습니다. WorkItem은 실패가 아니라 정확한 도구 승인 대기가 됩니다.
+모델이 `workspace.write_file` 또는 여러 파일 change set을 요청해도
+CharterMesh는 즉시 실행하지 않습니다. WorkItem은 실패가 아니라 정확한
+도구 승인 대기가 됩니다. 여러 파일은 파일마다 승인하지 않고 하나의
+content-addressed change set과 Decision Packet으로 압축할 수 있습니다.
 
 대시보드에서 다음을 검토합니다.
 
-- 변경할 상대 경로
-- 전체 쓰기인지 정확한 문자열 교체인지
-- 예상 SHA-256
-- 변경 크기와 내용
+- 변경할 모든 상대 경로
+- 각 파일의 승인 전 SHA-256 또는 `없음`
+- 각 파일의 승인 후 SHA-256, 크기와 읽기 쉬운 변경 요약
 - 경로 제한과 실패 시 동작
 - 정확한 call hash
 - 현재 Decision Packet hash
@@ -354,7 +442,7 @@ npx --yes github:jade-blanco/chartermesh complete `
 CLI 승인:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh approve-tool `
+npx --yes $CM approve-tool `
   --id work-000001 `
   --call-hash CALL_SHA256 `
   --tool workspace.write_file `
@@ -363,15 +451,17 @@ npx --yes github:jade-blanco/chartermesh approve-tool `
   --target $Target
 ```
 
-승인하면 WorkItem이 `준비`로 돌아갑니다. 다음 실행에서 그 정확한 호출만
-재생합니다.
+승인하면 WorkItem이 `준비`로 돌아갑니다. 새 claim은 경로·승인 전 상태·내용을
+다시 생성하지 않고 Control Plane에 저장된 그 정확한 호출만 복구 가능한
+트랜잭션으로 재생합니다. 파일 하나라도 승인 뒤 바뀌었으면 전체 change set을
+적용하지 않고 새 계획과 승인을 요구합니다.
 
 허용하지 않을 경우 대시보드에서 `거부하고 작업 종료`를 선택하거나 CLI에서
 현재 패킷 해시에 결박해 거부합니다. 이때 도구는 실행되지 않고 WorkItem은
 감사 이력을 보존한 채 `취소`로 종료됩니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh deny-tool `
+npx --yes $CM deny-tool `
   --id work-000001 `
   --call-hash CALL_SHA256 `
   --tool workspace.write_file `
@@ -381,11 +471,11 @@ npx --yes github:jade-blanco/chartermesh deny-tool `
 ```
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh run `
+npx --yes $CM run `
   --id work-000001 `
   --target $Target
 
-npx --yes github:jade-blanco/chartermesh tool-evidence `
+npx --yes $CM tool-evidence `
   --id work-000001 `
   --target $Target `
   --json
@@ -414,7 +504,7 @@ Ollama, llama.cpp server, LM Studio, vLLM 등 Chat Completions 호환 서버를
 설정을 확인하세요.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh configure-engine `
+npx --yes $CM configure-engine `
   --target $Target `
   --engine openai-compatible `
   --endpoint http://127.0.0.1:11434/v1 `
@@ -427,7 +517,7 @@ npx --yes github:jade-blanco/chartermesh configure-engine `
 
 ```powershell
 # 위와 동일한 인자를 유지해야 합니다.
-npx --yes github:jade-blanco/chartermesh configure-engine `
+npx --yes $CM configure-engine `
   --target $Target `
   --engine openai-compatible `
   --endpoint http://127.0.0.1:11434/v1 `
@@ -436,7 +526,7 @@ npx --yes github:jade-blanco/chartermesh configure-engine `
   --reasoning disabled `
   --approve PLAN_HASH
 
-npx --yes github:jade-blanco/chartermesh doctor --target $Target
+npx --yes $CM doctor --target $Target
 ```
 
 모델 서버가 OpenAI 방식의 function call을 실제 지원할 때만
@@ -454,7 +544,7 @@ API 키 값은 프로젝트 파일에 넣지 않고 환경변수로 설정합니
 ```powershell
 $env:CHARTERMESH_MODEL_API_KEY = "your-secret"
 
-npx --yes github:jade-blanco/chartermesh configure-engine `
+npx --yes $CM configure-engine `
   --target $Target `
   --engine openai-compatible `
   --endpoint https://provider.example/v1 `
@@ -471,7 +561,7 @@ HTTP 호환 서버가 없는 로컬 엔진은 중립 JSON stdin/stdout 계약을
 wrapper로 연결할 수 있습니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh configure-engine `
+npx --yes $CM configure-engine `
   --target $Target `
   --engine command-process `
   --command C:\absolute\path\to\engine.exe `
@@ -490,7 +580,7 @@ CharterMesh는 셸을 사용하지 않고 절대 경로의 실행 파일을 직�
 ### 7.4 모델 품질 시험
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh evaluate-model `
+npx --yes $CM evaluate-model `
   --target $Target `
   --live `
   --json
@@ -507,7 +597,7 @@ ModelEngine을 planner → implementer → verifier → synthesizer 순서로 �
 기록되고 마지막 산출물 하나만 사람 검토로 올라옵니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh run `
+npx --yes $CM run `
   --id work-000001 `
   --delegated `
   --target $Target
@@ -521,7 +611,7 @@ npx --yes github:jade-blanco/chartermesh run `
 단일 실행과 위임 실행의 품질을 같은 합성 업무로 비교하려면:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh evaluate-collaboration `
+npx --yes $CM evaluate-collaboration `
   --target $Target `
   --live `
   --repetitions 3 `
@@ -572,11 +662,11 @@ OrgSpec의 주요 한도:
 산출물·도구 증거를 검사합니다. 다시 실행하기로 사람이 결정한 경우:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh retry `
+npx --yes $CM retry `
   --id work-000001 `
   --target $Target
 
-npx --yes github:jade-blanco/chartermesh run `
+npx --yes $CM run `
   --id work-000001 `
   --target $Target
 ```
@@ -592,7 +682,7 @@ CLI에서는 `--acknowledge-tool-outcome`을 추가하거나, 대시보드의 �
 ### 실행 취소
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh cancel `
+npx --yes $CM cancel `
   --id work-000001 `
   --target $Target
 ```
@@ -603,7 +693,7 @@ npx --yes github:jade-blanco/chartermesh cancel `
 ### 사용자 입력 대기
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh wait `
+npx --yes $CM wait `
   --id work-000001 `
   --type user_input `
   --reason "배포 대상 지역을 선택해야 합니다." `
@@ -623,12 +713,12 @@ active review time과 상세 열람 횟수는
 않습니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh decision-packet `
+npx --yes $CM decision-packet `
   --id work-000001 `
   --target $Target `
   --json
 
-npx --yes github:jade-blanco/chartermesh provide-input `
+npx --yes $CM provide-input `
   --id work-000001 `
   --packet-hash PACKET_SHA256 `
   --response "대한민국 리전으로 진행하세요." `
@@ -640,7 +730,7 @@ npx --yes github:jade-blanco/chartermesh provide-input `
 ### 활성 작업 목록
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh list `
+npx --yes $CM list `
   --target $Target `
   --active-only `
   --limit 100 `
@@ -650,11 +740,11 @@ npx --yes github:jade-blanco/chartermesh list `
 ### 전체 시스템 일시 정지
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh system pause `
+npx --yes $CM system pause `
   --reason "점검" `
   --target $Target
 
-npx --yes github:jade-blanco/chartermesh system resume --target $Target
+npx --yes $CM system resume --target $Target
 ```
 
 일시 정지는 새 모델 실행만 막습니다. 이미 실행 중인 작업을 자동 취소하지
@@ -663,11 +753,11 @@ npx --yes github:jade-blanco/chartermesh system resume --target $Target
 ### Control Plane 백업
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh backup create `
+npx --yes $CM backup create `
   --target $Target `
   --json
 
-npx --yes github:jade-blanco/chartermesh backup list `
+npx --yes $CM backup list `
   --target $Target `
   --json
 ```
@@ -678,7 +768,7 @@ npx --yes github:jade-blanco/chartermesh backup list `
 복원은 먼저 무쓰기 계획을 만듭니다.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh restore `
+npx --yes $CM restore `
   --backup BACKUP_ID `
   --target $Target `
   --json
@@ -689,7 +779,7 @@ npx --yes github:jade-blanco/chartermesh restore `
 ### 감사 기록 내보내기
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh audit export `
+npx --yes $CM audit export `
   --target $Target `
   --json
 ```
@@ -701,7 +791,7 @@ npx --yes github:jade-blanco/chartermesh audit export `
 ### 완료 작업 보관
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh archive `
+npx --yes $CM archive `
   --id work-000001 `
   --target $Target
 ```
@@ -755,11 +845,11 @@ npx --yes github:jade-blanco/chartermesh archive `
 | 복원 중 maintenance 오류 | 대시보드 등 쓰기 프로세스가 열려 있음 | 관련 로컬 프로세스를 중지하고 복원 재시도 |
 
 구성 파일 교체 중 프로세스가 종료되었다면 journal을 수동 삭제하지 마세요.
-`doctor` 또는 다음 계획 명령이 자동 복구하며, 명시적으로 다음을 실행할 수도
-있습니다.
+`doctor`와 다음 계획 명령은 파일을 바꾸지 않고 미완료 상태를 보고합니다.
+내용을 확인한 뒤 다음 명시적 복구 명령을 실행하세요.
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh recover --target $Target --json
+npx --yes $CM recover --target $Target --json
 ```
 
 ## 13. 안전하게 제거하기

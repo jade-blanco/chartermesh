@@ -24,6 +24,7 @@ process.stdin.on("end", () => {
             arguments: {
               path: "approval-fixture.txt",
               content: "approved\n",
+              beforeSha256: null,
             },
           },
         ],

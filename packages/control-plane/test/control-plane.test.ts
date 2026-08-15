@@ -13,6 +13,7 @@ import {
   openControlPlaneDatabase,
   projectDecisionReviewView,
   type ArtifactProducerReport,
+  type ActiveRunFence,
   type ToolExecutionEvidenceRecord,
 } from "../src/index.ts";
 import {
@@ -35,6 +36,15 @@ function currentPacketHash(controlPlane: ControlPlane, id: string): string {
   const packet = controlPlane.decisionPacket(id);
   assert.ok(packet, `Expected a current decision packet for ${id}.`);
   return packet.binding.packetHash;
+}
+
+function runFence(claim: ActiveRunFence): ActiveRunFence {
+  return {
+    runId: claim.runId,
+    attemptId: claim.attemptId,
+    leaseId: claim.leaseId,
+    generation: claim.generation,
+  };
 }
 
 const boundedProducerReport: ArtifactProducerReport = {
@@ -364,8 +374,8 @@ test("intake through approval completes and resurfaces a successor", () => {
     assert.equal(claim.generation, 1);
     const submission = controlPlane.submitArtifact({
       id: first.id,
+      ...runFence(claim),
       content: "Synthetic implementation result.",
-      generation: claim.generation,
       actor: "role:implementation",
       idempotencyKey: "submit:first",
     });
@@ -443,6 +453,23 @@ test("delegated attempts retain bounded parent-child lineage", () => {
     assert.equal(planner.parentAttemptId, claim.attemptId);
     assert.equal(planner.kind, "delegated");
     assert.equal(implementer.attemptNo, planner.attemptNo + 1);
+    const delegatedReceipt = controlPlane.prepareToolEvidence({
+      id: work.id,
+      ...runFence(claim),
+      evidenceAttemptId: planner.id,
+      callHash: "1".repeat(64),
+      toolName: "workspace.read_file",
+      inputHash: "2".repeat(64),
+      actor: "runner:test",
+    });
+    assert.equal(
+      (
+        database
+          .prepare("SELECT attempt_id FROM tool_evidence_receipts WHERE id = ?")
+          .get(delegatedReceipt.id) as { attempt_id: string }
+      ).attempt_id,
+      planner.id,
+    );
     assert.throws(
       () =>
         controlPlane.startChildAttempt({
@@ -592,11 +619,14 @@ test("dashboard treats an unapproved pending tool call as human review", () => {
       id: item.id,
       runId: claim.runId,
       attemptId: claim.attemptId,
+      leaseId: claim.leaseId,
+      generation: claim.generation,
       callHash,
       toolName: "workspace.write_file",
       arguments: { path: "src/result.ts", content: "export {};\n" },
       createdAt: new Date().toISOString(),
       actor: "runner:test",
+      idempotencyKey: "tool-review:pending",
     });
 
     const beforeApproval = controlPlane.dashboard();
@@ -646,18 +676,20 @@ test("dashboard treats an unapproved pending tool call as human review", () => {
           id: malformedItem.id,
           runId: malformedClaim.runId,
           attemptId: malformedClaim.attemptId,
+          leaseId: malformedClaim.leaseId,
+          generation: malformedClaim.generation,
           callHash: "f".repeat(64),
           toolName: "workspace.write_file",
           arguments: { unparsed: "{\"path\":" },
           createdAt: new Date().toISOString(),
           actor: "runner:test",
+          idempotencyKey: "tool-review:malformed-pending",
         }),
       /fully parsed/u,
     );
     controlPlane.failRun({
       id: malformedItem.id,
-      generation: malformedClaim.generation,
-      attemptId: malformedClaim.attemptId,
+      ...runFence(malformedClaim),
       errorCode: "TOOL_ARGUMENTS_INVALID",
       errorMessage: "Tool arguments were incomplete.",
       actor: "runner:test",
@@ -699,6 +731,7 @@ test("dashboard primary human decision is independent of the newest-work page", 
     });
     controlPlane.submitArtifact({
       id: review.id,
+      ...runFence(claim),
       content: JSON.stringify({
         summary: "Review me even when I am not on the newest page.",
         deliverable: "Bounded artifact",
@@ -707,7 +740,6 @@ test("dashboard primary human decision is independent of the newest-work page", 
         nextActions: [],
         confidence: "medium",
       }),
-      generation: claim.generation,
       actor: "runner:test",
       idempotencyKey: "global-decision:submit",
     });
@@ -757,8 +789,8 @@ test("changes requested retain the human review note", () => {
     });
     const submission = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(claim),
       content: '{"summary":"draft"}',
-      generation: claim.generation,
       actor: "runner:test",
       idempotencyKey: "review-note:submit",
     });
@@ -814,8 +846,8 @@ test("decision packets keep model claims unverified and reject stale or non-huma
     });
     const firstArtifact = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(firstClaim),
       content,
-      generation: firstClaim.generation,
       actor: "runner:test",
       idempotencyKey: "packet:submit:1",
     });
@@ -900,8 +932,8 @@ test("decision packets keep model claims unverified and reject stale or non-huma
     });
     const secondArtifact = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(secondClaim),
       content,
-      generation: secondClaim.generation,
       actor: "runner:test",
       idempotencyKey: "packet:submit:2",
     });
@@ -964,10 +996,10 @@ test("artifact producer sidecars bind real deliverables while keeping reported c
     };
     const firstArtifact = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(firstClaim),
       content: deliverable,
       mediaType: "text/html",
       producerReport: report,
-      generation: firstClaim.generation,
       actor: "runner:test",
       idempotencyKey: "sidecar:submit:1",
     });
@@ -997,10 +1029,10 @@ test("artifact producer sidecars bind real deliverables while keeping reported c
       .run(JSON.stringify(legacyReplay), "sidecar:submit:1");
     const replayed = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(firstClaim),
       content: deliverable,
       mediaType: "text/html",
       producerReport: report,
-      generation: firstClaim.generation,
       actor: "runner:test",
       idempotencyKey: "sidecar:submit:1",
     });
@@ -1052,13 +1084,13 @@ test("artifact producer sidecars bind real deliverables while keeping reported c
     });
     const secondArtifact = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(secondClaim),
       content: deliverable,
       mediaType: "text/html",
       producerReport: {
         ...report,
         summary: "Release notes were rendered and bounded to this report.",
       },
-      generation: secondClaim.generation,
       actor: "runner:test",
       idempotencyKey: "sidecar:submit:2",
     });
@@ -1114,8 +1146,8 @@ test("a projected v1alpha2 packet is persisted before approving a migrated activ
     });
     const artifact = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(claim),
       content: "migrated review artifact",
-      generation: claim.generation,
       actor: "runner:test",
       idempotencyKey: "packet-migration:submit",
     });
@@ -1194,6 +1226,7 @@ test("artifact and producer-report tampering fail closed before review", () => {
     });
     const artifact = value.controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(claim),
       content: "immutable artifact bytes",
       producerReport: {
         apiVersion: "chartermesh.dev/artifact-producer-report/v1alpha1",
@@ -1205,7 +1238,6 @@ test("artifact and producer-report tampering fail closed before review", () => {
         nextActions: [],
         confidence: "medium",
       },
-      generation: claim.generation,
       actor: "runner:test",
       idempotencyKey: `integrity:${suffix}:submit`,
     });
@@ -1303,9 +1335,28 @@ test("idempotency replays the original response and rejects command reuse", () =
       idempotencyKey: "same-key",
     };
     const first = controlPlane.intake(input);
-    const replay = controlPlane.intake(input);
+    const replay = controlPlane.intake({
+      idempotencyKey: input.idempotencyKey,
+      actor: input.actor,
+      summary: input.summary,
+      title: input.title,
+    });
     assert.deepEqual(replay, first);
     assert.equal(controlPlane.list().length, 1);
+    const stored = database
+      .prepare(
+        "SELECT request_hash FROM command_results WHERE idempotency_key = ?",
+      )
+      .get(input.idempotencyKey) as { request_hash: string };
+    assert.match(stored.request_hash, /^[a-f0-9]{64}$/u);
+    assert.throws(
+      () =>
+        controlPlane.intake({
+          ...input,
+          summary: "A changed payload must never replay the first response.",
+        }),
+      /different request input/u,
+    );
     assert.throws(
       () =>
         controlPlane.triage({
@@ -1316,6 +1367,58 @@ test("idempotency replays the original response and rejects command reuse", () =
           idempotencyKey: "same-key",
         }),
       /another command/u,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("idempotency replay cannot transfer a claim or heartbeat across actors", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Actor-bound lease",
+      summary: "A cached lease response belongs only to the original actor.",
+      actor: "human:test",
+      idempotencyKey: "actor-bound:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "actor-bound:triage",
+    });
+    const claim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:one",
+      idempotencyKey: "actor-bound:claim",
+    });
+    assert.throws(
+      () =>
+        controlPlane.claim({
+          id: item.id,
+          actor: "runner:two",
+          idempotencyKey: "actor-bound:claim",
+        }),
+      /different request input/u,
+    );
+
+    const heartbeatInput = {
+      id: item.id,
+      ...runFence(claim),
+      actor: "runner:one",
+      idempotencyKey: "actor-bound:heartbeat",
+    };
+    const heartbeat = controlPlane.heartbeat(heartbeatInput);
+    assert.equal(heartbeat.leaseId, claim.leaseId);
+    assert.throws(
+      () =>
+        controlPlane.heartbeat({
+          ...heartbeatInput,
+          actor: "runner:two",
+        }),
+      /different request input/u,
     );
   } finally {
     database.close();
@@ -1405,19 +1508,33 @@ test("artifact evidence is fenced by run generation and exact hash", () => {
     });
     assert.throws(
       () =>
+        controlPlane.wait({
+          id: item.id,
+          condition: {
+            type: "manual_resume",
+            reason: "An active worker cannot discard its lease credentials.",
+          },
+          actor: "runner:test",
+          idempotencyKey: "fence:unfenced-wait",
+        }),
+      /RUN_OWNERSHIP_FENCE_REQUIRED/u,
+    );
+    assert.throws(
+      () =>
         controlPlane.submitArtifact({
           id: item.id,
+          ...runFence(claim),
           content: "Stale result",
           generation: claim.generation + 1,
           actor: "runner:test",
           idempotencyKey: "fence:stale-submit",
         }),
-      /Stale or inactive run generation/u,
+      /RUN_OWNERSHIP_FENCE_MISMATCH/u,
     );
     const submitted = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(claim),
       content: "Current result",
-      generation: claim.generation,
       actor: "runner:test",
       idempotencyKey: "fence:submit",
     });
@@ -1484,8 +1601,8 @@ test("artifact byte limits are enforced before evidence is written", () => {
       () =>
         controlPlane.submitArtifact({
           id: item.id,
+          ...runFence(firstClaim),
           content: "123456789",
-          generation: firstClaim.generation,
           actor: "runner:test",
           idempotencyKey: "artifact-limit:oversized",
         }),
@@ -1493,8 +1610,8 @@ test("artifact byte limits are enforced before evidence is written", () => {
     );
     const first = controlPlane.submitArtifact({
       id: item.id,
+      ...runFence(firstClaim),
       content: "12345678",
-      generation: firstClaim.generation,
       actor: "runner:test",
       idempotencyKey: "artifact-limit:first-submit",
     });
@@ -1516,8 +1633,8 @@ test("artifact byte limits are enforced before evidence is written", () => {
       () =>
         controlPlane.submitArtifact({
           id: item.id,
+          ...runFence(secondClaim),
           content: "12345",
-          generation: secondClaim.generation,
           actor: "runner:test",
           idempotencyKey: "artifact-limit:work-total",
         }),
@@ -1551,8 +1668,7 @@ test("failed runs are retryable with a new fenced generation", () => {
     });
     controlPlane.failRun({
       id: item.id,
-      generation: first.generation,
-      attemptId: first.attemptId,
+      ...runFence(first),
       errorCode: "MODEL_INVOCATION_FAILED",
       errorMessage: "Synthetic model failure.",
       actor: "runner:test",
@@ -1605,6 +1721,8 @@ test("unknown tool outcomes require explicit human acknowledgement before retry"
       id: item.id,
       runId: claim.runId,
       attemptId: claim.attemptId,
+      leaseId: claim.leaseId,
+      generation: claim.generation,
       callHash: "a".repeat(64),
       toolName: "workspace.write_file",
       inputHash: "b".repeat(64),
@@ -1612,8 +1730,7 @@ test("unknown tool outcomes require explicit human acknowledgement before retry"
     });
     const failed = controlPlane.failRun({
       id: item.id,
-      generation: claim.generation,
-      attemptId: claim.attemptId,
+      ...runFence(claim),
       errorCode: "TOOL_OUTCOME_UNKNOWN",
       errorMessage: "The tool returned before evidence was committed.",
       actor: "runner:test",
@@ -1647,6 +1764,131 @@ test("unknown tool outcomes require explicit human acknowledgement before retry"
         idempotencyKey: "unknown-tool:human-ack",
       }).status,
       "ready",
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("human acknowledgement retires an uncertain pending call without replay", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const item = controlPlane.intake({
+      title: "Retire an uncertain approved write",
+      summary: "A human-inspected unknown outcome must not remain retryable.",
+      actor: "human:test",
+      idempotencyKey: "unknown-pending:intake",
+    });
+    controlPlane.triage({
+      id: item.id,
+      ownerRole: "operator",
+      executionTarget: "local",
+      actor: "human:test",
+      idempotencyKey: "unknown-pending:triage",
+    });
+    const approvalClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "unknown-pending:approval-claim",
+    });
+    const callHash = "d".repeat(64);
+    controlPlane.recordPendingToolCall({
+      id: item.id,
+      ...runFence(approvalClaim),
+      callHash,
+      toolName: "workspace.write_file",
+      arguments: {
+        path: "result.txt",
+        content: "uncertain\n",
+        beforeSha256: null,
+      },
+      createdAt: new Date().toISOString(),
+      actor: "runner:test",
+      idempotencyKey: "unknown-pending:record",
+    });
+    controlPlane.approveToolCall({
+      id: item.id,
+      callHash,
+      toolName: "workspace.write_file",
+      packetHash: currentPacketHash(controlPlane, item.id),
+      actor: "human:test",
+      note: "Approve this exact content-addressed write.",
+      idempotencyKey: "unknown-pending:approve",
+    });
+    const executionClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "unknown-pending:execution-claim",
+    });
+    const reservation = controlPlane.reservePendingToolExecution({
+      id: item.id,
+      ...runFence(executionClaim),
+      callHash,
+      actor: "runner:test",
+      idempotencyKey: "unknown-pending:reserve",
+    });
+    assert.equal(reservation.disposition, "reserved");
+    assert.ok(reservation.pending.reservation);
+    controlPlane.markPendingToolOutcomeUnknown({
+      id: item.id,
+      ...runFence(executionClaim),
+      callHash,
+      previousReservationId: reservation.pending.reservation.id,
+      message: "The atomic effect may have committed before evidence failed.",
+      actor: "runner:test",
+      idempotencyKey: "unknown-pending:mark-unknown",
+    });
+    assert.equal(
+      controlPlane.listPendingToolCalls(item.id)[0]?.status,
+      "outcome_unknown",
+    );
+
+    assert.equal(
+      controlPlane.retry({
+        id: item.id,
+        actor: "human:test",
+        acknowledgeUnknownToolOutcome: true,
+        idempotencyKey: "unknown-pending:acknowledge",
+      }).status,
+      "ready",
+    );
+    assert.equal(
+      controlPlane.listPendingToolCalls(item.id)[0]?.status,
+      "outcome_acknowledged",
+    );
+    assert.equal(
+      (
+        database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM pending_tool_calls
+          WHERE work_item_id = ? AND status = 'outcome_unknown'
+        `).get(item.id) as { count: number }
+      ).count,
+      0,
+    );
+
+    const retryClaim = controlPlane.claim({
+      id: item.id,
+      actor: "runner:test",
+      idempotencyKey: "unknown-pending:retry-claim",
+    });
+    assert.throws(
+      () =>
+        controlPlane.recordPendingToolCall({
+          id: item.id,
+          ...runFence(retryClaim),
+          callHash,
+          toolName: "workspace.write_file",
+          arguments: {
+            path: "result.txt",
+            content: "uncertain\n",
+            beforeSha256: null,
+          },
+          createdAt: new Date().toISOString(),
+          actor: "runner:test",
+          idempotencyKey: "unknown-pending:record-same-call",
+        }),
+      /TOOL_OUTCOME_ACKNOWLEDGED/u,
     );
   } finally {
     database.close();
@@ -1774,8 +2016,7 @@ test("block cost policy refuses later claims after unknown monthly usage", () =>
     });
     controlPlane.failRun({
       id: first.id,
-      generation: claim.generation,
-      attemptId: claim.attemptId,
+      ...runFence(claim),
       errorCode: "FIXTURE_FAILURE",
       errorMessage: "Synthetic failure.",
       actor: "runner:test",
@@ -1827,6 +2068,7 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
       arguments: {
         path: "src/result.ts",
         content: "export const result = true;\n",
+        beforeSha256: null,
       },
     };
     const callHash = toolCallHash(item.id, call);
@@ -1834,11 +2076,14 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
       id: item.id,
       runId: claim.runId,
       attemptId: claim.attemptId,
+      leaseId: claim.leaseId,
+      generation: claim.generation,
       callHash,
       toolName: "workspace.write_file",
       arguments: call.arguments,
       createdAt: new Date().toISOString(),
       actor: "runner:test",
+      idempotencyKey: "tool:pending",
     });
     const waiting = controlPlane.get(item.id);
     assert.equal(waiting.status, "in_progress");
@@ -1857,6 +2102,7 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
     assert.deepEqual(pending[0]?.arguments, {
       path: "src/result.ts",
       content: "export const result = true;\n",
+      beforeSha256: null,
     });
     assert.equal(controlPlane.approvedPendingToolCall(item.id), null);
     assert.equal(
@@ -1910,37 +2156,20 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
       actor: "runner:test",
       idempotencyKey: "tool:evidence-claim",
     });
-    const forgedPreparation = controlPlane.prepareToolEvidence({
-      id: item.id,
-      runId: evidenceClaim.runId,
-      attemptId: evidenceClaim.attemptId,
-      callHash,
-      toolName: "workspace.write_file",
-      inputHash: "b".repeat(64),
-      actor: "runner:forged",
-    });
     assert.throws(
       () =>
-        controlPlane.recordToolEvidence({
-          receipt: {
-            ...forgedPreparation,
-            runtimeProof: "forged-runtime-proof",
-          },
-          evidenceId: "tool-evidence-forged-active-lineage",
+        controlPlane.prepareToolEvidence({
           id: item.id,
           runId: evidenceClaim.runId,
           attemptId: evidenceClaim.attemptId,
+          leaseId: evidenceClaim.leaseId,
+          generation: evidenceClaim.generation,
           callHash,
           toolName: "workspace.write_file",
-          status: "succeeded",
           inputHash: "b".repeat(64),
-          outputHash: "c".repeat(64),
-          paths: ["src/result.ts"],
-          durationMs: 1,
-          createdAt: new Date().toISOString(),
           actor: "runner:forged",
         }),
-      /in-process Tool Runtime/u,
+      /RUN_OWNERSHIP_FENCE_MISMATCH/u,
     );
     let runtimeReceipt: ToolEvidenceReceipt | undefined;
     const runtime = createWorkspaceToolRuntime({
@@ -1959,6 +2188,8 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
           id: item.id,
           runId: evidenceClaim.runId,
           attemptId: evidenceClaim.attemptId,
+          leaseId: evidenceClaim.leaseId,
+          generation: evidenceClaim.generation,
           callHash: intent.callHash,
           toolName: intent.toolName,
           inputHash: intent.inputHash,
@@ -1973,6 +2204,8 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
           id: item.id,
           runId: evidenceClaim.runId,
           attemptId: evidenceClaim.attemptId,
+          leaseId: evidenceClaim.leaseId,
+          generation: evidenceClaim.generation,
           callHash: runtimeEvidence.callHash,
           toolName: runtimeEvidence.toolName,
           status: runtimeEvidence.status,
@@ -1990,7 +2223,9 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
     assert.ok(runtimeReceipt);
     const executed = controlPlane.markPendingToolCallExecuted({
       id: item.id,
+      ...runFence(evidenceClaim),
       callHash,
+      evidenceId: execution.evidence.id,
       actor: "runner:test",
       idempotencyKey: "tool:pending-executed",
     });
@@ -2029,6 +2264,8 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
           id: item.id,
           runId: evidenceClaim.runId,
           attemptId: evidenceClaim.attemptId,
+          leaseId: evidenceClaim.leaseId,
+          generation: evidenceClaim.generation,
           callHash,
           toolName: "workspace.write_file",
           status: "succeeded",
@@ -2045,6 +2282,8 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
       id: item.id,
       runId: evidenceClaim.runId,
       attemptId: evidenceClaim.attemptId,
+      leaseId: evidenceClaim.leaseId,
+      generation: evidenceClaim.generation,
       callHash,
       toolName: "workspace.write_file",
       inputHash: "d".repeat(64),
@@ -2061,6 +2300,8 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
           id: item.id,
           runId: claim.runId,
           attemptId: claim.attemptId,
+          leaseId: claim.leaseId,
+          generation: claim.generation,
           callHash,
           toolName: "workspace.write_file",
           status: "succeeded",
@@ -2071,7 +2312,7 @@ test("tool approval and execution evidence stay bound to exact hashes", async ()
           createdAt: new Date().toISOString(),
           actor: "runner:test",
         }),
-      /active lineage/u,
+      /RUN_OWNERSHIP_FENCE_MISMATCH/u,
     );
   } finally {
     database.close();

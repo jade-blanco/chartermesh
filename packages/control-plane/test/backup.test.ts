@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -88,17 +88,45 @@ test("Control Plane backups are hashed, integrity-checked snapshots", () => {
     });
     const submission = controlPlane.submitArtifact({
       id: item.id,
+      runId: claim.runId,
+      attemptId: claim.attemptId,
+      leaseId: claim.leaseId,
       content: "Artifact bytes must be part of the backup set.",
       generation: claim.generation,
       actor: "role:operator",
       idempotencyKey: "backup:submit",
     });
+    database.prepare(`
+      INSERT INTO pending_tool_calls(
+        id, work_item_id, run_id, attempt_id, call_hash, tool_name,
+        arguments_json, summary_json, status, created_at, executed_at,
+        reservation_id, reservation_run_id, reservation_attempt_id,
+        reservation_lease_id, reservation_generation, reservation_actor,
+        reserved_at, evidence_id, effect_hash, outcome_message
+      ) VALUES (?, ?, ?, ?, ?, 'workspace.write_file', '{}', NULL,
+                'executing', ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+    `).run(
+      "pending-backup",
+      item.id,
+      claim.runId,
+      claim.attemptId,
+      "a".repeat(64),
+      new Date().toISOString(),
+      "reservation-backup",
+      claim.runId,
+      claim.attemptId,
+      claim.leaseId,
+      claim.generation,
+      "role:operator",
+      new Date().toISOString(),
+      "b".repeat(64),
+    );
     const manifest = createControlPlaneBackup(
       database,
       backupDirectory,
       "manual",
     );
-    assert.equal(manifest.schemaVersion, 12);
+    assert.equal(manifest.schemaVersion, 15);
     assert.equal(manifest.workItemCount, 1);
     assert.equal(manifest.artifacts?.length, 1);
     assert.equal(manifest.artifacts?.[0]?.sha256, submission.sha256);
@@ -111,6 +139,30 @@ test("Control Plane backups are hashed, integrity-checked snapshots", () => {
       selected.artifacts[0]?.bytes.toString("utf8"),
       "Artifact bytes must be part of the backup set.",
     );
+    const restoredPath = join(directory, "restored.db");
+    writeFileSync(restoredPath, selected.bytes);
+    const restored = openControlPlaneDatabase(restoredPath);
+    try {
+      const pending = restored
+        .prepare(`
+          SELECT status, reservation_id, reservation_lease_id, effect_hash
+          FROM pending_tool_calls WHERE id = 'pending-backup'
+        `)
+        .get() as {
+          status: string;
+          reservation_id: string;
+          reservation_lease_id: string;
+          effect_hash: string;
+        };
+      assert.deepEqual({ ...pending }, {
+        status: "executing",
+        reservation_id: "reservation-backup",
+        reservation_lease_id: claim.leaseId,
+        effect_hash: "b".repeat(64),
+      });
+    } finally {
+      restored.close();
+    }
     const blobPath = join(
       backupDirectory,
       "blobs",
@@ -163,7 +215,7 @@ test("opening an older schema creates a migration safety backup", () => {
     const version = migrated
       .prepare("SELECT MAX(version) AS version FROM schema_migrations")
       .get() as { version: number };
-    assert.equal(Number(version.version), 12);
+    assert.equal(Number(version.version), 15);
     const attemptColumns = migrated
       .prepare("PRAGMA table_info(attempts)")
       .all() as Array<{ name: string }>;
@@ -177,6 +229,70 @@ test("opening an older schema creates a migration safety backup", () => {
     assert.equal(backups.length, 1);
     assert.equal(backups[0]?.reason, "migration");
     assert.equal(backups[0]?.schemaVersion, 1);
+  } finally {
+    migrated.close();
+  }
+});
+
+test("opening a schema-v13 database backs up and fails closed for legacy idempotency rows", () => {
+  const directory = mkdtempSync(join(tmpdir(), "chartermesh-v13-migration-"));
+  const databasePath = join(directory, "state.db");
+  const initial = openControlPlaneDatabase(databasePath);
+  const controlPlane = new ControlPlane(initial, join(directory, "artifacts"));
+  const originalInput = {
+    title: "Legacy idempotency response",
+    summary: "The pre-v14 row has no actor or payload binding.",
+    actor: "human:test",
+    idempotencyKey: "v13:idempotency:intake",
+  };
+  controlPlane.intake(originalInput);
+  initial.prepare("DELETE FROM schema_migrations WHERE version >= 14").run();
+  initial.exec(`
+    CREATE TABLE command_results_v13 (
+      idempotency_key TEXT PRIMARY KEY,
+      command TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO command_results_v13(
+      idempotency_key, command, response_json, created_at
+    )
+    SELECT idempotency_key, command, response_json, created_at
+    FROM command_results;
+    DROP TABLE command_results;
+    ALTER TABLE command_results_v13 RENAME TO command_results;
+  `);
+  initial.close();
+
+  const migrated = openControlPlaneDatabase(databasePath);
+  try {
+    const version = migrated
+      .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+      .get() as { version: number };
+    assert.equal(Number(version.version), 15);
+    const columns = migrated
+      .prepare("PRAGMA table_info(command_results)")
+      .all() as Array<{ name: string }>;
+    assert.equal(columns.some(({ name }) => name === "request_hash"), true);
+    const legacy = migrated
+      .prepare(
+        "SELECT request_hash FROM command_results WHERE idempotency_key = ?",
+      )
+      .get(originalInput.idempotencyKey) as { request_hash: string };
+    assert.equal(legacy.request_hash, "legacy-unbound-pre-v14");
+    const migratedControlPlane = new ControlPlane(
+      migrated,
+      join(directory, "artifacts"),
+    );
+    assert.throws(
+      () => migratedControlPlane.intake(originalInput),
+      /different request input/u,
+    );
+    assert.equal(migratedControlPlane.list().length, 1);
+    const backups = listControlPlaneBackups(join(directory, "backups"));
+    assert.equal(backups.length, 1);
+    assert.equal(backups[0]?.reason, "migration");
+    assert.equal(backups[0]?.schemaVersion, 13);
   } finally {
     migrated.close();
   }
@@ -207,12 +323,15 @@ test("opening a schema-v11 database backs up before producer-sidecar migration",
   });
   const submitted = controlPlane.submitArtifact({
     id: item.id,
+    runId: claim.runId,
+    attemptId: claim.attemptId,
+    leaseId: claim.leaseId,
     content: "legacy artifact bytes",
     generation: claim.generation,
     actor: "runner:test",
     idempotencyKey: "v11-sidecar:submit",
   });
-  initial.prepare("DELETE FROM schema_migrations WHERE version = 12").run();
+  initial.prepare("DELETE FROM schema_migrations WHERE version >= 12").run();
   initial.exec(`
     PRAGMA foreign_keys = OFF;
     CREATE TABLE artifacts_v11 (
@@ -247,7 +366,7 @@ test("opening a schema-v11 database backs up before producer-sidecar migration",
     const version = migrated
       .prepare("SELECT MAX(version) AS version FROM schema_migrations")
       .get() as { version: number };
-    assert.equal(Number(version.version), 12);
+    assert.equal(Number(version.version), 15);
     const backups = listControlPlaneBackups(join(directory, "backups"));
     assert.equal(backups.length, 1);
     assert.equal(backups[0]?.reason, "migration");

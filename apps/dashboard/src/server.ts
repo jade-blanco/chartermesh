@@ -8,7 +8,11 @@ import {
   openControlPlaneDatabase,
   type RuntimeHealth,
 } from "../../../packages/control-plane/src/index.ts";
-import { parseRuntimeConfig } from "../../../packages/runtime/src/index.ts";
+import {
+  parseRuntimeConfig,
+  readBoundedRegularText,
+  resolveProjectStatePaths,
+} from "../../../packages/runtime/src/index.ts";
 
 const PUBLIC_DIRECTORY = fileURLToPath(new URL("../public/", import.meta.url));
 const MAX_BODY_BYTES = 128 * 1024;
@@ -105,7 +109,7 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
 }
 
 function runtimeHealth(target: string): RuntimeHealth[] {
-  const runtimePath = resolve(target, ".chartermesh", "runtime.json");
+  const runtimePath = resolveProjectStatePaths(target).runtime;
   if (!existsSync(runtimePath)) {
     return [
       {
@@ -124,7 +128,7 @@ function runtimeHealth(target: string): RuntimeHealth[] {
   }
 
   try {
-    const config = parseRuntimeConfig(readFileSync(runtimePath, "utf8"));
+    const config = parseRuntimeConfig(readBoundedRegularText(runtimePath));
     const engines: RuntimeHealth[] = config.modelEngines.map((engine) => {
       const requiresKey = Boolean(engine.apiKeyEnv);
       const keyReady = !engine.apiKeyEnv || Boolean(process.env[engine.apiKeyEnv]);
@@ -171,13 +175,13 @@ function safeMessage(error: unknown): string {
 export async function startDashboard(
   options: DashboardOptions,
 ): Promise<DashboardServer> {
-  const target = resolve(options.target);
-  const stateDirectory = resolve(target, ".chartermesh");
-  if (!existsSync(resolve(stateDirectory, "runtime.json"))) {
-    throw new Error("CharterMesh is not initialized. Run bootstrap first.");
-  }
+  const paths = resolveProjectStatePaths(options.target, {
+    requireInitialized: true,
+  });
+  const target = paths.projectRoot;
+  const stateDirectory = paths.root;
 
-  const database = openControlPlaneDatabase(resolve(stateDirectory, "state.db"));
+  const database = openControlPlaneDatabase(paths.database);
   let budgets:
     | {
         monthlyCostLimitUsd: number;
@@ -190,7 +194,7 @@ export async function startDashboard(
     | undefined;
   try {
     const organization = JSON.parse(
-      readFileSync(resolve(stateDirectory, "organization.json"), "utf8"),
+      readBoundedRegularText(paths.organization),
     ) as { spec?: { budgets?: typeof budgets } };
     budgets = organization.spec?.budgets;
   } catch {
@@ -198,7 +202,7 @@ export async function startDashboard(
   }
   const controlPlane = new ControlPlane(
     database,
-    resolve(stateDirectory, "artifacts"),
+    paths.artifacts,
     { budgets },
   );
   controlPlane.recoverExpiredLeases("system:dashboard-start");

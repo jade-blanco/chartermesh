@@ -1,17 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   constants,
   existsSync,
+  fstatSync,
   lstatSync,
-  mkdirSync,
+  opendirSync,
   openSync,
-  closeSync,
-  readFileSync,
-  readdirSync,
+  readSync,
   realpathSync,
-  writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { applyFileTransaction } from "../../compiler/src/index.ts";
 import type {
   InferenceRequest,
   InferenceResult,
@@ -96,13 +96,31 @@ export interface ApprovedToolCallResult {
   evidence: ToolExecutionEvidence;
 }
 
+export interface WorkspaceWriteRequestSummary {
+  title: string;
+  changeCount: 1;
+  totalBytes: number;
+  changes: Array<{
+    path: string;
+    beforeSha256: string | null;
+    afterSha256: string;
+    byteSize: number;
+  }>;
+}
+
 export class ToolApprovalRequiredError extends Error {
   readonly code = "TOOL_APPROVAL_REQUIRED";
   readonly callHash: string;
   readonly toolName: string;
   readonly call: ModelToolCall;
+  readonly summary: WorkspaceWriteRequestSummary | null;
 
-  constructor(callHash: string, toolName: string, call: ModelToolCall) {
+  constructor(
+    callHash: string,
+    toolName: string,
+    call: ModelToolCall,
+    summary: WorkspaceWriteRequestSummary | null = null,
+  ) {
     super(
       `TOOL_APPROVAL_REQUIRED: approve exact call hash ${callHash} for '${toolName}'.`,
     );
@@ -114,6 +132,7 @@ export class ToolApprovalRequiredError extends Error {
       name: call.name,
       arguments: call.arguments,
     };
+    this.summary = summary;
   }
 }
 
@@ -217,8 +236,64 @@ function malformedToolArguments(
     return "The model returned tool arguments that were not valid complete JSON.";
   }
   if (toolName === "workspace.write_file") {
+    if (record.changeSet !== undefined) {
+      if (
+        !record.changeSet ||
+        typeof record.changeSet !== "object" ||
+        Array.isArray(record.changeSet)
+      ) {
+        return "workspace.write_file changeSet must be an object.";
+      }
+      const changeSet = record.changeSet as Record<string, unknown>;
+      if (
+        changeSet.apiVersion !== "chartermesh.dev/workspace-change-set/v1alpha1" ||
+        !Array.isArray(changeSet.changes) ||
+        changeSet.changes.length < 1 ||
+        changeSet.changes.length > 50
+      ) {
+        return "workspace.write_file changeSet requires version v1alpha1 and 1 through 50 changes.";
+      }
+      let totalBytes = 0;
+      const seenPaths = new Set<string>();
+      for (const value of changeSet.changes) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return "Each workspace.write_file change must be an object.";
+        }
+        const change = value as Record<string, unknown>;
+        if (
+          typeof change.path !== "string" ||
+          !change.path.trim() ||
+          typeof change.content !== "string" ||
+          (change.beforeSha256 !== null &&
+            (typeof change.beforeSha256 !== "string" ||
+              !/^[a-f0-9]{64}$/u.test(change.beforeSha256)))
+        ) {
+          return "Each workspace.write_file change requires path, content, and a SHA-256 or null beforeSha256.";
+        }
+        try {
+          const path = governedWritePath(change.path);
+          const key = path.toLocaleLowerCase("en-US");
+          if (seenPaths.has(key)) {
+            return "workspace.write_file changeSet paths must be case-folded unique.";
+          }
+          seenPaths.add(key);
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+        totalBytes += Buffer.byteLength(change.content, "utf8");
+      }
+      if (totalBytes > 1_048_576) {
+        return "workspace.write_file changeSet content exceeds 1048576 UTF-8 bytes.";
+      }
+      return null;
+    }
     if (typeof record.path !== "string" || !record.path.trim()) {
       return "workspace.write_file requires a non-empty path.";
+    }
+    try {
+      governedWritePath(record.path);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
     }
     const hasContent = typeof record.content === "string";
     const hasReplacements = Array.isArray(record.replacements);
@@ -230,6 +305,14 @@ function malformedToolArguments(
       Buffer.byteLength(record.content as string, "utf8") > 262_144
     ) {
       return "workspace.write_file content exceeds 262144 UTF-8 bytes.";
+    }
+    if (
+      hasContent &&
+      record.beforeSha256 !== null &&
+      (typeof record.beforeSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(record.beforeSha256))
+    ) {
+      return "Content mode requires beforeSha256 as the complete current-file SHA-256, or null only when the target is absent.";
     }
     if (hasReplacements) {
       if (
@@ -330,11 +413,46 @@ function cleanRelativePath(value: unknown): string {
   return value;
 }
 
+function governedWritePath(value: unknown): string {
+  const raw = cleanRelativePath(value);
+  if (/^[\\/]/u.test(raw)) {
+    throw new Error("WORKSPACE_PATH_DENIED: write paths must be relative.");
+  }
+  const segments = raw.replaceAll("\\", "/").split("/");
+  const reserved = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
+  if (
+    segments.some((segment) =>
+      segment === "" ||
+      segment === "." ||
+      segment === ".." ||
+      /[:\u0000-\u001f]/u.test(segment) ||
+      /[. ]$/u.test(segment) ||
+      reserved.test(segment)
+    )
+  ) {
+    throw new Error(
+      "WORKSPACE_PATH_DENIED: write path uses an empty/dot segment, Windows namespace, device name, ADS, control character, or trailing dot/space alias.",
+    );
+  }
+  const folded = segments.map((segment) => segment.toLocaleLowerCase("en-US"));
+  if (
+    folded.some((segment) =>
+      [".chartermesh", ".git", ".codex", ".claude"].includes(segment)
+    ) ||
+    folded.some((segment) => ["agents.md", "claude.md", "codex.md"].includes(segment))
+  ) {
+    throw new Error(
+      "WORKSPACE_CONTROL_PATH_DENIED: project-state, VCS, or coding-host control paths require a separate configuration plan.",
+    );
+  }
+  return segments.join("/");
+}
+
 function canonicalAllowedRoots(
   workspaceRoot: string,
   policy: ToolPolicy,
 ): string[] {
-  const root = realpathSync(workspaceRoot);
+  const root = realpathSync.native(workspaceRoot);
   return (policy.workspaceRoots ?? ["."]).map((entry) => {
     const relativePath = cleanRelativePath(entry);
     const candidate = resolve(root, relativePath);
@@ -344,7 +462,7 @@ function canonicalAllowedRoots(
     if (!existsSync(candidate)) {
       throw new Error(`Workspace root '${entry}' does not exist.`);
     }
-    const canonical = realpathSync(candidate);
+    const canonical = realpathSync.native(candidate);
     if (!isWithin(root, canonical)) {
       throw new Error(`Workspace root '${entry}' resolves outside the project.`);
     }
@@ -357,9 +475,11 @@ function canonicalPath(
   policy: ToolPolicy,
   value: unknown,
   mode: "read" | "write",
-): { absolute: string; display: string } {
-  const display = cleanRelativePath(value);
-  const root = realpathSync(workspaceRoot);
+): { absolute: string; display: string; canonical: string } {
+  const display = mode === "write"
+    ? governedWritePath(value)
+    : cleanRelativePath(value);
+  const root = realpathSync.native(workspaceRoot);
   const absolute = resolve(root, display);
   if (!isWithin(root, absolute)) {
     throw new Error(`Path '${display}' escapes the workspace.`);
@@ -370,7 +490,7 @@ function canonicalPath(
     if (lstatSync(absolute).isSymbolicLink()) {
       throw new Error(`Symbolic-link target '${display}' is not allowed.`);
     }
-    canonical = realpathSync(absolute);
+    canonical = realpathSync.native(absolute);
   } else {
     if (mode === "read") throw new Error(`Path '${display}' does not exist.`);
     let ancestor = dirname(absolute);
@@ -379,12 +499,18 @@ function canonicalPath(
       if (parent === ancestor) break;
       ancestor = parent;
     }
-    canonical = resolve(realpathSync(ancestor), relative(ancestor, absolute));
+    canonical = resolve(
+      realpathSync.native(ancestor),
+      relative(ancestor, absolute),
+    );
   }
   if (!allowedRoots.some((allowed) => isWithin(allowed, canonical))) {
     throw new Error(`Path '${display}' is outside OrgSpec workspaceRoots.`);
   }
-  return { absolute, display };
+  if (mode === "write") {
+    governedWritePath(relative(root, canonical).replaceAll("\\", "/"));
+  }
+  return { absolute, display, canonical };
 }
 
 function objectArguments(value: unknown): Record<string, unknown> {
@@ -392,32 +518,6 @@ function objectArguments(value: unknown): Record<string, unknown> {
     throw new Error("Tool arguments must be a JSON object.");
   }
   return value as Record<string, unknown>;
-}
-
-function writeUtf8File(path: { absolute: string; display: string }, content: string) {
-  mkdirSync(dirname(path.absolute), { recursive: true });
-  if (
-    existsSync(path.absolute) &&
-    lstatSync(path.absolute).isSymbolicLink()
-  ) {
-    throw new Error(`Symbolic-link target '${path.display}' is not allowed.`);
-  }
-  const noFollow = "O_NOFOLLOW" in constants
-    ? Number(constants.O_NOFOLLOW)
-    : 0;
-  const descriptor = openSync(
-    path.absolute,
-    constants.O_WRONLY |
-      constants.O_CREAT |
-      constants.O_TRUNC |
-      noFollow,
-    0o600,
-  );
-  try {
-    writeFileSync(descriptor, content, { encoding: "utf8" });
-  } finally {
-    closeSync(descriptor);
-  }
 }
 
 function occurrenceCount(content: string, search: string): number {
@@ -430,6 +530,335 @@ function occurrenceCount(content: string, search: string): number {
     cursor = next + search.length;
   }
   return count;
+}
+
+function canonicalIdentity(value: string): string {
+  const resolved = resolve(value);
+  return process.platform === "win32"
+    ? resolved.toLocaleLowerCase("en-US")
+    : resolved;
+}
+
+function sameFileIdentity(
+  left: ReturnType<typeof lstatSync>,
+  right: ReturnType<typeof fstatSync>,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function openVerifiedRegularFile(
+  path: string,
+  expectedCanonical: string,
+): number {
+  const before = lstatSync(path);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error(`Path '${path}' is not a regular non-linked file.`);
+  }
+  const beforeCanonical = realpathSync.native(path);
+  if (
+    canonicalIdentity(beforeCanonical) !== canonicalIdentity(expectedCanonical)
+  ) {
+    throw new Error(`WORKSPACE_PATH_RACE: '${path}' changed after validation.`);
+  }
+  const noFollow = typeof constants.O_NOFOLLOW === "number"
+    ? constants.O_NOFOLLOW
+    : 0;
+  const descriptor = openSync(path, constants.O_RDONLY | noFollow);
+  try {
+    const opened = fstatSync(descriptor);
+    const after = lstatSync(path);
+    const afterCanonical = realpathSync.native(path);
+    if (
+      !opened.isFile() ||
+      after.isSymbolicLink() ||
+      !sameFileIdentity(before, opened) ||
+      !sameFileIdentity(after, opened) ||
+      canonicalIdentity(afterCanonical) !== canonicalIdentity(expectedCanonical)
+    ) {
+      throw new Error(`WORKSPACE_PATH_RACE: '${path}' changed while opening.`);
+    }
+    return descriptor;
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+function openVerifiedDirectory(
+  path: string,
+  expectedCanonical: string,
+): { descriptor: number; identity: ReturnType<typeof lstatSync> } {
+  const before = lstatSync(path);
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw new Error(`Path '${path}' is not a regular non-linked directory.`);
+  }
+  if (
+    canonicalIdentity(realpathSync.native(path)) !==
+      canonicalIdentity(expectedCanonical)
+  ) {
+    throw new Error(`WORKSPACE_PATH_RACE: '${path}' changed after validation.`);
+  }
+  const noFollow = typeof constants.O_NOFOLLOW === "number"
+    ? constants.O_NOFOLLOW
+    : 0;
+  const directoryOnly = typeof constants.O_DIRECTORY === "number"
+    ? constants.O_DIRECTORY
+    : 0;
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | noFollow | directoryOnly,
+  );
+  try {
+    const opened = fstatSync(descriptor);
+    const after = lstatSync(path);
+    if (
+      !opened.isDirectory() ||
+      after.isSymbolicLink() ||
+      !sameFileIdentity(before, opened) ||
+      !sameFileIdentity(after, opened) ||
+      canonicalIdentity(realpathSync.native(path)) !==
+        canonicalIdentity(expectedCanonical)
+    ) {
+      throw new Error(`WORKSPACE_PATH_RACE: '${path}' changed while opening.`);
+    }
+    return { descriptor, identity: before };
+  } catch (error) {
+    closeSync(descriptor);
+    throw error;
+  }
+}
+
+function assertDirectoryIdentity(
+  path: string,
+  expectedCanonical: string,
+  expected: ReturnType<typeof lstatSync>,
+  descriptor: number,
+): void {
+  const current = lstatSync(path);
+  const opened = fstatSync(descriptor);
+  if (
+    !opened.isDirectory() ||
+    !current.isDirectory() ||
+    current.isSymbolicLink() ||
+    !sameFileIdentity(expected, opened) ||
+    !sameFileIdentity(current, opened) ||
+    current.dev !== expected.dev ||
+    current.ino !== expected.ino ||
+    canonicalIdentity(realpathSync.native(path)) !==
+      canonicalIdentity(expectedCanonical)
+  ) {
+    throw new Error(`WORKSPACE_PATH_RACE: directory '${path}' changed while open.`);
+  }
+}
+
+function digestRegularFile(path: string, expectedCanonical: string): string {
+  const descriptor = openVerifiedRegularFile(path, expectedCanonical);
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    for (;;) {
+      const length = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (length === 0) break;
+      hash.update(buffer.subarray(0, length));
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return hash.digest("hex");
+}
+
+export function hashBoundedRegularFile(
+  path: string,
+  expectedCanonical: string,
+  maximumBytes: number,
+): { byteSize: number; sha256: string } {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+    throw new Error("maximumBytes must be a non-negative safe integer.");
+  }
+  const descriptor = openVerifiedRegularFile(path, expectedCanonical);
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let byteSize = 0;
+  try {
+    const opened = fstatSync(descriptor);
+    if (opened.size > maximumBytes) {
+      throw new Error(
+        `REGULAR_FILE_SIZE_LIMIT: '${path}' exceeds ${maximumBytes} bytes.`,
+      );
+    }
+    for (;;) {
+      const length = readSync(descriptor, chunk, 0, chunk.length, null);
+      if (length === 0) break;
+      byteSize += length;
+      if (byteSize > maximumBytes) {
+        throw new Error(
+          `REGULAR_FILE_SIZE_LIMIT: '${path}' exceeds ${maximumBytes} bytes.`,
+        );
+      }
+      hash.update(chunk.subarray(0, length));
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return { byteSize, sha256: hash.digest("hex") };
+}
+
+function inspectBoundedTextFile(
+  path: string,
+  expectedCanonical: string,
+  maximum: number,
+): { byteSize: number; prefix: Buffer; sha256: string } {
+  const descriptor = openVerifiedRegularFile(path, expectedCanonical);
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  const prefix = Buffer.allocUnsafe(maximum);
+  let prefixLength = 0;
+  let byteSize = 0;
+  try {
+    if (!fstatSync(descriptor).isFile()) {
+      throw new Error(`Path '${path}' is not a regular file.`);
+    }
+    for (;;) {
+      const length = readSync(descriptor, chunk, 0, chunk.length, null);
+      if (length === 0) break;
+      const current = chunk.subarray(0, length);
+      if (current.includes(0)) {
+        throw new Error(`Path '${path}' is not a UTF-8 text file.`);
+      }
+      hash.update(current);
+      byteSize += length;
+      if (prefixLength < maximum) {
+        const copied = Math.min(length, maximum - prefixLength);
+        current.copy(prefix, prefixLength, 0, copied);
+        prefixLength += copied;
+      }
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return {
+    byteSize,
+    prefix: prefix.subarray(0, prefixLength),
+    sha256: hash.digest("hex"),
+  };
+}
+
+interface PlannedWorkspaceWrite {
+  path: { absolute: string; display: string };
+  content: string;
+  beforeSha256: string | null;
+  afterSha256: string;
+  mode: "content" | "replacements";
+  replacementCount: number;
+}
+
+function planWorkspaceWrite(
+  workspaceRoot: string,
+  policy: ToolPolicy,
+  value: unknown,
+): PlannedWorkspaceWrite {
+  const args = objectArguments(value);
+  const path = canonicalPath(workspaceRoot, policy, args.path, "write");
+  let content: string;
+  let beforeSha256: string | null;
+  const replacements = Array.isArray(args.replacements)
+    ? (args.replacements as Array<Record<string, unknown>>)
+    : null;
+  if (replacements) {
+    const current = inspectBoundedTextFile(
+      path.absolute,
+      path.canonical,
+      262_145,
+    );
+    if (current.byteSize > 262_144) {
+      throw new Error(
+        `Replacement target '${path.display}' exceeds the 262144-byte limit.`,
+      );
+    }
+    beforeSha256 = current.sha256;
+    if (beforeSha256 !== args.expectedSha256) {
+      throw new Error(
+        `Replacement target '${path.display}' changed after planning: expected ${String(
+          args.expectedSha256,
+        )}, found ${beforeSha256}.`,
+      );
+    }
+    content = current.prefix.toString("utf8");
+    for (const replacement of replacements) {
+      const oldText = String(replacement.oldText);
+      const newText = String(replacement.newText);
+      const expectedOccurrences = Number(replacement.expectedOccurrences ?? 1);
+      const found = occurrenceCount(content, oldText);
+      if (found !== expectedOccurrences) {
+        throw new Error(
+          `Replacement in '${path.display}' expected ${expectedOccurrences} occurrence(s), found ${found}.`,
+        );
+      }
+      content = content.split(oldText).join(newText);
+    }
+  } else if (typeof args.content === "string") {
+    content = args.content;
+    beforeSha256 = args.beforeSha256 === null
+      ? null
+      : String(args.beforeSha256);
+    const metadata = existsSync(path.absolute) ? lstatSync(path.absolute) : null;
+    if (beforeSha256 === null) {
+      if (metadata) {
+        throw new Error(
+          `Target changed after planning: content target '${path.display}' exists but beforeSha256 was null.`,
+        );
+      }
+    } else {
+      if (!metadata?.isFile() || metadata.isSymbolicLink()) {
+        throw new Error(
+          `Target changed after planning: content target '${path.display}' is not an existing regular file.`,
+        );
+      }
+      const currentSha256 = digestRegularFile(
+        path.absolute,
+        path.canonical,
+      );
+      if (currentSha256 !== beforeSha256) {
+        throw new Error(
+          `Target changed after planning: content target '${path.display}' expected ${beforeSha256}, found ${currentSha256}.`,
+        );
+      }
+    }
+  } else {
+    throw new Error("workspace.write_file requires content or exact replacements.");
+  }
+  const byteSize = Buffer.byteLength(content, "utf8");
+  if (byteSize > 262_144) {
+    throw new Error("Resulting UTF-8 file exceeds the 262144-byte limit.");
+  }
+  return {
+    path,
+    content,
+    beforeSha256,
+    afterSha256: digest(content),
+    mode: replacements ? "replacements" : "content",
+    replacementCount: replacements?.length ?? 0,
+  };
+}
+
+export function summarizeWorkspaceWriteRequest(
+  workspaceRoot: string,
+  policy: ToolPolicy,
+  value: unknown,
+): WorkspaceWriteRequestSummary {
+  const plan = planWorkspaceWrite(workspaceRoot, policy, value);
+  const byteSize = Buffer.byteLength(plan.content, "utf8");
+  return {
+    title: `Workspace file ${plan.beforeSha256 === null ? "creation" : "replacement"}`,
+    changeCount: 1,
+    totalBytes: byteSize,
+    changes: [{
+      path: plan.path.display,
+      beforeSha256: plan.beforeSha256,
+      afterSha256: plan.afterSha256,
+      byteSize,
+    }],
+  };
 }
 
 export function createWorkspaceTools(
@@ -465,16 +894,48 @@ export function createWorkspaceTools(
           200,
           Math.max(1, Number(args.maxEntries ?? 100)),
         );
-        const entries = readdirSync(path.absolute, { withFileTypes: true })
-          .slice(0, maximum)
-          .map((entry) => ({
+        const verified = openVerifiedDirectory(path.absolute, path.canonical);
+        let directory: ReturnType<typeof opendirSync> | undefined;
+        const entries: Array<{ name: string; kind: string }> = [];
+        try {
+          directory = opendirSync(path.absolute);
+          assertDirectoryIdentity(
+            path.absolute,
+            path.canonical,
+            verified.identity,
+            verified.descriptor,
+          );
+          while (entries.length < maximum) {
+            const entry = directory.readSync();
+            if (!entry) break;
+            entries.push({
             name: entry.name,
             kind: entry.isDirectory()
               ? "directory"
               : entry.isFile()
                 ? "file"
                 : "other",
-          }));
+            });
+            assertDirectoryIdentity(
+              path.absolute,
+              path.canonical,
+              verified.identity,
+              verified.descriptor,
+            );
+          }
+          assertDirectoryIdentity(
+            path.absolute,
+            path.canonical,
+            verified.identity,
+            verified.descriptor,
+          );
+        } finally {
+          try {
+            directory?.closeSync();
+          } finally {
+            closeSync(verified.descriptor);
+          }
+        }
         return {
           output: JSON.stringify({ path: path.display, entries }),
           paths: [path.display],
@@ -516,16 +977,17 @@ export function createWorkspaceTools(
           65_536,
           Math.max(1, Number(args.maxBytes ?? 32_768)),
         );
-        const content = readFileSync(path.absolute);
-        if (content.includes(0)) {
-          throw new Error(`Path '${path.display}' is not a UTF-8 text file.`);
-        }
+        const content = inspectBoundedTextFile(
+          path.absolute,
+          path.canonical,
+          maximum,
+        );
         return {
           output: JSON.stringify({
             path: path.display,
-            truncated: content.byteLength > maximum,
-            sha256: createHash("sha256").update(content).digest("hex"),
-            content: content.subarray(0, maximum).toString("utf8"),
+            truncated: content.byteSize > maximum,
+            sha256: content.sha256,
+            content: content.prefix.toString("utf8"),
           }),
           paths: [path.display],
         };
@@ -535,7 +997,7 @@ export function createWorkspaceTools(
       modelTool: {
         name: "workspace.write_file",
         description:
-          "Create or replace one UTF-8 text file inside the approved workspace roots. Prefer replacements with the complete-file expectedSha256 for small, exact edits; every oldText must occur exactly expectedOccurrences times. Otherwise pass exact raw file text in content after one JSON transport encoding. Never JSON-encode file text a second time. Exact-call human approval is required.",
+          "Create or replace one UTF-8 text file inside the approved workspace roots with an exact content precondition and recoverable atomic transaction. For content mode, beforeSha256 is null only for a new absent path, otherwise it is the complete current-file hash. Prefer replacements for small exact edits. Exact-call human approval is required.",
         inputSchema: {
           type: "object",
           additionalProperties: false,
@@ -547,6 +1009,14 @@ export function createWorkspaceTools(
               maxLength: 262_144,
               description:
                 "Exact raw UTF-8 file text after JSON parsing. Source quotes and line breaks must not remain pervasively backslash-escaped.",
+            },
+            beforeSha256: {
+              anyOf: [
+                { type: "string", pattern: "^[a-f0-9]{64}$" },
+                { type: "null" },
+              ],
+              description:
+                "Complete current-file SHA-256, or null only when the target does not exist.",
             },
             expectedSha256: {
               type: "string",
@@ -579,7 +1049,7 @@ export function createWorkspaceTools(
           },
           oneOf: [
             {
-              required: ["content"],
+              required: ["content", "beforeSha256"],
               not: { required: ["replacements"] },
             },
             {
@@ -591,76 +1061,32 @@ export function createWorkspaceTools(
       },
       permission: "workspace_write",
       async execute(value) {
-        const args = objectArguments(value);
-        const path = canonicalPath(
+        const plan = planWorkspaceWrite(workspaceRoot, policy, value);
+        applyFileTransaction(
           workspaceRoot,
-          policy,
-          args.path,
-          "write",
+          `runtime-${digest({
+            path: plan.path.display,
+            beforeSha256: plan.beforeSha256,
+            afterSha256: plan.afterSha256,
+          }).slice(0, 48)}`,
+          [{
+            path: plan.path.absolute,
+            content: plan.content,
+            beforeHash: plan.beforeSha256,
+            afterHash: plan.afterSha256,
+          }],
+          { denyHostControlPaths: true },
         );
-        let content: string;
-        let beforeSha256: string | null = null;
-        const replacements = Array.isArray(args.replacements)
-          ? (args.replacements as Array<Record<string, unknown>>)
-          : null;
-        if (replacements) {
-          if (!existsSync(path.absolute) || !lstatSync(path.absolute).isFile()) {
-            throw new Error(
-              `Replacement target '${path.display}' must be an existing regular file.`,
-            );
-          }
-          const current = readFileSync(path.absolute);
-          if (current.includes(0)) {
-            throw new Error(
-              `Replacement target '${path.display}' is not UTF-8 text.`,
-            );
-          }
-          beforeSha256 = createHash("sha256").update(current).digest("hex");
-          if (beforeSha256 !== args.expectedSha256) {
-            throw new Error(
-              `Replacement target '${path.display}' changed: expected ${String(
-                args.expectedSha256,
-              )}, found ${beforeSha256}.`,
-            );
-          }
-          content = current.toString("utf8");
-          for (const replacement of replacements) {
-            const oldText = String(replacement.oldText);
-            const newText = String(replacement.newText);
-            const expectedOccurrences = Number(
-              replacement.expectedOccurrences ?? 1,
-            );
-            const found = occurrenceCount(content, oldText);
-            if (found !== expectedOccurrences) {
-              throw new Error(
-                `Replacement in '${path.display}' expected ${expectedOccurrences} occurrence(s), found ${found}.`,
-              );
-            }
-            content = content.split(oldText).join(newText);
-          }
-        } else if (typeof args.content === "string") {
-          content = args.content;
-        } else {
-          throw new Error(
-            "workspace.write_file requires content or exact replacements.",
-          );
-        }
-        if (Buffer.byteLength(content, "utf8") > 262_144) {
-          throw new Error(
-            "Resulting UTF-8 file exceeds the 262144-byte limit.",
-          );
-        }
-        writeUtf8File(path, content);
         return {
           output: JSON.stringify({
-            path: path.display,
-            mode: replacements ? "replacements" : "content",
-            replacements: replacements?.length ?? 0,
-            beforeSha256,
-            byteSize: Buffer.byteLength(content, "utf8"),
-            sha256: digest(content),
+            path: plan.path.display,
+            mode: plan.mode,
+            replacements: plan.replacementCount,
+            beforeSha256: plan.beforeSha256,
+            byteSize: Buffer.byteLength(plan.content, "utf8"),
+            sha256: plan.afterSha256,
           }),
-          paths: [path.display],
+          paths: [plan.path.display],
         };
       },
     },
@@ -818,6 +1244,35 @@ export class ToolRuntime {
       tool.permission !== "read_only" ||
       (this.#policy.approvalRequired ?? []).includes(call.name);
     if (approvalRequired && !this.#isApproved(callHash, call.name)) {
+      let summary: WorkspaceWriteRequestSummary | null = null;
+      if (call.name === "workspace.write_file") {
+        try {
+          summary = summarizeWorkspaceWriteRequest(
+            this.#workspaceRoot,
+            this.#policy,
+            call.arguments,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const output = JSON.stringify({
+            ok: false,
+            code: "TOOL_PRECONDITION_FAILED",
+            message,
+          }).slice(0, 8_000);
+          await this.#record(
+            this.#evidence(
+              call,
+              "failed",
+              started,
+              output,
+              declaredPaths(call.arguments),
+            ),
+            evidence,
+            receipt,
+          );
+          throw new Error(`TOOL_PRECONDITION_FAILED: ${message}`);
+        }
+      }
       await this.#record(
         this.#evidence(
           call,
@@ -829,7 +1284,12 @@ export class ToolRuntime {
         evidence,
         receipt,
       );
-      throw new ToolApprovalRequiredError(callHash, call.name, call);
+      throw new ToolApprovalRequiredError(
+        callHash,
+        call.name,
+        call,
+        summary,
+      );
     }
     let result: Awaited<ReturnType<RuntimeTool["execute"]>>;
     try {
@@ -966,6 +1426,39 @@ export class ToolRuntime {
           approvalRequired &&
           !this.#isApproved(callHash, call.name)
         ) {
+          let summary: WorkspaceWriteRequestSummary | null = null;
+          if (call.name === "workspace.write_file") {
+            try {
+              summary = summarizeWorkspaceWriteRequest(
+                this.#workspaceRoot,
+                this.#policy,
+                call.arguments,
+              );
+            } catch (error) {
+              const output = JSON.stringify({
+                ok: false,
+                code: "TOOL_PRECONDITION_FAILED",
+                message: error instanceof Error ? error.message : String(error),
+              }).slice(0, 8_000);
+              await this.#record(
+                this.#evidence(
+                  call,
+                  "failed",
+                  started,
+                  output,
+                  declaredPaths(call.arguments),
+                ),
+                evidence,
+                receipt,
+              );
+              messages.push({
+                role: "tool",
+                toolCallId: call.id,
+                content: output,
+              });
+              continue;
+            }
+          }
           await this.#record(
             this.#evidence(
               call,
@@ -977,7 +1470,12 @@ export class ToolRuntime {
             evidence,
             receipt,
           );
-          throw new ToolApprovalRequiredError(callHash, call.name, call);
+          throw new ToolApprovalRequiredError(
+            callHash,
+            call.name,
+            call,
+            summary,
+          );
         }
         let result: Awaited<ReturnType<RuntimeTool["execute"]>>;
         try {

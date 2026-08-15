@@ -13,6 +13,8 @@ import {
   type ToolExecutionEvidence,
 } from "../../runtime/src/tool-runtime.ts";
 import type {
+  ActiveRunFence,
+  AgentHostRunBinding,
   AuditRecord,
   AcceptanceCriterion,
   ArtifactProducerReport,
@@ -26,6 +28,8 @@ import type {
   OutboxDelivery,
   OutboxRecord,
   PendingToolCall,
+  PendingToolCallSummary,
+  PendingToolExecutionClaim,
   RuntimeBudgets,
   ScheduleTickRecord,
   ToolCallApproval,
@@ -54,6 +58,80 @@ const DEFAULT_MAX_WORK_ITEM_ARTIFACT_BYTES = 10_485_760;
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function asPendingToolCall(row: Row): PendingToolCall {
+  const reservation = row.reservation_id
+    ? {
+        id: String(row.reservation_id),
+        runId: String(row.reservation_run_id),
+        attemptId: String(row.reservation_attempt_id),
+        leaseId: String(row.reservation_lease_id),
+        generation: Number(row.reservation_generation),
+        actor: String(row.reservation_actor),
+        reservedAt: String(row.reserved_at),
+      }
+    : null;
+  return {
+    id: String(row.id),
+    workItemId: String(row.work_item_id),
+    runId: String(row.run_id),
+    attemptId: String(row.attempt_id),
+    callHash: String(row.call_hash),
+    toolName: String(row.tool_name),
+    arguments: JSON.parse(String(row.arguments_json)) as unknown,
+    summary: row.summary_json
+      ? (JSON.parse(String(row.summary_json)) as PendingToolCallSummary)
+      : null,
+    status: String(row.status) as PendingToolCall["status"],
+    createdAt: String(row.created_at),
+    executedAt: row.executed_at ? String(row.executed_at) : null,
+    reservation,
+    evidenceId: row.evidence_id ? String(row.evidence_id) : null,
+    effectHash: row.effect_hash ? String(row.effect_hash) : null,
+    outcomeMessage: row.outcome_message ? String(row.outcome_message) : null,
+  };
+}
+
+function pendingToolSummary(input: PendingToolCallSummary | undefined): string | null {
+  if (input === undefined) return null;
+  const title = assertText(input.title, "pending tool summary title");
+  if (!Array.isArray(input.changes) || input.changes.length < 1 || input.changes.length > 50) {
+    throw new Error("Pending tool summary requires from 1 through 50 changes.");
+  }
+  if (
+    !Number.isInteger(input.changeCount) ||
+    input.changeCount !== input.changes.length ||
+    !Number.isInteger(input.totalBytes) ||
+    input.totalBytes < 0 ||
+    input.totalBytes > 1_048_576
+  ) {
+    throw new Error("Pending tool summary counts are invalid.");
+  }
+  const summary: PendingToolCallSummary = {
+    title: title.slice(0, 500),
+    changeCount: input.changeCount,
+    totalBytes: input.totalBytes,
+    changes: input.changes.map((change) => {
+      const path = assertText(change.path, "pending tool summary path").slice(0, 1_000);
+      if (
+        (change.beforeSha256 !== null && !/^[a-f0-9]{64}$/u.test(change.beforeSha256)) ||
+        !/^[a-f0-9]{64}$/u.test(change.afterSha256) ||
+        !Number.isInteger(change.byteSize) ||
+        change.byteSize < 0 ||
+        change.byteSize > 1_048_576
+      ) {
+        throw new Error("Pending tool summary contains invalid file metadata.");
+      }
+      return { ...change, path };
+    }),
+  };
+  return JSON.stringify(summary);
+}
+
+function pendingToolApprovalQuestion(pending: PendingToolCall): string | undefined {
+  if (!pending.summary) return undefined;
+  return `Approve ${pending.summary.changeCount} exact workspace file change${pending.summary.changeCount === 1 ? "" : "s"} (${pending.summary.totalBytes} UTF-8 bytes): ${pending.summary.changes.map(({ path }) => path).join(", ")}`.slice(0, 4_000);
 }
 
 function asWorkItem(row: Row): WorkItem {
@@ -255,6 +333,10 @@ const AUDIT_PAYLOAD_FIELDS = new Set([
   "detailsOpenCount",
   "reviewMeasurementStatus",
   "responseHash",
+  "hostId",
+  "hostSessionId",
+  "hostRunId",
+  "lastEventCursor",
 ]);
 
 function allowlistedAuditPayload(
@@ -394,6 +476,26 @@ function asScheduleTick(row: Row): ScheduleTickRecord {
     startedAt: String(row.started_at),
     finishedAt: row.finished_at ? String(row.finished_at) : null,
     errorCode: row.error_code ? String(row.error_code) : null,
+  };
+}
+
+function asAgentHostRunBinding(row: Row): AgentHostRunBinding {
+  return {
+    id: String(row.id),
+    workItemId: String(row.work_item_id),
+    runId: String(row.run_id),
+    attemptId: String(row.attempt_id),
+    hostId: String(row.host_id),
+    hostSessionId: String(row.host_session_id),
+    hostRunId: String(row.host_run_id),
+    status: String(row.status) as AgentHostRunBinding["status"],
+    lastEventCursor: row.last_event_cursor
+      ? String(row.last_event_cursor)
+      : null,
+    errorCode: row.error_code ? String(row.error_code) : null,
+    startedAt: String(row.started_at),
+    updatedAt: String(row.updated_at),
+    finishedAt: row.finished_at ? String(row.finished_at) : null,
   };
 }
 
@@ -557,7 +659,7 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): OperationalState {
-    return this.command(input.idempotencyKey, "operations.pause", () => {
+    return this.command(input.idempotencyKey, "operations.pause", input, () => {
       if (!input.actor.startsWith("human:")) {
         throw new Error("OPERATIONS_PAUSE_REQUIRES_HUMAN");
       }
@@ -582,7 +684,7 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): OperationalState {
-    return this.command(input.idempotencyKey, "operations.resume", () => {
+    return this.command(input.idempotencyKey, "operations.resume", input, () => {
       if (!input.actor.startsWith("human:")) {
         throw new Error("OPERATIONS_RESUME_REQUIRES_HUMAN");
       }
@@ -846,7 +948,7 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): OutboxRecord {
-    return this.command(input.idempotencyKey, "outbox.dead-letter.retry", () => {
+    return this.command(input.idempotencyKey, "outbox.dead-letter.retry", input, () => {
       if (!input.actor.startsWith("human:")) {
         throw new Error("OUTBOX_RETRY_REQUIRES_HUMAN");
       }
@@ -1015,16 +1117,178 @@ export class ControlPlane {
     return rows.map(asScheduleTick);
   }
 
+  bindAgentHostRun(input: {
+    workItemId: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    hostId: string;
+    hostSessionId: string;
+    hostRunId: string;
+    actor: string;
+    idempotencyKey: string;
+  }): AgentHostRunBinding {
+    return this.command(input.idempotencyKey, "agent-host.bind", input, () => {
+      this.assertOwnedActiveRun({
+        id: input.workItemId,
+        runId: input.runId,
+        attemptId: input.attemptId,
+        leaseId: input.leaseId,
+        generation: input.generation,
+        actor: input.actor,
+      });
+      const lineage = this.database
+        .prepare(`
+          SELECT r.work_item_id, r.status AS run_status,
+                 a.run_id, a.status AS attempt_status
+          FROM runs r
+          JOIN attempts a ON a.run_id = r.id AND a.id = ?
+          WHERE r.id = ?
+        `)
+        .get(input.attemptId, input.runId) as Row | undefined;
+      if (
+        !lineage ||
+        lineage.work_item_id !== input.workItemId ||
+        lineage.run_id !== input.runId
+      ) {
+        throw new Error("AGENT_HOST_LINEAGE_INVALID");
+      }
+      if (
+        lineage.run_status !== "running" ||
+        lineage.attempt_status !== "running"
+      ) {
+        throw new Error("AGENT_HOST_LINEAGE_INACTIVE");
+      }
+      const hostId = assertText(input.hostId, "hostId");
+      const hostSessionId = assertText(input.hostSessionId, "hostSessionId");
+      const hostRunId = assertText(input.hostRunId, "hostRunId");
+      const stamp = now();
+      const id = this.nextId("host-run");
+      this.database
+        .prepare(`
+          INSERT INTO agent_host_runs(
+            id, work_item_id, run_id, attempt_id, host_id,
+            host_session_id, host_run_id, status, started_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+        `)
+        .run(
+          id,
+          input.workItemId,
+          input.runId,
+          input.attemptId,
+          hostId,
+          hostSessionId,
+          hostRunId,
+          stamp,
+          stamp,
+        );
+      this.event("agent-host.bound", input.workItemId, input.actor, {
+        runId: input.runId,
+        attemptId: input.attemptId,
+        hostId,
+        hostSessionId,
+        hostRunId,
+      });
+      return this.agentHostRunBinding(input.runId)!;
+    });
+  }
+
+  checkpointAgentHostRun(input: {
+    workItemId: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    status?: "running" | "waiting" | "succeeded" | "failed" | "canceled";
+    lastEventCursor?: string;
+    errorCode?: string;
+    actor: string;
+    idempotencyKey: string;
+  }): AgentHostRunBinding {
+    return this.command(input.idempotencyKey, "agent-host.checkpoint", input, () => {
+      this.assertOwnedActiveRun({
+        id: input.workItemId,
+        runId: input.runId,
+        attemptId: input.attemptId,
+        leaseId: input.leaseId,
+        generation: input.generation,
+        actor: input.actor,
+      });
+      const current = this.agentHostRunBinding(input.runId);
+      if (!current) throw new Error("AGENT_HOST_BINDING_NOT_FOUND");
+      if (
+        current.workItemId !== input.workItemId ||
+        current.attemptId !== input.attemptId
+      ) {
+        throw new Error("AGENT_HOST_LINEAGE_INVALID");
+      }
+      if (["succeeded", "failed", "canceled"].includes(current.status)) {
+        throw new Error("AGENT_HOST_BINDING_TERMINAL");
+      }
+      const status = input.status ?? current.status;
+      const cursor = input.lastEventCursor === undefined
+        ? current.lastEventCursor
+        : assertText(input.lastEventCursor, "lastEventCursor");
+      const errorCode = input.errorCode === undefined
+        ? current.errorCode
+        : assertText(input.errorCode, "errorCode");
+      const stamp = now();
+      const finishedAt = ["succeeded", "failed", "canceled"].includes(status)
+        ? stamp
+        : null;
+      this.database
+        .prepare(`
+          UPDATE agent_host_runs
+          SET status = ?, last_event_cursor = ?, error_code = ?,
+              updated_at = ?, finished_at = ?
+          WHERE run_id = ?
+        `)
+        .run(status, cursor, errorCode, stamp, finishedAt, input.runId);
+      this.event("agent-host.checkpointed", current.workItemId, input.actor, {
+        runId: input.runId,
+        hostId: current.hostId,
+        hostSessionId: current.hostSessionId,
+        hostRunId: current.hostRunId,
+        status,
+        ...(cursor ? { lastEventCursor: cursor } : {}),
+        ...(errorCode ? { errorCode } : {}),
+      });
+      return this.agentHostRunBinding(input.runId)!;
+    });
+  }
+
+  agentHostRunBinding(runId: string): AgentHostRunBinding | null {
+    const row = this.database
+      .prepare("SELECT * FROM agent_host_runs WHERE run_id = ?")
+      .get(runId) as Row | undefined;
+    return row ? asAgentHostRunBinding(row) : null;
+  }
+
+  activeAgentHostRun(workItemId: string): AgentHostRunBinding | null {
+    const row = this.database
+      .prepare(`
+        SELECT * FROM agent_host_runs
+        WHERE work_item_id = ? AND status IN ('running', 'waiting')
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(workItemId) as Row | undefined;
+    return row ? asAgentHostRunBinding(row) : null;
+  }
+
   private command<T>(
     idempotencyKey: string,
     command: string,
+    request: unknown,
     operation: () => T,
   ): T {
     assertText(idempotencyKey, "idempotencyKey");
+    const requestHash = canonicalHash({ command, request });
     return this.transact(() => {
       const replay = this.database
         .prepare(`
-          SELECT command, response_json
+          SELECT command, request_hash, response_json
           FROM command_results
           WHERE idempotency_key = ?
         `)
@@ -1035,16 +1299,27 @@ export class ControlPlane {
             "Idempotency key was already used for another command.",
           );
         }
+        if (replay.request_hash !== requestHash) {
+          throw new Error(
+            "Idempotency key was already used with different request input.",
+          );
+        }
         return JSON.parse(String(replay.response_json)) as T;
       }
       const result = operation();
       this.database
         .prepare(`
           INSERT INTO command_results(
-            idempotency_key, command, response_json, created_at
-          ) VALUES (?, ?, ?, ?)
+            idempotency_key, command, request_hash, response_json, created_at
+          ) VALUES (?, ?, ?, ?, ?)
         `)
-        .run(idempotencyKey, command, JSON.stringify(result), now());
+        .run(
+          idempotencyKey,
+          command,
+          requestHash,
+          JSON.stringify(result),
+          now(),
+        );
       return result;
     });
   }
@@ -1063,7 +1338,7 @@ export class ControlPlane {
     decisionQuestion?: string;
     acceptanceCriteria?: AcceptanceCriterion[];
   }): WorkItem {
-    return this.command(input.idempotencyKey, "intake", () => {
+    return this.command(input.idempotencyKey, "intake", input, () => {
       const id = this.nextId("work");
       const stamp = now();
       const rootId = input.rootId ?? id;
@@ -1327,6 +1602,9 @@ export class ControlPlane {
           ({ runId }) => runId === pending.runId,
         ),
         createdAt: pending.createdAt,
+        ...(pendingToolApprovalQuestion(pending)
+          ? { question: pendingToolApprovalQuestion(pending)! }
+          : {}),
       });
     }
     if (item.availability === "user_input_waiting" && item.wait) {
@@ -1432,7 +1710,7 @@ export class ControlPlane {
     activeReviewMs?: number;
     detailsOpenCount?: number;
   }): { input: Omit<UserInputRecord, "response">; workItem: WorkItem } {
-    return this.command(input.idempotencyKey, "user.input.provide", () => {
+    return this.command(input.idempotencyKey, "user.input.provide", input, () => {
       const current = this.get(input.id);
       if (!input.actor.startsWith("human:")) {
         throw new Error("User input authority must be a human actor.");
@@ -1542,7 +1820,7 @@ export class ControlPlane {
     idempotencyKey: string;
     expectedVersion?: number;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "triage", () => {
+    return this.command(input.idempotencyKey, "triage", input, () => {
       const current = this.get(input.id);
       this.assertVersion(current, input.expectedVersion);
       if (!["requested", "ready", "changes_requested"].includes(current.status)) {
@@ -1573,13 +1851,103 @@ export class ControlPlane {
     });
   }
 
+  retargetUnclaimedWork(input: {
+    items: Array<{
+      id: string;
+      expectedVersion: number;
+      ownerRole: string;
+      fromExecutionTarget: string;
+      toExecutionTarget: string;
+    }>;
+    actor: string;
+    idempotencyKey: string;
+  }): WorkItem[] {
+    return this.command(input.idempotencyKey, "work.retarget-unclaimed", input, () => {
+      if (
+        !Array.isArray(input.items) ||
+        input.items.length === 0 ||
+        input.items.length > 500
+      ) {
+        throw new Error("items must contain between 1 and 500 work items.");
+      }
+      const actor = assertText(input.actor, "actor");
+      const ids = new Set<string>();
+      const currentItems = input.items.map((candidate, index) => {
+        if (!candidate || typeof candidate !== "object") {
+          throw new Error(`items[${index}] is invalid.`);
+        }
+        const id = assertText(candidate.id, `items[${index}].id`);
+        if (ids.has(id)) {
+          throw new Error(`Work item '${id}' is duplicated.`);
+        }
+        ids.add(id);
+        if (
+          !Number.isSafeInteger(candidate.expectedVersion) ||
+          candidate.expectedVersion < 0
+        ) {
+          throw new Error(`items[${index}].expectedVersion is invalid.`);
+        }
+        const ownerRole = assertText(
+          candidate.ownerRole,
+          `items[${index}].ownerRole`,
+        );
+        const fromExecutionTarget = assertText(
+          candidate.fromExecutionTarget,
+          `items[${index}].fromExecutionTarget`,
+        );
+        const toExecutionTarget = assertText(
+          candidate.toExecutionTarget,
+          `items[${index}].toExecutionTarget`,
+        );
+        if (fromExecutionTarget === toExecutionTarget) {
+          throw new Error(`Work item '${id}' already uses the requested target.`);
+        }
+        const current = this.get(id);
+        this.assertVersion(current, candidate.expectedVersion);
+        if (!["ready", "changes_requested"].includes(current.status)) {
+          throw new Error(
+            `Work item '${id}' is not unclaimed ready or change-requested work.`,
+          );
+        }
+        if (current.ownerRole !== ownerRole) {
+          throw new Error(`Work item '${id}' owner role changed after planning.`);
+        }
+        if (current.executionTarget !== fromExecutionTarget) {
+          throw new Error(
+            `Work item '${id}' execution target changed after planning.`,
+          );
+        }
+        return { current, fromExecutionTarget, toExecutionTarget };
+      });
+      const stamp = now();
+      for (
+        const { current, fromExecutionTarget, toExecutionTarget } of currentItems
+      ) {
+        this.database
+          .prepare(`
+            UPDATE work_items
+            SET execution_target = ?, version = version + 1, updated_at = ?
+            WHERE id = ? AND version = ?
+          `)
+          .run(toExecutionTarget, stamp, current.id, current.version);
+        this.event("work.execution-target.changed", current.id, actor, {
+          fromExecutionTarget,
+          executionTarget: toExecutionTarget,
+          ownerRole: current.ownerRole,
+          reason: "agent_host_role_activated",
+        });
+      }
+      return currentItems.map(({ current }) => this.get(current.id));
+    });
+  }
+
   addDependency(input: {
     id: string;
     predecessorId: string;
     actor: string;
     idempotencyKey: string;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "dependency.add", () => {
+    return this.command(input.idempotencyKey, "dependency.add", input, () => {
       this.get(input.id);
       this.get(input.predecessorId);
       if (input.id === input.predecessorId) {
@@ -1624,14 +1992,8 @@ export class ControlPlane {
     idempotencyKey: string;
     expectedVersion?: number;
     leaseMinutes?: number;
-  }): {
-    workItem: WorkItem;
-    runId: string;
-    attemptId: string;
-    leaseId: string;
-    generation: number;
-  } {
-    return this.command(input.idempotencyKey, "work.claim", () => {
+  }): { workItem: WorkItem } & ActiveRunFence {
+    return this.command(input.idempotencyKey, "work.claim", input, () => {
       const current = this.get(input.id);
       this.assertVersion(current, input.expectedVersion);
       if (
@@ -1935,7 +2297,7 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): { workItemId: string; runId: string; requestedAt: string } {
-    return this.command(input.idempotencyKey, "run.cancel.request", () => {
+    return this.command(input.idempotencyKey, "run.cancel.request", input, () => {
       if (!input.actor.startsWith("human:")) {
         throw new Error("RUN_CANCELLATION_REQUIRES_HUMAN");
       }
@@ -1988,24 +2350,27 @@ export class ControlPlane {
 
   cancelRun(input: {
     id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
     generation: number;
     actor: string;
     idempotencyKey: string;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "run.cancel", () => {
+    return this.command(input.idempotencyKey, "run.cancel", input, () => {
       const current = this.get(input.id);
       if (current.status !== "in_progress") {
         throw new Error("Only in-progress work can cancel an active run.");
       }
-      this.assertActiveGeneration(input.id, input.generation);
+      this.assertOwnedActiveRun(input);
       const run = this.database
         .prepare(`
           SELECT id
           FROM runs
-          WHERE work_item_id = ? AND generation = ?
-            AND status IN ('running', 'waiting')
+          WHERE id = ? AND work_item_id = ? AND generation = ?
+            AND status = 'running'
         `)
-        .get(input.id, input.generation) as Row | undefined;
+        .get(input.runId, input.id, input.generation) as Row | undefined;
       if (!run) throw new Error("Active run was not found.");
       const stamp = now();
       this.database
@@ -2058,28 +2423,17 @@ export class ControlPlane {
   }
 
   heartbeat(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
     leaseId: string;
     generation: number;
     actor: string;
     idempotencyKey: string;
     leaseMinutes?: number;
   }): { leaseId: string; expiresAt: string } {
-    return this.command(input.idempotencyKey, "lease.heartbeat", () => {
-      const lease = this.database
-        .prepare(`
-          SELECT id, generation, expires_at, released_at
-          FROM leases WHERE id = ?
-        `)
-        .get(input.leaseId) as Row | undefined;
-      if (!lease || lease.released_at) {
-        throw new Error("Lease is not active.");
-      }
-      if (Number(lease.generation) !== input.generation) {
-        throw new Error("Lease generation does not match.");
-      }
-      if (Date.parse(String(lease.expires_at)) <= Date.now()) {
-        throw new Error("Lease has expired.");
-      }
+    return this.command(input.idempotencyKey, "lease.heartbeat", input, () => {
+      this.assertOwnedActiveRun(input);
       const stamp = now();
       const expiresAt = new Date(
         Date.now() + (input.leaseMinutes ?? 15) * 60_000,
@@ -2087,10 +2441,21 @@ export class ControlPlane {
       this.database
         .prepare(`
           UPDATE leases SET heartbeat_at = ?, expires_at = ?
-          WHERE id = ? AND released_at IS NULL
+          WHERE id = ? AND run_id = ? AND attempt_id = ?
+            AND owner = ? AND generation = ? AND released_at IS NULL
         `)
-        .run(stamp, expiresAt, input.leaseId);
-      this.event("lease.heartbeat", null, input.actor, {
+        .run(
+          stamp,
+          expiresAt,
+          input.leaseId,
+          input.runId,
+          input.attemptId,
+          input.actor,
+          input.generation,
+        );
+      this.event("lease.heartbeat", input.id, input.actor, {
+        runId: input.runId,
+        attemptId: input.attemptId,
         leaseId: input.leaseId,
         generation: input.generation,
         expiresAt,
@@ -2101,6 +2466,8 @@ export class ControlPlane {
 
   failRun(input: {
     id: string;
+    runId: string;
+    leaseId: string;
     generation: number;
     attemptId: string;
     errorCode: string;
@@ -2108,52 +2475,48 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "run.fail", () => {
+    return this.command(input.idempotencyKey, "run.fail", input, () => {
       const current = this.get(input.id);
       if (current.status !== "in_progress") {
         throw new Error("Only in-progress work can fail an active run.");
       }
-      this.assertActiveGeneration(input.id, input.generation);
+      this.assertOwnedActiveRun(input);
       const message = assertText(input.errorMessage, "errorMessage").slice(
         0,
         1_000,
       );
       const code = assertText(input.errorCode, "errorCode").slice(0, 100);
       const stamp = now();
-      const run = this.database
-        .prepare(`
-          SELECT id FROM runs
-          WHERE work_item_id = ? AND generation = ? AND status = 'running'
-        `)
-        .get(input.id, input.generation) as Row | undefined;
-      if (!run) throw new Error("Active run was not found.");
-      this.database
+      const failedAttempt = this.database
         .prepare(`
           UPDATE attempts
           SET status = 'failed', finished_at = ?,
               error_code = ?, error_message = ?
           WHERE id = ? AND run_id = ? AND status = 'running'
         `)
-        .run(stamp, code, message, input.attemptId, String(run.id));
+        .run(stamp, code, message, input.attemptId, input.runId);
+      if (Number(failedAttempt.changes) !== 1) {
+        throw new Error("RUN_OWNERSHIP_FENCE_MISMATCH");
+      }
       this.database
         .prepare(`
           UPDATE runs SET status = 'failed', finished_at = ?
           WHERE id = ?
         `)
-        .run(stamp, String(run.id));
+        .run(stamp, input.runId);
       this.database
         .prepare(`
           UPDATE leases SET released_at = ?
           WHERE run_id = ? AND released_at IS NULL
         `)
-        .run(stamp, String(run.id));
+        .run(stamp, input.runId);
       const unknownOutcomes = this.database
         .prepare(`
           UPDATE tool_evidence_receipts
           SET status = 'outcome_unknown', consumed_at = ?
           WHERE run_id = ? AND status = 'issued'
         `)
-        .run(stamp, String(run.id));
+        .run(stamp, input.runId);
       this.database
         .prepare(`
           UPDATE work_items
@@ -2170,7 +2533,7 @@ export class ControlPlane {
           input.id,
         );
       this.event("run.failed", input.id, input.actor, {
-        runId: String(run.id),
+        runId: input.runId,
         attemptId: input.attemptId,
         generation: input.generation,
         errorCode: code,
@@ -2186,7 +2549,7 @@ export class ControlPlane {
     idempotencyKey: string;
     acknowledgeUnknownToolOutcome?: boolean;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "run.retry", () => {
+    return this.command(input.idempotencyKey, "run.retry", input, () => {
       const current = this.get(input.id);
       if (current.status !== "failed") {
         throw new Error("Only failed work can be retried.");
@@ -2195,11 +2558,13 @@ export class ControlPlane {
         (
           this.database
             .prepare(`
-              SELECT COUNT(*) AS count
-              FROM tool_evidence_receipts
-              WHERE work_item_id = ? AND status = 'outcome_unknown'
+              SELECT
+                (SELECT COUNT(*) FROM tool_evidence_receipts
+                 WHERE work_item_id = ? AND status = 'outcome_unknown') +
+                (SELECT COUNT(*) FROM pending_tool_calls
+                 WHERE work_item_id = ? AND status = 'outcome_unknown') AS count
             `)
-            .get(input.id) as Row
+            .get(input.id, input.id) as Row
         ).count,
       );
       if (unknownOutcomes > 0) {
@@ -2218,6 +2583,18 @@ export class ControlPlane {
             WHERE work_item_id = ? AND status = 'outcome_unknown'
           `)
           .run(input.id);
+        const acknowledgedPending = this.database
+          .prepare(`
+            UPDATE pending_tool_calls
+            SET status = 'outcome_acknowledged'
+            WHERE work_item_id = ? AND status = 'outcome_unknown'
+          `)
+          .run(input.id);
+        if (Number(acknowledgedPending.changes) > 0) {
+          this.event("tool.pending.outcome_acknowledged", input.id, input.actor, {
+            count: Number(acknowledgedPending.changes),
+          });
+        }
       }
       const stamp = now();
       this.database
@@ -2284,6 +2661,21 @@ export class ControlPlane {
             ) AND status = 'running'
           `)
           .run(stamp, String(row.run_id));
+        const abandonedHostRuns = this.database
+          .prepare(`
+            SELECT id, host_id, host_session_id, host_run_id
+            FROM agent_host_runs
+            WHERE run_id = ? AND status IN ('running', 'waiting')
+          `)
+          .all(String(row.run_id)) as Row[];
+        this.database
+          .prepare(`
+            UPDATE agent_host_runs
+            SET status = 'failed', error_code = 'LEASE_EXPIRED',
+                updated_at = ?, finished_at = ?
+            WHERE run_id = ? AND status IN ('running', 'waiting')
+          `)
+          .run(stamp, stamp, String(row.run_id));
         this.database
           .prepare(`
             UPDATE runs SET status = 'failed', finished_at = ?
@@ -2331,6 +2723,15 @@ export class ControlPlane {
             measurementStatus: "unknown",
           });
         }
+        for (const hostRun of abandonedHostRuns) {
+          this.event("agent-host.abandoned", workItemId, actor, {
+            runId: String(row.run_id),
+            hostId: String(hostRun.host_id),
+            hostSessionId: String(hostRun.host_session_id),
+            hostRunId: String(hostRun.host_run_id),
+            errorCode: "LEASE_EXPIRED",
+          });
+        }
         recovered.push(workItemId);
       }
       return recovered;
@@ -2339,13 +2740,20 @@ export class ControlPlane {
 
   progress(input: {
     id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
     summary: string;
     nextAction: string;
     actor: string;
     idempotencyKey: string;
+    expectedVersion: number;
+    generation: number;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "work.progress", () => {
+    return this.command(input.idempotencyKey, "work.progress", input, () => {
       const current = this.get(input.id);
+      this.assertVersion(current, input.expectedVersion);
+      this.assertOwnedActiveRun(input);
       if (current.status !== "in_progress") {
         throw new Error("Only in-progress work accepts progress.");
       }
@@ -2369,9 +2777,42 @@ export class ControlPlane {
     condition: Omit<WaitCondition, "createdBy">;
     actor: string;
     idempotencyKey: string;
+    expectedVersion?: number;
+    generation?: number;
+    runId?: string;
+    attemptId?: string;
+    leaseId?: string;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "work.wait", () => {
+    return this.command(input.idempotencyKey, "work.wait", input, () => {
       const current = this.get(input.id);
+      this.assertVersion(current, input.expectedVersion);
+      const suppliedFenceParts = [
+        input.runId,
+        input.attemptId,
+        input.leaseId,
+        input.generation,
+      ].filter((value) => value !== undefined).length;
+      if (suppliedFenceParts !== 0 && suppliedFenceParts !== 4) {
+        throw new Error("RUN_OWNERSHIP_FENCE_INCOMPLETE");
+      }
+      if (current.status === "in_progress" && suppliedFenceParts !== 4) {
+        throw new Error("RUN_OWNERSHIP_FENCE_REQUIRED");
+      }
+      if (
+        input.runId !== undefined &&
+        input.attemptId !== undefined &&
+        input.leaseId !== undefined &&
+        input.generation !== undefined
+      ) {
+        this.assertOwnedActiveRun({
+          id: input.id,
+          runId: input.runId,
+          attemptId: input.attemptId,
+          leaseId: input.leaseId,
+          generation: input.generation,
+          actor: input.actor,
+        });
+      }
       if (["done", "canceled"].includes(current.status)) {
         throw new Error("Terminal work cannot wait.");
       }
@@ -2429,12 +2870,26 @@ export class ControlPlane {
     });
   }
 
+  waitOwnedRun(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    condition: Omit<WaitCondition, "createdBy">;
+    actor: string;
+    idempotencyKey: string;
+    expectedVersion: number;
+  }): WorkItem {
+    return this.wait(input);
+  }
+
   resume(input: {
     id: string;
     actor: string;
     idempotencyKey: string;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "work.resume", () => {
+    return this.command(input.idempotencyKey, "work.resume", input, () => {
       const current = this.get(input.id);
       if (current.wait?.type === "user_input") {
         throw new Error(
@@ -2489,6 +2944,9 @@ export class ControlPlane {
 
   submitArtifact(input: {
     id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
     content: string;
     mediaType?: string;
     producerReport?: ArtifactProducerReport;
@@ -2501,12 +2959,12 @@ export class ControlPlane {
     sha256: string;
     producerReportHash: string | null;
   } {
-    const result = this.command(input.idempotencyKey, "artifact.submit", () => {
+    const result = this.command(input.idempotencyKey, "artifact.submit", input, () => {
       const current = this.get(input.id);
       if (current.status !== "in_progress") {
         throw new Error("Only in-progress work can submit an artifact.");
       }
-      this.assertActiveGeneration(input.id, input.generation);
+      this.assertOwnedActiveRun(input);
       const content = input.content;
       if (!content.trim()) throw new Error("artifact content is required.");
       const mediaType = (input.mediaType ?? "text/plain").trim();
@@ -2551,14 +3009,6 @@ export class ControlPlane {
       ) {
         throw new Error("WORK_ITEM_ARTIFACT_BUDGET_EXCEEDED");
       }
-      const run = this.database
-        .prepare(`
-          SELECT id FROM runs
-          WHERE work_item_id = ? AND status = 'running'
-          ORDER BY generation DESC LIMIT 1
-        `)
-        .get(input.id) as Row | undefined;
-      if (!run) throw new Error("No active run exists.");
       const digest = createHash("sha256").update(content).digest("hex");
       const storageName = `${digest}.txt`;
       const artifactPath = join(this.artifactDirectory, storageName);
@@ -2580,7 +3030,7 @@ export class ControlPlane {
         .run(
           artifactId,
           input.id,
-          String(run.id),
+          input.runId,
           digest,
           storageName,
           mediaType,
@@ -2597,20 +3047,20 @@ export class ControlPlane {
           SET status = 'succeeded', finished_at = ?
           WHERE run_id = ? AND status IN ('running', 'waiting')
         `)
-        .run(completedAt, String(run.id));
+        .run(completedAt, input.runId);
       this.database
         .prepare(`
           UPDATE runs
           SET status = 'succeeded', finished_at = ?
           WHERE id = ? AND status = 'running'
         `)
-        .run(completedAt, String(run.id));
+        .run(completedAt, input.runId);
       this.database
         .prepare(`
           UPDATE leases SET released_at = ?
           WHERE run_id = ? AND released_at IS NULL
         `)
-        .run(completedAt, String(run.id));
+        .run(completedAt, input.runId);
       this.database
         .prepare(`
           UPDATE work_items
@@ -2635,7 +3085,7 @@ export class ControlPlane {
         artifactContent: content,
         ...(producerReport ? { producerReport } : {}),
         toolEvidence: this.listToolEvidence(input.id).filter(
-          ({ runId }) => runId === String(run.id),
+          ({ runId }) => runId === input.runId,
         ),
         createdAt: completedAt,
       });
@@ -2671,7 +3121,7 @@ export class ControlPlane {
     detailsOpenCount?: number;
     completeOnApprove?: boolean;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "approval.decide", () => {
+    return this.command(input.idempotencyKey, "approval.decide", input, () => {
       const current = this.get(input.id);
       if (!input.actor.startsWith("human:")) {
         throw new Error("Artifact approval authority must be a human actor.");
@@ -2876,7 +3326,7 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): { workItem: WorkItem; resurfaced: string[] } {
-    return this.command(input.idempotencyKey, "work.complete", () => {
+    return this.command(input.idempotencyKey, "work.complete", input, () => {
       const resurfaced = this.completeApprovedWork(
         input.id,
         input.actor,
@@ -2891,7 +3341,7 @@ export class ControlPlane {
     actor: string;
     idempotencyKey: string;
   }): WorkItem {
-    return this.command(input.idempotencyKey, "work.archive", () => {
+    return this.command(input.idempotencyKey, "work.archive", input, () => {
       if (!input.actor.startsWith("human:")) {
         throw new Error("WORK_ARCHIVE_REQUIRES_HUMAN");
       }
@@ -3076,17 +3526,24 @@ export class ControlPlane {
     id: string;
     runId: string;
     attemptId: string;
+    leaseId: string;
+    generation: number;
     callHash: string;
     toolName: string;
     arguments: unknown;
+    summary?: PendingToolCallSummary;
     createdAt: string;
     actor: string;
+    idempotencyKey: string;
   }): PendingToolCall {
+    const { createdAt: _createdAt, ...idempotentRequest } = input;
     return this.command(
-      `pending-tool:${input.id}:${input.callHash}`,
+      input.idempotencyKey,
       "tool.pending.record",
+      idempotentRequest,
       () => {
         const current = this.get(input.id);
+        this.assertOwnedActiveRun(input);
         if (current.status !== "in_progress") {
           throw new Error(
             "Only in-progress work can wait for tool approval.",
@@ -3098,12 +3555,13 @@ export class ControlPlane {
         const argumentsJson = JSON.stringify(input.arguments);
         if (
           argumentsJson === undefined ||
-          Buffer.byteLength(argumentsJson, "utf8") > 300_000
+          Buffer.byteLength(argumentsJson, "utf8") > 7_000_000
         ) {
           throw new Error(
-            "Pending tool arguments must be JSON of at most 300000 bytes.",
+            "Pending tool arguments must be JSON of at most 7000000 bytes.",
           );
         }
+        const summaryJson = pendingToolSummary(input.summary);
         const parsedArguments = JSON.parse(argumentsJson) as unknown;
         if (
           parsedArguments &&
@@ -3116,6 +3574,23 @@ export class ControlPlane {
             "Pending tool arguments must be fully parsed before approval.",
           );
         }
+        const existing = this.database
+          .prepare(`
+            SELECT status
+            FROM pending_tool_calls
+            WHERE work_item_id = ? AND call_hash = ?
+          `)
+          .get(input.id, input.callHash) as Row | undefined;
+        if (existing) {
+          if (String(existing.status) === "outcome_acknowledged") {
+            throw new Error(
+              "TOOL_OUTCOME_ACKNOWLEDGED: the exact uncertain call is retired; submit a new content-addressed call with changed prestate before requesting approval again.",
+            );
+          }
+          throw new Error(
+            "PENDING_TOOL_CALL_DUPLICATE: this exact call hash already exists for the WorkItem.",
+          );
+        }
         const pending: PendingToolCall = {
           id: `pending-tool-${randomUUID()}`,
           workItemId: input.id,
@@ -3124,16 +3599,23 @@ export class ControlPlane {
           callHash: input.callHash,
           toolName: assertText(input.toolName, "toolName"),
           arguments: parsedArguments,
+          summary: summaryJson
+            ? (JSON.parse(summaryJson) as PendingToolCallSummary)
+            : null,
           status: "approval_required",
           createdAt: input.createdAt,
           executedAt: null,
+          reservation: null,
+          evidenceId: null,
+          effectHash: null,
+          outcomeMessage: null,
         };
         this.database
           .prepare(`
             INSERT INTO pending_tool_calls(
               id, work_item_id, run_id, attempt_id, call_hash, tool_name,
-              arguments_json, status, created_at, executed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+              arguments_json, summary_json, status, created_at, executed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
           `)
           .run(
             pending.id,
@@ -3143,6 +3625,7 @@ export class ControlPlane {
             pending.callHash,
             pending.toolName,
             argumentsJson,
+            summaryJson,
             pending.status,
             pending.createdAt,
           );
@@ -3242,6 +3725,9 @@ export class ControlPlane {
             ({ runId }) => runId === input.runId,
           ),
           createdAt: stamp,
+          ...(pendingToolApprovalQuestion(pending)
+            ? { question: pendingToolApprovalQuestion(pending)! }
+            : {}),
         });
         this.replaceDecisionPacket(packet, stamp);
         this.event("tool.approval.required", input.id, input.actor, {
@@ -3264,23 +3750,12 @@ export class ControlPlane {
         ORDER BY created_at, id
       `)
       .all(id) as Row[];
-    return rows.map((row) => ({
-      id: String(row.id),
-      workItemId: String(row.work_item_id),
-      runId: String(row.run_id),
-      attemptId: String(row.attempt_id),
-      callHash: String(row.call_hash),
-      toolName: String(row.tool_name),
-      arguments: JSON.parse(String(row.arguments_json)) as unknown,
-      status: String(row.status) as PendingToolCall["status"],
-      createdAt: String(row.created_at),
-      executedAt: row.executed_at ? String(row.executed_at) : null,
-    }));
+    return rows.map(asPendingToolCall);
   }
 
   approvedPendingToolCall(id: string): PendingToolCall | null {
     this.get(id);
-    const row = this.database
+    const rows = this.database
       .prepare(`
         SELECT p.*
         FROM pending_tool_calls p
@@ -3289,33 +3764,33 @@ export class ControlPlane {
          AND a.call_hash = p.call_hash
          AND a.tool_name = p.tool_name
         WHERE p.work_item_id = ?
-          AND p.status = 'approval_required'
-        ORDER BY p.created_at, p.id
-        LIMIT 1
+          AND p.status IN ('approval_required', 'executing')
+        ORDER BY CASE p.status WHEN 'executing' THEN 0 ELSE 1 END,
+                 p.created_at, p.id
+        LIMIT 2
       `)
-      .get(id) as Row | undefined;
-    if (!row) return null;
-    return {
-      id: String(row.id),
-      workItemId: String(row.work_item_id),
-      runId: String(row.run_id),
-      attemptId: String(row.attempt_id),
-      callHash: String(row.call_hash),
-      toolName: String(row.tool_name),
-      arguments: JSON.parse(String(row.arguments_json)) as unknown,
-      status: String(row.status) as PendingToolCall["status"],
-      createdAt: String(row.created_at),
-      executedAt: row.executed_at ? String(row.executed_at) : null,
-    };
+      .all(id) as Row[];
+    if (rows.length > 1) {
+      throw new Error(
+        "PENDING_TOOL_EXECUTION_AMBIGUOUS: more than one approved call is eligible for execution.",
+      );
+    }
+    return rows[0] ? asPendingToolCall(rows[0]) : null;
   }
 
   markPendingToolCallExecuted(input: {
     id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
     callHash: string;
+    evidenceId: string;
     actor: string;
     idempotencyKey: string;
   }): PendingToolCall {
-    return this.command(input.idempotencyKey, "tool.pending.executed", () => {
+    return this.command(input.idempotencyKey, "tool.pending.executed", input, () => {
+      this.assertOwnedActiveRun(input);
       const pending = this.listPendingToolCalls(input.id).find(
         ({ callHash }) => callHash === input.callHash,
       );
@@ -3323,14 +3798,36 @@ export class ControlPlane {
       if (pending.status !== "approval_required") {
         throw new Error("Pending tool call is not awaiting execution.");
       }
+      const evidence = this.database
+        .prepare(`
+          SELECT id
+          FROM tool_evidence
+          WHERE id = ? AND work_item_id = ? AND run_id = ? AND attempt_id = ?
+            AND call_hash = ? AND tool_name = ? AND status = 'succeeded'
+        `)
+        .get(
+          input.evidenceId,
+          input.id,
+          input.runId,
+          input.attemptId,
+          input.callHash,
+          pending.toolName,
+        );
+      if (!evidence) {
+        throw new Error("TOOL_EVIDENCE_MISMATCH: successful matching evidence is required.");
+      }
       const executedAt = now();
-      this.database
+      const update = this.database
         .prepare(`
           UPDATE pending_tool_calls
-          SET status = 'executed', executed_at = ?
+          SET status = 'executed', executed_at = ?, evidence_id = ?
           WHERE work_item_id = ? AND call_hash = ?
+            AND status = 'approval_required'
         `)
-        .run(executedAt, input.id, input.callHash);
+        .run(executedAt, input.evidenceId, input.id, input.callHash);
+      if (Number(update.changes) !== 1) {
+        throw new Error("Pending tool call execution lost its atomic settlement race.");
+      }
       this.event("tool.pending.executed", input.id, input.actor, {
         callHash: pending.callHash,
         toolName: pending.toolName,
@@ -3339,7 +3836,419 @@ export class ControlPlane {
         ...pending,
         status: "executed",
         executedAt,
+        evidenceId: input.evidenceId,
       };
+    });
+  }
+
+  reservePendingToolExecution(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolExecutionClaim {
+    assertText(input.idempotencyKey, "idempotencyKey");
+    return this.transact(() => {
+      this.assertOwnedActiveRun(input);
+      const row = this.database
+        .prepare(`
+          SELECT p.*,
+                 CASE WHEN approval.id IS NULL THEN 0 ELSE 1 END AS approved
+          FROM pending_tool_calls p
+          LEFT JOIN tool_approvals approval
+            ON approval.work_item_id = p.work_item_id
+           AND approval.call_hash = p.call_hash
+           AND approval.tool_name = p.tool_name
+          WHERE p.work_item_id = ? AND p.call_hash = ?
+        `)
+        .get(input.id, input.callHash) as Row | undefined;
+      if (!row || Number(row.approved) !== 1) {
+        throw new Error(`TOOL_APPROVAL_REQUIRED: a human must approve exact call hash ${input.callHash}.`);
+      }
+      const pending = asPendingToolCall(row);
+      if (pending.status === "executed") {
+        return { pending, disposition: "executed" };
+      }
+      if (pending.status === "outcome_unknown") {
+        throw new Error("TOOL_OUTCOME_UNKNOWN: this approved call is fail-closed and cannot be rewritten.");
+      }
+      if (pending.status === "outcome_acknowledged") {
+        throw new Error("TOOL_OUTCOME_ACKNOWLEDGED: this exact uncertain call was retired after human inspection and cannot be replayed.");
+      }
+      if (pending.status === "denied") {
+        throw new Error("TOOL_CALL_DENIED: this exact call was denied.");
+      }
+      if (pending.status === "precondition_failed") {
+        throw new Error("TOOL_PRECONDITION_FAILED: the approved filesystem prestate is stale.");
+      }
+      if (pending.status === "executing") {
+        if (!pending.reservation) {
+          throw new Error("PENDING_TOOL_EXECUTION_STATE_INVALID");
+        }
+        if (this.pendingReservationIsActive(pending)) {
+          throw new Error("TOOL_EXECUTION_ALREADY_RESERVED: another executor owns this exact call.");
+        }
+        return { pending, disposition: "recovery_required" };
+      }
+      const reservationId = `tool-execution-${randomUUID()}`;
+      const reservedAt = now();
+      const update = this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'executing', reservation_id = ?,
+              reservation_run_id = ?, reservation_attempt_id = ?,
+              reservation_lease_id = ?, reservation_generation = ?,
+              reservation_actor = ?, reserved_at = ?
+          WHERE id = ? AND status = 'approval_required'
+        `)
+        .run(
+          reservationId,
+          input.runId,
+          input.attemptId,
+          input.leaseId,
+          input.generation,
+          input.actor,
+          reservedAt,
+          pending.id,
+        );
+      if (Number(update.changes) !== 1) {
+        throw new Error("TOOL_EXECUTION_ALREADY_RESERVED: reservation race was lost.");
+      }
+      const reserved = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (!reserved) throw new Error("Pending tool call disappeared after reservation.");
+      this.event("tool.pending.reserved", input.id, input.actor, {
+        callHash: input.callHash,
+        reservationId,
+        runId: input.runId,
+        attemptId: input.attemptId,
+      });
+      return { pending: reserved, disposition: "reserved" };
+    });
+  }
+
+  replacePendingToolExecutionReservation(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    previousReservationId: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolExecutionClaim {
+    assertText(input.idempotencyKey, "idempotencyKey");
+    return this.transact(() => {
+      this.assertOwnedActiveRun(input);
+      const pending = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (
+        !pending ||
+        pending.status !== "executing" ||
+        pending.reservation?.id !== input.previousReservationId
+      ) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_RACE: reservation no longer matches.");
+      }
+      if (this.pendingReservationIsActive(pending)) {
+        throw new Error("TOOL_EXECUTION_ALREADY_RESERVED: prior executor is still active.");
+      }
+      const succeededEvidence = this.database
+        .prepare(`
+          SELECT id FROM tool_evidence
+          WHERE work_item_id = ? AND run_id = ? AND attempt_id = ?
+            AND call_hash = ? AND tool_name = ? AND status = 'succeeded'
+          LIMIT 1
+        `)
+        .get(
+          input.id,
+          pending.reservation.runId,
+          pending.reservation.attemptId,
+          input.callHash,
+          pending.toolName,
+        );
+      if (succeededEvidence) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_EVIDENCE_EXISTS: inspect and finalize the committed effect.");
+      }
+      const reservationId = `tool-execution-${randomUUID()}`;
+      const reservedAt = now();
+      const update = this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET reservation_id = ?, reservation_run_id = ?,
+              reservation_attempt_id = ?, reservation_lease_id = ?,
+              reservation_generation = ?, reservation_actor = ?, reserved_at = ?
+          WHERE id = ? AND status = 'executing' AND reservation_id = ?
+        `)
+        .run(
+          reservationId,
+          input.runId,
+          input.attemptId,
+          input.leaseId,
+          input.generation,
+          input.actor,
+          reservedAt,
+          pending.id,
+          input.previousReservationId,
+        );
+      if (Number(update.changes) !== 1) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_RACE: reservation replacement was lost.");
+      }
+      const reserved = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (!reserved) throw new Error("Pending tool call disappeared after recovery reservation.");
+      this.event("tool.pending.recovered", input.id, input.actor, {
+        callHash: input.callHash,
+        previousReservationId: input.previousReservationId,
+        reservationId,
+        action: "retry_before_effect",
+      });
+      return { pending: reserved, disposition: "reserved" };
+    });
+  }
+
+  settlePendingToolExecution(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    reservationId: string;
+    evidenceId: string;
+    effectHash: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolCall {
+    return this.command(input.idempotencyKey, "tool.pending.settle", input, () => {
+      this.assertOwnedActiveRun(input);
+      if (!/^[a-f0-9]{64}$/u.test(input.effectHash)) {
+        throw new Error("effectHash must be a SHA-256 digest.");
+      }
+      const pending = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (
+        !pending ||
+        pending.status !== "executing" ||
+        pending.reservation?.id !== input.reservationId ||
+        pending.reservation.runId !== input.runId ||
+        pending.reservation.attemptId !== input.attemptId ||
+        pending.reservation.leaseId !== input.leaseId ||
+        pending.reservation.generation !== input.generation ||
+        pending.reservation.actor !== input.actor
+      ) {
+        throw new Error("TOOL_EXECUTION_RESERVATION_MISMATCH");
+      }
+      this.assertSuccessfulPendingEvidence(pending, input.evidenceId);
+      const executedAt = now();
+      const update = this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'executed', executed_at = ?, evidence_id = ?, effect_hash = ?
+          WHERE id = ? AND status = 'executing' AND reservation_id = ?
+        `)
+        .run(
+          executedAt,
+          input.evidenceId,
+          input.effectHash,
+          pending.id,
+          input.reservationId,
+        );
+      if (Number(update.changes) !== 1) {
+        throw new Error("TOOL_EXECUTION_SETTLEMENT_RACE");
+      }
+      this.event("tool.pending.executed", input.id, input.actor, {
+        callHash: input.callHash,
+        reservationId: input.reservationId,
+        evidenceId: input.evidenceId,
+        effectHash: input.effectHash,
+      });
+      return this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      )!;
+    });
+  }
+
+  recoverCommittedPendingToolExecution(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    previousReservationId: string;
+    evidenceId: string;
+    effectHash: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolCall {
+    return this.command(input.idempotencyKey, "tool.pending.recover-committed", input, () => {
+      this.assertOwnedActiveRun(input);
+      if (!/^[a-f0-9]{64}$/u.test(input.effectHash)) {
+        throw new Error("effectHash must be a SHA-256 digest.");
+      }
+      const pending = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (
+        !pending ||
+        pending.status !== "executing" ||
+        pending.reservation?.id !== input.previousReservationId ||
+        this.pendingReservationIsActive(pending)
+      ) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_RACE: prior reservation is not recoverable.");
+      }
+      this.assertSuccessfulPendingEvidence(pending, input.evidenceId);
+      const executedAt = now();
+      const update = this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'executed', executed_at = ?, evidence_id = ?, effect_hash = ?
+          WHERE id = ? AND status = 'executing' AND reservation_id = ?
+        `)
+        .run(
+          executedAt,
+          input.evidenceId,
+          input.effectHash,
+          pending.id,
+          input.previousReservationId,
+        );
+      if (Number(update.changes) !== 1) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_RACE");
+      }
+      this.event("tool.pending.recovered", input.id, input.actor, {
+        callHash: input.callHash,
+        previousReservationId: input.previousReservationId,
+        evidenceId: input.evidenceId,
+        effectHash: input.effectHash,
+        action: "finalized_committed_effect",
+      });
+      return this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      )!;
+    });
+  }
+
+  failPendingToolExecutionPrecondition(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    reservationId: string;
+    message: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolCall {
+    return this.command(input.idempotencyKey, "tool.pending.precondition-failed", input, () => {
+      this.assertOwnedActiveRun(input);
+      const pending = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (
+        !pending ||
+        pending.status !== "executing" ||
+        pending.reservation?.id !== input.reservationId ||
+        pending.reservation.runId !== input.runId ||
+        pending.reservation.attemptId !== input.attemptId ||
+        pending.reservation.leaseId !== input.leaseId ||
+        pending.reservation.generation !== input.generation ||
+        pending.reservation.actor !== input.actor
+      ) {
+        throw new Error("TOOL_EXECUTION_RESERVATION_MISMATCH");
+      }
+      const message = assertText(input.message, "precondition message").slice(0, 2_000);
+      const stamp = now();
+      const update = this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'precondition_failed', executed_at = ?, outcome_message = ?
+          WHERE id = ? AND status = 'executing' AND reservation_id = ?
+        `)
+        .run(stamp, message, pending.id, input.reservationId);
+      if (Number(update.changes) !== 1) {
+        throw new Error("TOOL_EXECUTION_PRECONDITION_RACE");
+      }
+      this.failCurrentPendingExecutionRun(input, stamp, "TOOL_PRECONDITION_FAILED", message);
+      this.event("tool.pending.precondition_failed", input.id, input.actor, {
+        callHash: input.callHash,
+        reservationId: input.reservationId,
+        message,
+      });
+      return this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      )!;
+    });
+  }
+
+  markPendingToolOutcomeUnknown(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    previousReservationId: string;
+    message: string;
+    actor: string;
+    idempotencyKey: string;
+  }): PendingToolCall {
+    return this.command(input.idempotencyKey, "tool.pending.outcome-unknown", input, () => {
+      this.assertOwnedActiveRun(input);
+      const pending = this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      );
+      if (
+        !pending ||
+        pending.status !== "executing" ||
+        pending.reservation?.id !== input.previousReservationId
+      ) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_RACE: prior reservation is not recoverable.");
+      }
+      const ownsCurrentReservation =
+        pending.reservation.runId === input.runId &&
+        pending.reservation.attemptId === input.attemptId &&
+        pending.reservation.leaseId === input.leaseId &&
+        pending.reservation.generation === input.generation &&
+        pending.reservation.actor === input.actor;
+      if (this.pendingReservationIsActive(pending) && !ownsCurrentReservation) {
+        throw new Error("TOOL_EXECUTION_ALREADY_RESERVED: prior executor is still active.");
+      }
+      const message = assertText(input.message, "outcome message").slice(0, 2_000);
+      const stamp = now();
+      const pendingUpdate = this.database
+        .prepare(`
+          UPDATE pending_tool_calls
+          SET status = 'outcome_unknown', executed_at = ?, outcome_message = ?
+          WHERE id = ? AND status = 'executing' AND reservation_id = ?
+        `)
+        .run(stamp, message, pending.id, input.previousReservationId);
+      if (Number(pendingUpdate.changes) !== 1) {
+        throw new Error("TOOL_EXECUTION_RECOVERY_RACE");
+      }
+      this.failCurrentPendingExecutionRun(
+        input,
+        stamp,
+        "TOOL_OUTCOME_UNKNOWN",
+        message,
+      );
+      this.event("tool.pending.outcome_unknown", input.id, input.actor, {
+        callHash: input.callHash,
+        previousReservationId: input.previousReservationId,
+        message,
+      });
+      return this.listPendingToolCalls(input.id).find(
+        ({ callHash }) => callHash === input.callHash,
+      )!;
     });
   }
 
@@ -3354,7 +4263,7 @@ export class ControlPlane {
     activeReviewMs?: number;
     detailsOpenCount?: number;
   }): ToolCallApproval {
-    return this.command(input.idempotencyKey, "tool.approve", () => {
+    return this.command(input.idempotencyKey, "tool.approve", input, () => {
       const current = this.get(input.id);
       if (!input.actor.startsWith("human:")) {
         throw new Error("Tool approval authority must be a human actor.");
@@ -3493,7 +4402,7 @@ export class ControlPlane {
     activeReviewMs?: number;
     detailsOpenCount?: number;
   }): ToolCallDenial {
-    return this.command(input.idempotencyKey, "tool.deny", () => {
+    return this.command(input.idempotencyKey, "tool.deny", input, () => {
       const current = this.get(input.id);
       if (!input.actor.startsWith("human:")) {
         throw new Error("Tool denial authority must be a human actor.");
@@ -3645,10 +4554,55 @@ export class ControlPlane {
     return Boolean(row);
   }
 
+  isPendingToolExecutionReserved(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    callHash: string;
+    toolName: string;
+    actor: string;
+  }): boolean {
+    this.assertOwnedActiveRun(input);
+    const row = this.database
+      .prepare(`
+        SELECT 1
+        FROM pending_tool_calls pending
+        JOIN tool_approvals approval
+          ON approval.work_item_id = pending.work_item_id
+         AND approval.call_hash = pending.call_hash
+         AND approval.tool_name = pending.tool_name
+        WHERE pending.work_item_id = ?
+          AND pending.call_hash = ?
+          AND pending.tool_name = ?
+          AND pending.status = 'executing'
+          AND pending.reservation_run_id = ?
+          AND pending.reservation_attempt_id = ?
+          AND pending.reservation_lease_id = ?
+          AND pending.reservation_generation = ?
+          AND pending.reservation_actor = ?
+      `)
+      .get(
+        input.id,
+        input.callHash,
+        input.toolName,
+        input.runId,
+        input.attemptId,
+        input.leaseId,
+        input.generation,
+        input.actor,
+      );
+    return Boolean(row);
+  }
+
   prepareToolEvidence(input: {
     id: string;
     runId: string;
     attemptId: string;
+    leaseId: string;
+    generation: number;
+    evidenceAttemptId?: string;
     callHash: string;
     toolName: string;
     inputHash: string;
@@ -3661,6 +4615,7 @@ export class ControlPlane {
           "Tool evidence preparation requires an active in-progress work item.",
         );
       }
+      this.assertOwnedActiveRun(input);
       for (const hash of [input.callHash, input.inputHash]) {
         if (!/^[a-f0-9]{64}$/u.test(hash)) {
           throw new Error(
@@ -3670,6 +4625,7 @@ export class ControlPlane {
       }
       const toolName = assertText(input.toolName, "toolName");
       const actor = assertText(input.actor, "actor");
+      const evidenceAttemptId = input.evidenceAttemptId ?? input.attemptId;
       const lineage = this.database
         .prepare(`
           SELECT runs.work_item_id, runs.status AS run_status,
@@ -3678,7 +4634,7 @@ export class ControlPlane {
           JOIN attempts ON attempts.run_id = runs.id
           WHERE runs.id = ? AND attempts.id = ?
         `)
-        .get(input.runId, input.attemptId) as Row | undefined;
+        .get(input.runId, evidenceAttemptId) as Row | undefined;
       if (
         !lineage ||
         String(lineage.work_item_id) !== input.id ||
@@ -3705,7 +4661,7 @@ export class ControlPlane {
           id,
           input.id,
           input.runId,
-          input.attemptId,
+          evidenceAttemptId,
           input.callHash,
           toolName,
           input.inputHash,
@@ -3715,7 +4671,7 @@ export class ControlPlane {
       this.event("tool.evidence.prepared", input.id, actor, {
         receiptId: id,
         runId: input.runId,
-        attemptId: input.attemptId,
+        attemptId: evidenceAttemptId,
         callHash: input.callHash,
         toolName,
       });
@@ -3729,6 +4685,9 @@ export class ControlPlane {
     id: string;
     runId: string;
     attemptId: string;
+    leaseId: string;
+    generation: number;
+    evidenceAttemptId?: string;
     callHash: string;
     toolName: string;
     status: ToolExecutionEvidenceRecord["status"];
@@ -3742,12 +4701,15 @@ export class ControlPlane {
     return this.command(
       `tool-evidence:${input.evidenceId}`,
       "tool.evidence.record",
+      input,
       () => {
         const current = this.get(input.id);
         if (current.status !== "in_progress") {
           throw new Error("Tool evidence requires an active in-progress work item.");
         }
+        this.assertOwnedActiveRun(input);
         const actor = assertText(input.actor, "actor");
+        const evidenceAttemptId = input.evidenceAttemptId ?? input.attemptId;
         const lineage = this.database
           .prepare(`
             SELECT runs.work_item_id, runs.status AS run_status,
@@ -3756,7 +4718,7 @@ export class ControlPlane {
             JOIN attempts ON attempts.run_id = runs.id
             WHERE runs.id = ? AND attempts.id = ?
           `)
-          .get(input.runId, input.attemptId) as Row | undefined;
+          .get(input.runId, evidenceAttemptId) as Row | undefined;
         if (
           !lineage ||
           String(lineage.work_item_id) !== input.id ||
@@ -3800,7 +4762,7 @@ export class ControlPlane {
           !receipt ||
           String(receipt.work_item_id) !== input.id ||
           String(receipt.run_id) !== input.runId ||
-          String(receipt.attempt_id) !== input.attemptId ||
+          String(receipt.attempt_id) !== evidenceAttemptId ||
           String(receipt.call_hash) !== input.callHash ||
           String(receipt.tool_name) !== input.toolName ||
           String(receipt.input_hash) !== input.inputHash ||
@@ -3814,7 +4776,7 @@ export class ControlPlane {
           id: input.evidenceId,
           workItemId: input.id,
           runId: input.runId,
-          attemptId: input.attemptId,
+          attemptId: evidenceAttemptId,
           receiptId: input.receipt.id,
           provenance: "control_plane_receipt",
           callHash: input.callHash,
@@ -4003,6 +4965,19 @@ export class ControlPlane {
     return asWorkItem(row);
   }
 
+  getWorkItemForRun(runId: string): WorkItem {
+    const row = this.database
+      .prepare(`
+        SELECT work_items.*
+        FROM runs
+        JOIN work_items ON work_items.id = runs.work_item_id
+        WHERE runs.id = ?
+      `)
+      .get(assertText(runId, "runId")) as Row | undefined;
+    if (!row) throw new Error(`Unknown run '${runId}'.`);
+    return asWorkItem(row);
+  }
+
   list(options: { includeArchived?: boolean } = {}): WorkItem[] {
     return (
       this.database
@@ -4075,6 +5050,45 @@ export class ControlPlane {
         LIMIT 1
       `)
       .get() as Row | undefined;
+    return row ? asWorkItem(row) : null;
+  }
+
+  nextClaimableWorkFor(input: {
+    ownerRoles: string[];
+    executionTargets: string[];
+  }): WorkItem | null {
+    if (
+      !Array.isArray(input.ownerRoles) ||
+      !Array.isArray(input.executionTargets) ||
+      input.ownerRoles.length === 0 ||
+      input.executionTargets.length === 0 ||
+      input.ownerRoles.length > 32 ||
+      input.executionTargets.length > 32
+    ) {
+      return null;
+    }
+    const ownerRoles = [...new Set(
+      input.ownerRoles.map((value) => assertText(value, "ownerRole")),
+    )];
+    const executionTargets = [...new Set(
+      input.executionTargets.map((value) =>
+        assertText(value, "executionTarget")
+      ),
+    )];
+    const row = this.database
+      .prepare(`
+        SELECT * FROM work_items
+        WHERE archived_at IS NULL
+          AND availability = 'ready'
+          AND status IN ('ready', 'changes_requested')
+          AND owner_role IN (${ownerRoles.map(() => "?").join(", ")})
+          AND execution_target IN (${
+            executionTargets.map(() => "?").join(", ")
+          })
+        ORDER BY priority DESC, updated_at ASC, id ASC
+        LIMIT 1
+      `)
+      .get(...ownerRoles, ...executionTargets) as Row | undefined;
     return row ? asWorkItem(row) : null;
   }
 
@@ -4347,6 +5361,147 @@ export class ControlPlane {
     if (!row || Number(row.generation) !== generation) {
       throw new Error("Stale or inactive run generation.");
     }
+  }
+
+  private assertOwnedActiveRun(input: {
+    id: string;
+    runId: string;
+    attemptId: string;
+    leaseId: string;
+    generation: number;
+    actor: string;
+  }): void {
+    const lineage = this.database
+      .prepare(`
+        SELECT l.owner, l.generation AS lease_generation, l.expires_at,
+               r.generation AS run_generation
+        FROM leases l
+        JOIN runs r ON r.id = l.run_id
+        JOIN attempts a ON a.id = l.attempt_id AND a.run_id = r.id
+        WHERE l.id = ? AND l.run_id = ? AND l.attempt_id = ?
+          AND r.work_item_id = ? AND r.id = ?
+          AND a.id = ? AND a.kind = 'primary'
+          AND l.released_at IS NULL
+          AND r.status = 'running'
+          AND a.status = 'running'
+      `)
+      .get(
+        input.leaseId,
+        input.runId,
+        input.attemptId,
+        input.id,
+        input.runId,
+        input.attemptId,
+      ) as Row | undefined;
+    const expiresAt = Date.parse(String(lineage?.expires_at ?? ""));
+    if (
+      !lineage ||
+      String(lineage.owner) !== input.actor ||
+      Number(lineage.lease_generation) !== input.generation ||
+      Number(lineage.run_generation) !== input.generation ||
+      !Number.isFinite(expiresAt) ||
+      expiresAt <= Date.now()
+    ) {
+      throw new Error("RUN_OWNERSHIP_FENCE_MISMATCH");
+    }
+  }
+
+  private pendingReservationIsActive(pending: PendingToolCall): boolean {
+    const reservation = pending.reservation;
+    if (!reservation) return false;
+    const row = this.database
+      .prepare(`
+        SELECT l.expires_at
+        FROM leases l
+        JOIN runs r ON r.id = l.run_id
+        JOIN attempts a ON a.id = l.attempt_id AND a.run_id = r.id
+        WHERE l.id = ? AND l.run_id = ? AND l.attempt_id = ?
+          AND l.owner = ? AND l.generation = ? AND r.generation = ?
+          AND r.work_item_id = ? AND r.status = 'running'
+          AND a.status = 'running' AND a.kind = 'primary'
+          AND l.released_at IS NULL
+      `)
+      .get(
+        reservation.leaseId,
+        reservation.runId,
+        reservation.attemptId,
+        reservation.actor,
+        reservation.generation,
+        reservation.generation,
+        pending.workItemId,
+      ) as Row | undefined;
+    const expiresAt = Date.parse(String(row?.expires_at ?? ""));
+    return Boolean(row) && Number.isFinite(expiresAt) && expiresAt > Date.now();
+  }
+
+  private assertSuccessfulPendingEvidence(
+    pending: PendingToolCall,
+    evidenceId: string,
+  ): void {
+    const reservation = pending.reservation;
+    if (!reservation) throw new Error("TOOL_EXECUTION_RESERVATION_MISMATCH");
+    const evidence = this.database
+      .prepare(`
+        SELECT id
+        FROM tool_evidence
+        WHERE id = ? AND work_item_id = ? AND run_id = ? AND attempt_id = ?
+          AND call_hash = ? AND tool_name = ? AND status = 'succeeded'
+      `)
+      .get(
+        evidenceId,
+        pending.workItemId,
+        reservation.runId,
+        reservation.attemptId,
+        pending.callHash,
+        pending.toolName,
+      );
+    if (!evidence) {
+      throw new Error("TOOL_EVIDENCE_MISMATCH: successful reservation-bound evidence is required.");
+    }
+  }
+
+  private failCurrentPendingExecutionRun(
+    input: {
+      id: string;
+      runId: string;
+      attemptId: string;
+      leaseId: string;
+    },
+    stamp: string,
+    errorCode: "TOOL_PRECONDITION_FAILED" | "TOOL_OUTCOME_UNKNOWN",
+    message: string,
+  ): void {
+    const attemptUpdate = this.database
+      .prepare(`
+        UPDATE attempts
+        SET status = 'failed', finished_at = ?, error_code = ?,
+            error_message = ?
+        WHERE id = ? AND run_id = ? AND status = 'running'
+      `)
+      .run(stamp, errorCode, message, input.attemptId, input.runId);
+    if (Number(attemptUpdate.changes) !== 1) {
+      throw new Error("TOOL_EXECUTION_ATTEMPT_RACE");
+    }
+    this.database
+      .prepare("UPDATE runs SET status = 'failed', finished_at = ? WHERE id = ? AND status = 'running'")
+      .run(stamp, input.runId);
+    this.database
+      .prepare("UPDATE leases SET released_at = ? WHERE id = ? AND released_at IS NULL")
+      .run(stamp, input.leaseId);
+    this.database
+      .prepare(`
+        UPDATE work_items
+        SET status = 'failed', availability = 'ready', next_action = ?,
+            version = version + 1, updated_at = ?
+        WHERE id = ? AND status = 'in_progress'
+      `)
+      .run(
+        errorCode === "TOOL_OUTCOME_UNKNOWN"
+          ? "Inspect the unknown tool outcome before explicitly retrying."
+          : "The approved file precondition is stale. Request a new change set.",
+        stamp,
+        input.id,
+      );
   }
 
   private assertVersion(item: WorkItem, expected?: number): void {

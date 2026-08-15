@@ -7,7 +7,7 @@
   projection boundaries.
 - OrgSpec, the SQLite Control Plane, the safe Tool Runtime, recoverable apply,
   operational backup/audit controls, the reviewed-work dashboard, and a
-  dependency-free package build are present at `0.0.8-alpha.1`.
+  dependency-free package build are present at `0.0.9-alpha.1`.
 - `ModelEngine`, `AgentHost`, and `ManagedRunner` are separate contracts;
   generic and fake engines are the primary foundation, while Codex and Claude
   Code remain optional host adapters.
@@ -47,6 +47,9 @@ git status --short
 12. Checkpointed benchmark resume with exact plan/suite/config hashes, segment
     lineage, invocation-prefix verification, and fail-closed interruption
     handling.
+13. Fresh-project kickoff, namespaced Codex/Claude role projection, a required
+    local MCP bridge, exact-fenced multi-file approvals, and the direct Codex
+    AgentHost v1alpha2 slice.
 
 ## Next implementation slice
 
@@ -62,9 +65,10 @@ git status --short
 
 ## Rollback
 
-Database migration 12 marks the decision-centered review slice; older known
+Database migration 15 marks the coding-host and exact-replay slice; older known
 schemas receive an automatic SQLite snapshot before migration. File transactions
-recover automatically from `.chartermesh/.transactions`; use
+remain journaled under `.chartermesh/.transactions`; no-write commands report
+them without mutation. Resume the exact approved operation or use explicit
 `chartermesh recover` rather than deleting journal or backup files. Revert
 future source changes with a new commit; do not delete user files or rewrite
 Git history when rolling back.

@@ -12,17 +12,20 @@ approvals, model connection, operations, and troubleshooting, see
 GitHub package path, with no manual source checkout:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 version --json
-npx --yes github:jade-blanco/chartermesh#v0.0.8-alpha.1 propose `
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 version --json
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 propose `
   --target C:\path\to\target `
   --profile balanced
 ```
 
-The tag pins this friend-trial guide to a reproducible pre-alpha release. Omit
-`#v0.0.8-alpha.1` only when intentionally testing the latest `main` branch.
+The tag selects this guide's pre-alpha friend-trial version, but a Git tag is
+movable and is not a cryptographic commit attestation. Omit `#v0.0.9-alpha.1`
+only when intentionally testing the latest `main` branch.
 
-This requires an explicitly authorized package download. For source
-development:
+This requires an explicitly authorized package download, Git 2.x, and normal
+npm lifecycle scripts so the dependency-free `prepare` build can run. An
+environment that enforces `ignore-scripts` must use a reviewed prebuilt package
+or source checkout. For source development:
 
 ```powershell
 git clone https://github.com/jade-blanco/chartermesh.git chartermesh
@@ -39,7 +42,9 @@ With a coding agent, provide the repository URL and say:
 
 The agent must follow `BOOTSTRAP.md` and use the repository CLI.
 
-The approved bootstrap also installs four Apache-2.0 portable skills and
+The approved bootstrap also installs five Apache-2.0 portable skills—
+`web-research`, `repository-diagnostics`, `small-model-evidence`,
+`tool-grounded-implementation`, and `integration-review`—plus
 `.chartermesh/AGENT-ENTRYPOINT.md`. Inspect them without model or network use:
 
 ```powershell
@@ -88,9 +93,86 @@ node bin/chartermesh.mjs bootstrap `
 ```
 
 Changed target state produces a new hash and invalidates the old approval.
-The apply journal survives process termination. `doctor` and the next plan
-command automatically recover an incomplete replacement; `recover` is also
-available as an explicit diagnostic command.
+The apply journal survives process termination. `doctor` and no-write plan
+commands report an incomplete replacement without mutating it. Use explicit
+`recover`, or resume the exact approved apply operation, after inspection.
+
+### Start from an empty project brief
+
+For a brand-new folder, `kickoff` combines bootstrap and the first requested
+WorkItem. The target directory must already exist; create it before the
+no-write preview. Put the intended service or product in a brief file:
+
+```powershell
+$Target = "C:\path\to\new-project"
+New-Item -ItemType Directory -Force -Path $Target | Out-Null
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 kickoff `
+  --target $Target `
+  --brief-file C:\path\to\project-brief.md `
+  --profile controlled `
+  --engine fake `
+  --acceptance "The implementation satisfies the approved brief and reports verification evidence." `
+  --json
+```
+
+Review the no-write response, then repeat every option and append
+`--approve PLAN_HASH`. The apply stores the immutable brief and creates one
+ready `operator` WorkItem; team setup is not counted as a model call. Use
+`controlled` when the trial should project both operator and verifier roles;
+`balanced` intentionally creates only one operator.
+
+### Project the team into Codex or Claude Code
+
+The host check starts no model call:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 host doctor `
+  --host codex --target C:\path\to\new-project --json
+```
+
+Generate and separately approve the host projection:
+
+```powershell
+npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 configure-host `
+  --host codex --target C:\path\to\new-project `
+  --allow-unrestricted-read --max-agents 4 --json
+```
+
+This creates project-local Codex roles and MCP configuration without making
+Codex's task list authoritative. Use `--host claude` for Claude Code. Both use
+the same local Control Plane through MCP, and that MCP server has no human
+approval authority. The projection-only host check reports the executable and
+CharterMesh-declared compatibility hash without starting Codex app-server; it
+is not a live feature probe. Use `host doctor --direct` only for strict
+direct-protocol compatibility.
+
+After approving and applying the host plan, close the current host session and
+start a new one from the project root. Trust the project so Codex loads
+`.codex/config.toml`. For Claude Code, approve the project MCP server once and
+inspect it with `/mcp`. Verify `chartermesh_status` and
+`chartermesh_work_next`; this post-projection health gate is mandatory, and
+pre-projection sessions are not assumed to hot-reload.
+
+Projected roles have native shell/write tools disabled. To implement, they
+submit one bounded content-addressed change set through MCP. A person reviews
+and approves its exact Decision Packet with `approve-tool`; a new claim then
+applies only the stored approved bytes through a recoverable transaction and
+records evidence. The MCP server cannot approve its own change set.
+
+For Codex only, repeat `--activate-role operator` in the preview and approved
+command if `chartermesh run` should
+invoke the experimental app-server adapter. The
+`--allow-unrestricted-read` acknowledgement already present in the host plan
+records that
+Codex's read-only sandbox does not confine reads to the project directory.
+That path can consume the user's Codex quota. A role whose writes require
+CharterMesh approval remains read-only because provider permission prompts are
+currently canceled fail-closed. Claude direct AgentHost execution is not part
+of this alpha.
+
+The `human:*` check is a policy/procedural boundary, not cryptographic proof
+against a local process that can invoke the CLI or edit SQLite. Keep approval
+decisions in a separately controlled human session.
 
 ## 4. Diagnose and exercise the offline workflow
 

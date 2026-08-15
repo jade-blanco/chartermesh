@@ -1,0 +1,11 @@
+{
+  "name": "@chartermesh/agent-host-codex",
+  "version": "0.0.9-alpha.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": "./src/index.ts"
+}

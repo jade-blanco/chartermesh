@@ -38,13 +38,18 @@ WorkItem id, tool name, and normalized JSON arguments. Only a `human:*` Control
 Plane actor may approve it.
 
 Tool evidence stores the call, input, and output hashes, status, bounded
-relative paths, duration, and attempt references. Raw arguments and raw tool
-results are passed only to the active model loop and are not copied into the
-audit ledger.
+relative paths, duration, and attempt references. Raw arguments and results are
+not copied into tool evidence or the audit projection. Exact proposed/approved
+workspace bytes are retained locally in pending approval state so a new fenced
+run can apply the same reviewed content after approval.
 
 The initial tools are non-recursive directory listing, bounded UTF-8 file
-reading, and bounded approval-gated UTF-8 file writing. Shell, network,
-package-manager, deployment, and arbitrary plugin execution remain absent.
+reading, and bounded approval-gated UTF-8 file writing. Every content write
+binds the exact prior SHA-256 or explicit absence, denies control paths, and
+uses the recoverable file transaction rather than direct truncation. Durable
+reservation and settlement prevent automatic replay when an execution outcome
+cannot be proven. Shell, network, package-manager, deployment, and arbitrary
+plugin execution remain absent.
 
 ### Recoverable file transactions
 
@@ -60,8 +65,9 @@ backups:
 - with `COMMITTED`, verify all approved hashes and finalize cleanup;
 - on an external hash conflict, preserve the journal and stop.
 
-Planning, configuring, diagnosing, and the explicit `recover` command invoke
-recovery. No-write planning remains no-write when no journal or lock exists.
+No-write planning and diagnostics report a journal or lock without mutating
+it. The explicit `recover` command performs general recovery; resuming the
+exact already-approved apply operation may recover only its bound transaction.
 
 ### Distribution
 
@@ -97,7 +103,8 @@ for the latest GitHub release.
 - Tool Runtime tests cover allowed read, exact write approval, path traversal,
   evidence, and iteration exhaustion.
 - A forced child-process exit after a file rename is recovered to the exact
-  prior state; CLI `doctor` exercises automatic recovery.
+  prior state; CLI `doctor` reports the pending journal and explicit `recover`
+  exercises recovery without making a no-write diagnostic mutating.
 - Sixteen-process tests cover contested claim and duplicate idempotency keys.
 - A held SQLite writer verifies busy-timeout behavior.
 - `pnpm pack:check` installs the tarball into a temporary consumer and performs

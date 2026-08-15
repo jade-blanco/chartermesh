@@ -44,7 +44,7 @@ try {
       const value = controlPlane.intake({
         title: "Concurrent idempotent intake",
         summary: "Every process uses one exact command key.",
-        actor: `human:process-${process.pid}`,
+        actor: "human:process-shared",
         idempotencyKey: rest[0],
       });
       console.log(JSON.stringify({ ok: true, value }));

@@ -34,7 +34,7 @@ export function openControlPlaneDatabase(
         )
         .get() as { version: number };
       const priorVersion = Number(row.version);
-      if (priorVersion > 0 && priorVersion < 12) {
+      if (priorVersion > 0 && priorVersion < 15) {
         createControlPlaneBackup(
           database,
           join(dirname(path), "backups"),
@@ -190,6 +190,7 @@ export function openControlPlaneDatabase(
     CREATE TABLE IF NOT EXISTS command_results (
       idempotency_key TEXT PRIMARY KEY,
       command TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
       response_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
@@ -572,6 +573,95 @@ export function openControlPlaneDatabase(
     .prepare(`
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (12, ?)
+    `)
+    .run(new Date().toISOString());
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS agent_host_runs (
+      id TEXT PRIMARY KEY,
+      work_item_id TEXT NOT NULL,
+      run_id TEXT NOT NULL UNIQUE,
+      attempt_id TEXT NOT NULL,
+      host_id TEXT NOT NULL,
+      host_session_id TEXT NOT NULL,
+      host_run_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      last_event_cursor TEXT,
+      error_code TEXT,
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      finished_at TEXT,
+      UNIQUE(host_id, host_run_id),
+      FOREIGN KEY(work_item_id) REFERENCES work_items(id),
+      FOREIGN KEY(run_id) REFERENCES runs(id),
+      FOREIGN KEY(attempt_id) REFERENCES attempts(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS agent_host_runs_work_idx
+      ON agent_host_runs(work_item_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS agent_host_runs_status_idx
+      ON agent_host_runs(status, updated_at);
+  `);
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (13, ?)
+    `)
+    .run(new Date().toISOString());
+  const commandResultColumns = database
+    .prepare("PRAGMA table_info(command_results)")
+    .all() as Array<{ name: string }>;
+  if (!commandResultColumns.some(({ name }) => name === "request_hash")) {
+    database.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE command_results_v14 (
+        idempotency_key TEXT PRIMARY KEY,
+        command TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO command_results_v14(
+        idempotency_key, command, request_hash, response_json, created_at
+      )
+      SELECT
+        idempotency_key, command, 'legacy-unbound-pre-v14', response_json, created_at
+      FROM command_results;
+      DROP TABLE command_results;
+      ALTER TABLE command_results_v14 RENAME TO command_results;
+      COMMIT;
+    `);
+  }
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (14, ?)
+    `)
+    .run(new Date().toISOString());
+  const pendingToolColumns = database
+    .prepare("PRAGMA table_info(pending_tool_calls)")
+    .all() as Array<{ name: string }>;
+  const addPendingToolColumn = (name: string, declaration: string): void => {
+    if (!pendingToolColumns.some((column) => column.name === name)) {
+      database.exec(
+        `ALTER TABLE pending_tool_calls ADD COLUMN ${name} ${declaration}`,
+      );
+    }
+  };
+  addPendingToolColumn("summary_json", "TEXT");
+  addPendingToolColumn("reservation_id", "TEXT");
+  addPendingToolColumn("reservation_run_id", "TEXT");
+  addPendingToolColumn("reservation_attempt_id", "TEXT");
+  addPendingToolColumn("reservation_lease_id", "TEXT");
+  addPendingToolColumn("reservation_generation", "INTEGER");
+  addPendingToolColumn("reservation_actor", "TEXT");
+  addPendingToolColumn("reserved_at", "TEXT");
+  addPendingToolColumn("evidence_id", "TEXT");
+  addPendingToolColumn("effect_hash", "TEXT");
+  addPendingToolColumn("outcome_message", "TEXT");
+  database
+    .prepare(`
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+      VALUES (15, ?)
     `)
     .run(new Date().toISOString());
   return database;

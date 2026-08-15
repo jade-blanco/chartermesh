@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  renameSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -32,8 +38,32 @@ function initializedTarget(): string {
     join(state, "organization.json"),
     `${JSON.stringify(createProposal(target, "balanced").organization, null, 2)}\n`,
   );
+  const database = openControlPlaneDatabase(join(state, "state.db"));
+  database.close();
   return target;
 }
+
+test("dashboard refuses a linked CharterMesh state directory", async (context) => {
+  const target = initializedTarget();
+  const outside = mkdtempSync(join(tmpdir(), "chartermesh-dashboard-linked-"));
+  const state = join(target, ".chartermesh");
+  const moved = join(outside, "state");
+  renameSync(state, moved);
+  try {
+    symlinkSync(moved, state, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES") {
+      context.skip("The platform does not permit creating a test link.");
+      return;
+    }
+    throw error;
+  }
+  await assert.rejects(
+    startDashboard({ target, port: 0, quiet: true }),
+    /PROJECT_STATE_LINK_REJECTED/u,
+  );
+});
 
 test("dashboard serves one projection and protects mutations", async () => {
   const dashboard = await startDashboard({
@@ -241,6 +271,10 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
     id: item.id,
     runId: claim.runId,
     attemptId: claim.attemptId,
+    leaseId: claim.leaseId,
+    generation: claim.generation,
+    leaseId: claim.leaseId,
+    generation: claim.generation,
     callHash,
     toolName: "workspace.write_file",
     arguments: {
@@ -249,6 +283,7 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
     },
     createdAt: new Date().toISOString(),
     actor: "runner:test",
+    idempotencyKey: "dashboard-tool-pending",
   });
   const deniedItem = controlPlane.intake({
     title: "Reject an exact tool call",
@@ -273,11 +308,16 @@ test("dashboard exposes and approves exact pending tool arguments", async () => 
     id: deniedItem.id,
     runId: deniedClaim.runId,
     attemptId: deniedClaim.attemptId,
+    leaseId: deniedClaim.leaseId,
+    generation: deniedClaim.generation,
+    leaseId: deniedClaim.leaseId,
+    generation: deniedClaim.generation,
     callHash: deniedCallHash,
     toolName: "workspace.write_file",
     arguments: { path: "denied.mjs", content: "export const denied = true;\n" },
     createdAt: new Date().toISOString(),
     actor: "runner:test",
+    idempotencyKey: "dashboard-tool-denied-pending",
   });
   database.close();
 

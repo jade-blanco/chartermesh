@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
+  readdirSync,
+  renameSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +24,7 @@ import {
   ToolEvidenceCommitError,
   ToolIterationLimitError,
   createWorkspaceToolRuntime,
+  hashBoundedRegularFile,
   toolCallHash,
 } from "../src/index.ts";
 
@@ -126,12 +132,127 @@ test("tool loop executes an allowed read and records hash-only evidence", async 
   );
 });
 
+test("workspace reads stream complete hashes while bounding file and directory materialization", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-bounded-read-"));
+  const large = "x".repeat(2 * 1024 * 1024);
+  writeFileSync(join(workspace, "large.txt"), large);
+  const many = join(workspace, "many");
+  mkdirSync(many);
+  for (let index = 0; index < 250; index += 1) {
+    writeFileSync(join(many, `${String(index).padStart(3, "0")}.txt`), "x");
+  }
+  const runtime = createWorkspaceToolRuntime({
+    workspaceRoot: workspace,
+    workItemId: "work-bounded-read",
+    policy: {
+      allow: ["workspace.read_file", "workspace.list_files"],
+      workspaceRoots: ["."],
+      maxIterations: 2,
+    },
+  });
+  const read = await runtime.executeApprovedCall({
+    id: "read-large",
+    name: "workspace.read_file",
+    arguments: { path: "large.txt", maxBytes: 64 },
+  });
+  const readOutput = JSON.parse(read.output) as {
+    truncated: boolean;
+    content: string;
+    sha256: string;
+  };
+  assert.equal(readOutput.truncated, true);
+  assert.equal(Buffer.byteLength(readOutput.content, "utf8"), 64);
+  assert.equal(
+    readOutput.sha256,
+    createHash("sha256").update(large).digest("hex"),
+  );
+  const listed = await runtime.executeApprovedCall({
+    id: "list-bounded",
+    name: "workspace.list_files",
+    arguments: { path: "many", maxEntries: 5 },
+  });
+  assert.equal(
+    (JSON.parse(listed.output) as { entries: unknown[] }).entries.length,
+    5,
+  );
+});
+
+test("workspace reads reject symlink and junction ancestors", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-linked-read-"));
+  const outside = mkdtempSync(join(tmpdir(), "chartermesh-tools-linked-outside-"));
+  writeFileSync(join(outside, "secret.txt"), "must stay outside\n");
+  const linked = join(workspace, "linked");
+  symlinkSync(
+    outside,
+    linked,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const runtime = createWorkspaceToolRuntime({
+    workspaceRoot: workspace,
+    workItemId: "work-linked-read",
+    policy: {
+      allow: ["workspace.read_file", "workspace.list_files"],
+      workspaceRoots: ["."],
+      maxIterations: 2,
+    },
+  });
+
+  await assert.rejects(
+    runtime.executeApprovedCall({
+      id: "read-linked-file",
+      name: "workspace.read_file",
+      arguments: { path: "linked/secret.txt" },
+    }),
+    /outside OrgSpec workspaceRoots|Symbolic-link/u,
+  );
+  await assert.rejects(
+    runtime.executeApprovedCall({
+      id: "list-linked-directory",
+      name: "workspace.list_files",
+      arguments: { path: "linked" },
+    }),
+    /outside OrgSpec workspaceRoots|Symbolic-link/u,
+  );
+});
+
+test("bounded descriptor hashing rejects oversized and replaced paths", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-hash-race-"));
+  const outside = mkdtempSync(join(tmpdir(), "chartermesh-tools-hash-outside-"));
+  const inside = join(workspace, "inside");
+  mkdirSync(inside);
+  const target = join(inside, "state.txt");
+  writeFileSync(target, "approved prestate\n");
+  const expectedCanonical = realpathSync.native(target);
+
+  writeFileSync(target, "x".repeat(1_025));
+  assert.throws(
+    () => hashBoundedRegularFile(target, expectedCanonical, 1_024),
+    /REGULAR_FILE_SIZE_LIMIT/u,
+  );
+
+  writeFileSync(join(outside, "state.txt"), "outside secret\n");
+  renameSync(inside, join(workspace, "original-inside"));
+  symlinkSync(
+    outside,
+    inside,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  assert.throws(
+    () => hashBoundedRegularFile(target, expectedCanonical, 1_024),
+    /WORKSPACE_PATH_RACE/u,
+  );
+});
+
 test("workspace writes require an exact human-approved call hash", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-write-"));
   const call = {
     id: "call-write",
     name: "workspace.write_file",
-    arguments: { path: "output.txt", content: "approved content\n" },
+    arguments: {
+      path: "output.txt",
+      content: "approved content\n",
+      beforeSha256: null,
+    },
   };
   const engine = (): ModelEngine => {
     let calls = 0;
@@ -170,6 +291,19 @@ test("workspace writes require an exact human-approved call hash", async () => {
     },
   );
   assert.deepEqual(pendingError?.call.arguments, call.arguments);
+  assert.deepEqual(pendingError?.summary, {
+    title: "Workspace file creation",
+    changeCount: 1,
+    totalBytes: Buffer.byteLength("approved content\n", "utf8"),
+    changes: [{
+      path: "output.txt",
+      beforeSha256: null,
+      afterSha256: createHash("sha256")
+        .update("approved content\n")
+        .digest("hex"),
+      byteSize: Buffer.byteLength("approved content\n", "utf8"),
+    }],
+  });
   assert.equal(existsSync(join(workspace, "output.txt")), false);
 
   const approved = createWorkspaceToolRuntime({
@@ -188,7 +322,11 @@ test("workspace writes require an exact human-approved call hash", async () => {
 
   const replayCall = {
     ...call,
-    arguments: { path: "replayed.txt", content: "durable replay\n" },
+    arguments: {
+      path: "replayed.txt",
+      content: "durable replay\n",
+      beforeSha256: null,
+    },
   };
   const replayHash = toolCallHash("work-write", replayCall);
   const replay = createWorkspaceToolRuntime({
@@ -205,6 +343,112 @@ test("workspace writes require an exact human-approved call hash", async () => {
     readFileSync(join(workspace, "replayed.txt"), "utf8"),
     "durable replay\n",
   );
+  assert.equal(
+    readdirSync(join(workspace, ".chartermesh", ".transactions")).length,
+    0,
+  );
+});
+
+test("content writes bind prestate and reject coding-host control paths before approval", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "chartermesh-tools-prestate-"));
+  const policy = {
+    allow: ["workspace.write_file"],
+    approvalRequired: ["workspace.write_file"],
+    workspaceRoots: ["."],
+    maxIterations: 2,
+  };
+  const runtime = createWorkspaceToolRuntime({
+    workspaceRoot: workspace,
+    workItemId: "work-prestate",
+    policy,
+    isApproved: () => true,
+  });
+  await assert.rejects(
+    runtime.executeApprovedCall({
+      id: "missing-prestate",
+      name: "workspace.write_file",
+      arguments: { path: "missing.txt", content: "unsafe\n" },
+    }),
+    /TOOL_ARGUMENTS_INVALID.*beforeSha256/u,
+  );
+  const protectedPaths = [
+    "nested/.git/config",
+    "nested/.chartermesh/state.db",
+    "nested/.codex/settings.json",
+    "nested/.claude/settings.json",
+    "nested/AGENTS.md",
+    "nested/file.txt:stream",
+    "nested/CON.txt",
+    "nested/trailing.",
+  ];
+  if (process.platform === "win32") {
+    mkdirSync(join(workspace, "short", ".git"), { recursive: true });
+    writeFileSync(join(workspace, "short", ".git", "config"), "protected\n");
+    if (existsSync(join(workspace, "short", "GIT~1"))) {
+      const aliasPath = "short/GIT~1/config";
+      const gated = createWorkspaceToolRuntime({
+        workspaceRoot: workspace,
+        workItemId: "work-prestate-alias",
+        policy,
+      });
+      await assert.rejects(
+        gated.executeApprovedCall({
+          id: "protected-alias-before-approval",
+          name: "workspace.write_file",
+          arguments: {
+            path: aliasPath,
+            content: "denied\n",
+            beforeSha256: createHash("sha256")
+              .update("protected\n")
+              .digest("hex"),
+          },
+        }),
+        /TOOL_PRECONDITION_FAILED.*WORKSPACE_CONTROL_PATH_DENIED/u,
+      );
+      protectedPaths.push(aliasPath);
+    }
+  }
+  for (const [index, path] of protectedPaths.entries()) {
+    await assert.rejects(
+      runtime.executeApprovedCall({
+        id: `protected-${index}`,
+        name: "workspace.write_file",
+        arguments: { path, content: "denied\n", beforeSha256: null },
+      }),
+      /(?:TOOL_ARGUMENTS_INVALID|TOOL_EXECUTION_FAILED).*WORKSPACE_(?:CONTROL_)?PATH_DENIED/u,
+      path,
+    );
+  }
+
+  const target = join(workspace, "existing.txt");
+  writeFileSync(target, "before\n");
+  const stale = "0".repeat(64);
+  await assert.rejects(
+    runtime.executeApprovedCall({
+      id: "stale-content",
+      name: "workspace.write_file",
+      arguments: {
+        path: "existing.txt",
+        content: "after\n",
+        beforeSha256: stale,
+      },
+    }),
+    /TOOL_EXECUTION_FAILED.*Target changed after planning/u,
+  );
+  assert.equal(readFileSync(target, "utf8"), "before\n");
+
+  const beforeSha256 = createHash("sha256").update("before\n").digest("hex");
+  const applied = await runtime.executeApprovedCall({
+    id: "exact-content",
+    name: "workspace.write_file",
+    arguments: {
+      path: "existing.txt",
+      content: "after\n",
+      beforeSha256,
+    },
+  });
+  assert.equal(applied.evidence.status, "succeeded");
+  assert.equal(readFileSync(target, "utf8"), "after\n");
 });
 
 test("a post-execution evidence failure is outcome-unknown and never reclassified", async () => {
@@ -212,7 +456,11 @@ test("a post-execution evidence failure is outcome-unknown and never reclassifie
   const call = {
     id: "call-outcome-unknown",
     name: "workspace.write_file",
-    arguments: { path: "result.txt", content: "written once\n" },
+    arguments: {
+      path: "result.txt",
+      content: "written once\n",
+      beforeSha256: null,
+    },
   };
   let evidenceCallbacks = 0;
   const runtime = createWorkspaceToolRuntime({
