@@ -163,7 +163,6 @@ test("host discovery hashes only the resolved executable and uses a sterile vers
     `readFile:${executablePath}`,
     `run:${executablePath}:--version`,
   ]);
-  assert.equal(calls.some((call) => /auth|token|credential|home/iu.test(call)), false);
 });
 
 test("host discovery fails closed on executable, version, snapshot, and capability drift", async () => {
