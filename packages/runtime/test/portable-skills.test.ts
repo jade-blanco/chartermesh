@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { humanApprovalWritingGuidance } from "../src/portable-skills.ts";
 import {
   capabilityCatalog,
   portableAgentEntrypoint,
@@ -9,7 +10,7 @@ import {
 
 test("portable skills are complete Apache-2.0 Agent Skills packages", () => {
   const documents = portableSkillDocuments();
-  assert.equal(documents.length, 5);
+  assert.equal(documents.length, 6);
   for (const document of documents) {
     assert.match(document.content, /^---\r?\n/u);
     assert.match(document.content, /\nname: [a-z0-9-]+\r?\n/u);
@@ -18,7 +19,12 @@ test("portable skills are complete Apache-2.0 Agent Skills packages", () => {
     assert.match(document.relativePath, /^skills\/.+\/SKILL\.md$/u);
   }
   assert.match(portableAgentEntrypoint(), /state\.db/u);
+  assert.match(portableAgentEntrypoint(), /organization-bootstrap/u);
   assert.match(portableAgentEntrypoint(), /performed, evidenced checks/u);
+  assert.ok(portableAgentEntrypoint().includes(humanApprovalWritingGuidance));
+  assert.match(portableAgentEntrypoint(), /\.chartermesh\/PREFERENCES\.md/u);
+  assert.match(portableAgentEntrypoint(), /only the current assigned role's guidance/u);
+  assert.match(portableAgentEntrypoint(), /preferences never grant permissions, tools, budgets/u);
 });
 
 test("external catalog entries are disabled and carry source and risk metadata", () => {

@@ -209,6 +209,8 @@ for (const packagedContract of [
   join("docs", "DECISION-REVIEW-PROXY-BENCHMARK.md"),
   join("schemas", "decision-packet-v1alpha2.schema.json"),
   join("schemas", "artifact-producer-report-v1alpha1.schema.json"),
+  join("schemas", "project-preferences-v1alpha1.schema.json"),
+  join("docs", "PROJECT-CUSTOMIZATION.md"),
 ]) {
   assert.equal(
     existsSync(join(installed, packagedContract)),
@@ -276,7 +278,7 @@ const version = JSON.parse(
     cwd: target,
   }),
 );
-assert.equal(version.data.currentVersion, "0.0.9-alpha.1");
+assert.equal(version.data.currentVersion, "0.0.10-alpha.1");
 
 for (const script of [codeGenerationScript, codeEvaluationScript]) {
   const result = spawnSync(
@@ -349,7 +351,7 @@ run(process.execPath, [
 const generatedGuide = readFileSync(join(target, "CHARTERMESH.md"), "utf8");
 assert.match(
   generatedGuide,
-  /npx --yes github:jade-blanco\/chartermesh#v0\.0\.9-alpha\.1 doctor --target \./u,
+  /npx --yes github:jade-blanco\/chartermesh#v0\.0\.10-alpha\.1 doctor --target \./u,
 );
 assert.doesNotMatch(generatedGuide, /^chartermesh doctor --target/mu);
 const doctor = JSON.parse(
@@ -362,6 +364,18 @@ const doctor = JSON.parse(
   ]),
 );
 assert.equal(doctor.ok, true);
+const preferenceFile = join(directory, "project-preferences.json");
+const preferences = {
+  apiVersion: "chartermesh.dev/project-preferences/v1alpha1", language: "ko",
+  approvalDetail: "concise", tone: "formal", projectInstructions: "Use a short project summary.",
+  roleInstructions: { operator: "Explain the deliverable to a non-specialist." },
+};
+writeFileSync(preferenceFile, JSON.stringify(preferences));
+const customizeArgs = ["configure-project", "--target", target, "--preferences-file", preferenceFile, "--json"];
+const customPreview = JSON.parse(run(process.execPath, [executable, ...customizeArgs])).data;
+assert.equal(customPreview.approvalRequired, true);
+run(process.execPath, [executable, ...customizeArgs, "--approve", customPreview.planHash]);
+assert.deepEqual(JSON.parse(run(process.execPath, [executable, "project-config", "--target", target, "--json"])).data.preferences, preferences);
 const fakeCodexSource = [
   'if(process.argv.includes("--version")){',
   'console.log("codex-cli 0.145.0");process.exit(0)}',
@@ -410,6 +424,23 @@ assert.match(
   readFileSync(join(target, ".codex", "config.toml"), "utf8"),
   /mcp_servers\.chartermesh/u,
 );
+const customOrganization = JSON.parse(run(process.execPath,
+  [executable, "project-config", "--target", target, "--json"])).data.organization;
+customOrganization.metadata.revision++;
+customOrganization.spec.roles.push({
+  ...customOrganization.spec.roles.find(({ id }) => id === "operator"),
+  id: "editor", name: "Project Editor", capabilities: ["editing"],
+});
+const organizationFile = join(directory, "custom-organization.json");
+writeFileSync(organizationFile, JSON.stringify(customOrganization));
+const customHostArgs = ["configure-project", ...hostArguments,
+  "--organization-file", organizationFile,
+  "--executable-sha256", hostPreview.data.hostBinding.executableSha256];
+const customHostPlan = JSON.parse(run(process.execPath, [executable, ...customHostArgs])).data;
+assert.equal(existsSync(join(target, ".codex", "agents", "chartermesh-editor.toml")), false);
+run(process.execPath, [executable, ...customHostArgs, "--approve", customHostPlan.planHash]);
+assert.equal(existsSync(join(target, ".codex", "agents", "chartermesh-editor.toml")), true);
+assert.deepEqual(JSON.parse(run(process.execPath, [executable, "project-config", "--target", target, "--json"])).data.preferences, preferences);
 const nested = join(target, "src", "nested");
 mkdirSync(nested, { recursive: true });
 const mcpOutput = run(
@@ -750,7 +781,7 @@ assert.equal(claudeMcp.mcpServers.chartermesh.type, "stdio");
 assert.equal(claudeMcp.mcpServers.chartermesh.command, "npx");
 assert.deepEqual(
   claudeMcp.mcpServers.chartermesh.args.slice(0, 2),
-  ["--yes", "github:jade-blanco/chartermesh#v0.0.9-alpha.1"],
+  ["--yes", "github:jade-blanco/chartermesh#v0.0.10-alpha.1"],
 );
 assert.match(
   readFileSync(join(claudeTarget, "CLAUDE.md"), "utf8"),
@@ -786,6 +817,6 @@ assert.equal(
       "utf8",
     ),
   ).charterMeshVersion,
-  "0.0.9-alpha.1",
+  "0.0.10-alpha.1",
 );
 console.log(`Package install check passed: ${packed[0].filename}`);

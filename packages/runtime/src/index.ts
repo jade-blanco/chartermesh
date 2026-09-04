@@ -122,3 +122,11 @@ export {
   resolveProjectStatePaths,
   type ProjectStatePaths,
 } from "./project-state.ts";
+export {
+  ProjectPreferencesParseError,
+  defaultProjectPreferences,
+  parseProjectPreferences,
+  readProjectPreferences,
+  renderProjectPreferences,
+  type ProjectPreferences,
+} from "./project-preferences.ts";

@@ -6,7 +6,7 @@
 
 상태: **신규 독립 프로젝트용 제품·아키텍처 설계 기준**
 
-개정 상태: **2026-08-02 검증 가능한 Decision Packet 운영 계층 반영**
+개정 상태: **2026-09-05 승인된 프로젝트 맞춤 설정·거래 복구·세션 정책 갱신 반영**
 
 > 이 문서의 최초안 이후 Codex와 Claude Code의 네이티브 협업 기능이
 > 확장되었고, 제품은 특정 LLM이나 agent host에 의존하지 않는 방향으로
@@ -39,6 +39,80 @@ CharterMesh의 우선 제품 목적은 “AI가 회사를 사람 없이 자율 �
 `changes_requested`는 사람이 이미 결정을 끝낸 뒤 실행팀이 보완할 작업이다.
 사람 대기열의 첫 항목은 cursor-bounded 최신 작업 페이지와 독립적으로
 전역 투영한다.
+
+### 사람 승인 문서의 기본 언어: ELI5
+
+사람에게 승인을 요청하는 모든 문서는 ELI5를 기본으로 한다. 이는 유아 말투가
+아니라 관련 지식이 없는 성인도 판단할 수 있는 쉬운 설명이다. 사용자의 언어로
+작성하고, 불가피한 전문 용어는 처음 나올 때 짧게 풀어 쓴다. 조직·설정·복구
+계획, 산출물 검토, 도구 실행 요청과 사용자 입력 요청에 같은 원칙을 적용한다.
+프로젝트가 명시적으로 승인한 `concise` 또는 `technical` 설명 수준과 언어·말투는
+이 기본값보다 우선할 수 있다. 어떤 표현 설정도 위험·미확인 사항·검증 상태나
+정확한 승인 식별자를 생략할 근거는 아니다.
+
+쉬운 설명을 먼저, 확인 가능한 기술 상세를 뒤에 둔다. 앞부분은 무엇을 왜
+제안하는지, 승인하면 실제로 무엇이 달라지는지와 달라지지 않는지, 영향 범위,
+위험·비용·미확인 사항, 거절·수정 요청의 실제 효과, 복구 방법과 한계를 다룬다.
+뒤에는 정확한 대상·범위·해시·명령·근거와 원문을 보존한다. 설명을 쉽게 고쳐도
+`claimed`를 `verified`로 올리지 않고, 모르는 비용을 0으로 쓰거나 검증되지 않은
+복구를 보장하지 않는다. 산출물 수락은 외부 실행 승인과 다르다.
+
+이 원칙은 작성자 지침, portable agent entrypoint, host 역할·안내와 builtin
+runner 프롬프트로 전달한다. 자동 승인 화면의 쉬운 안내는 모델 호출 없는
+결정론적 projection이다. 원문 제작자 보고서를 자동 번역하거나 자연어 이해도와
+품질을 강제 검증하지 않는다. 검증 상태, 실제 승인 효과와 정확한 식별자는
+기존 기록으로 확인하며, 설명 자체는 새 권한·승인·원장이 아니다. OrgSpec,
+Decision Packet 스키마와 기존 승인 정책은 변경하지 않는다. 결정 근거는
+[ADR 0024](adr/0024-plain-language-approval.md)에 기록한다.
+
+### 승인된 프로젝트 맞춤 설정
+
+총괄팀은 프로젝트에 맞는 지침·역할·업무 흐름을 자유롭게 제안할 수 있지만,
+자기 제안을 승인하거나 새 권한을 얻을 수 없다. `project-config`는 현재 조직,
+표현 설정과 맞춤 설정 표식을 읽는다. `configure-project`는 대상에 쓰지 않는
+계획을 만들며, 사람이 그 정확한 해시를 승인한 뒤 동일한 옵션과 `--approve`로
+적용한다. 모델 학습이나 무인 자기 최적화 기능이 아니다.
+
+`chartermesh.dev/project-preferences/v1alpha1`은 `apiVersion`,
+`language: auto|ko|en`, `approvalDetail: eli5|concise|technical`,
+`tone: plain|formal`, `projectInstructions`, 역할 ID별 `roleInstructions`를
+갖는다. 기본은 `auto`·`eli5`·`plain`과 빈 지침이다. 승인된
+`.chartermesh/preferences.json`이 설정 계약이며 `PREFERENCES.md`와 생성
+에이전트 안내는 읽기용 투영이다. 표현 지침은 권한 정책도 작업 원장도 아니며,
+과거 산출물 번역이나 모델의 문장 품질을 보장하지 않는다.
+Decision Packet 화면에는 언어·설명 수준을 적용하되 정확한 packet은 바꾸지
+않는다. `auto`는 CLI 영어·대시보드 한국어이며, bootstrap·설정·평가 계획의
+CLI 안내는 현재 영어 ELI5로 고정한다. 말투와 자유 지침은 모델용 지침이지
+모든 고정 UI 문구를 다시 쓰는 기능이 아니다.
+
+조직 후보는 같은 `metadata.id`와 정확히 다음 `metadata.revision`의 완전한
+OrgSpec이어야 한다. 역할·분장·의존 그래프·허용 도구를 바꿀 수 있지만 기존
+승인 정책을 완화할 수 없고, 현재 실행 대상·capability·orchestration 설정을
+재사용한다. 엔진·호스트 연결과 일정 변경은 별도 설정 경로를 유지한다.
+proposed·paused를 포함한 모든 기존 일정이 참조하는 역할·workflow 정의는
+표시 이름 외 구조를 변경할 수 없다. `team-design.json`은 현재 승인된 역할과
+workflow를 `source: approved_custom_orgspec`으로 투영하여 템플릿과 구분한다.
+실행 중인 Run 또는 `in_progress` 작업이 있으면 변경을 차단한다. 나머지
+미완료 작업의 역할·실행 대상은 계속 유효해야 하며 관련 작업 상태 해시를
+계획에 결박해 적용 직전 다시 확인한다.
+
+기존 native 투영 갱신은 단일 Codex 또는 Claude에 한하며 실행 파일 해시를
+재검증한다. Codex는 별도 호스트 읽기 범위 확인이 필요하다. 다중 호스트는
+부분 갱신하지 않고 거부하며, 삭제된 역할 문서는 폐기된 역할임을 표시한다.
+적용 뒤 새 호스트 세션과 MCP 확인이 필요하다. 맞춤 설정 표식이 생기면 일반
+bootstrap 덮어쓰기를 차단하고, 이후 변경은 새 맞춤 설정 계획으로 한다.
+기존 저장된 preferences는 bootstrap/kickoff 및 연결 변경에서 보존한다.
+계약과 절차는 [ADR 0025](adr/0025-project-customization.md),
+[프로젝트 맞춤 설정](PROJECT-CUSTOMIZATION.md)에 기록한다.
+
+파일 교체 전 pending 표식과 정확한 승인 계획을 Control Plane metadata에
+하나의 트랜잭션으로 저장한다. 중단 뒤에도 작업 변경을 차단하며 같은 승인
+계획을 재개해야 한다. 사라지거나 바뀐 후보 파일에서 승인을 재구성하지 않는다.
+조직 정책이 달라지면 이전 snapshot을 가진 MCP·대시보드 세션의 변경 요청을
+거부하고 새 세션을 요구한다. 읽기 전용 조회와 preferences만의 읽기 갱신은
+유지한다. 후보 없는 승인된 `configure-project` 갱신은 현재 조직·선호 설정과
+사용자가 쓴 관련 없는 문구를 보존하면서 설치 버전과 관리 문서의 명령 참조를
+갱신한다. 기존 취향을 기본 bootstrap으로 덮어쓰는 재설정 경로가 아니다.
 
 ### Decision Packet v1alpha2
 
@@ -2036,3 +2110,39 @@ boundary:
   bindings. The seed controls task and condition order only; provider-default
   sampling and unshared orientations mean feedback-policy deltas remain
   exploratory until a shared-orientation design is implemented.
+
+# Project-type-aware one-plan onboarding amendment — 2026-08-29
+
+ADR 0023 defines the fresh-project experience as one reviewable team setup,
+not merely a generic worker configuration:
+
+- The `organization-bootstrap` skill selects one explicit provider-neutral
+  team template from the project goal. The CLI accepts `general`,
+  `software-product`, `research`, `content-production`, `data-analysis`, or
+  `operations`; it does not silently turn arbitrary brief text into authority.
+- The earlier three-alternative interview default is narrowed: show concise
+  alternatives only when the choice materially changes authority, cost, or
+  review. Otherwise select and explain a defensible default so setup remains a
+  one-request flow.
+- The operating profile is independent of the project type. Lean uses one
+  operator, balanced separates coordination and production, and controlled
+  adds an independent verifier before human review.
+- `kickoff` defaults to the sanitized general template when no explicit
+  template is supplied. Its one exact plan includes the Organization,
+  machine-readable team design, immutable brief, first WorkItem,
+  `.chartermesh/TEAM-CHARTER.md`, work rules, copy/paste inter-team packets,
+  and exact-hash human approval matrix.
+- `kickoff --host codex|claude` may project project roles and the local MCP
+  bridge in that same plan. The host binding is re-attested at apply and the
+  user must start a new host session afterward. Separate `configure-host`
+  remains available for later changes and direct Codex activation.
+- Declared OrgSpec stages are allocation contracts, not proof of automatic
+  agent calls or workflow progression. Before compatible host projection,
+  handoffs are explicitly copy/paste. Host projection still does not bind
+  declared stages to separate WorkItems: kickoff creates one entry-role item,
+  and other roles are bounded read-only consultations unless separately
+  assigned. The Control Plane remains the sole mutable WorkItem and approval
+  ledger.
+- Bootstrap now carries six Apache-2.0 provider-neutral skills. None of these
+  files grants tools, connects an account, starts a model, or satisfies a human
+  approval gate.

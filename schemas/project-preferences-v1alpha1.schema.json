@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:chartermesh:schema:project-preferences:v1alpha1",
+  "title": "CharterMesh advisory project preferences v1alpha1",
+  "description": "Presentation and bounded project/role guidance only. Does not grant permissions, tools, budgets, or approval authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "language",
+    "approvalDetail",
+    "tone",
+    "projectInstructions",
+    "roleInstructions"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "chartermesh.dev/project-preferences/v1alpha1"
+    },
+    "language": { "enum": ["auto", "ko", "en"], "default": "auto" },
+    "approvalDetail": {
+      "enum": ["eli5", "concise", "technical"],
+      "default": "eli5"
+    },
+    "tone": { "enum": ["plain", "formal"], "default": "plain" },
+    "projectInstructions": { "$ref": "#/$defs/instructions" },
+    "roleInstructions": {
+      "type": "object",
+      "maxProperties": 50,
+      "propertyNames": {
+        "type": "string",
+        "maxLength": 64,
+        "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/instructions" },
+      "default": {}
+    }
+  },
+  "$defs": {
+    "instructions": {
+      "type": "string",
+      "maxLength": 4000,
+      "pattern": "^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]*$",
+      "default": ""
+    }
+  }
+}

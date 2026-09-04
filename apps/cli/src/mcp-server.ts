@@ -9,6 +9,7 @@ import { createInterface } from "node:readline";
 import type { DatabaseSync } from "node:sqlite";
 import {
   ControlPlane,
+  assertMaintenanceInactive,
   normalizeArtifactProducerReport,
   openControlPlaneDatabase,
   type ArtifactProducerReport,
@@ -38,13 +39,22 @@ const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set([
   "2024-11-05",
 ]);
 const MCP_SERVER_NAME = "chartermesh-control-plane";
-const MCP_SERVER_VERSION = "0.0.9-alpha.1";
+const MCP_SERVER_VERSION = "0.0.10-alpha.1";
 const MCP_RESULT_VERSION = "chartermesh.dev/mcp-result/v1alpha1";
 const MAX_REQUEST_BYTES = 7_500_000;
 const MAX_ARTIFACT_INPUT_BYTES = 1_000_000;
 const MAX_ARTIFACT_RESPONSE_BYTES = 256_000;
 const MAX_WORKSPACE_CHANGE_SET_BYTES = 1_048_576;
 const MAX_WORKSPACE_CHANGE_COUNT = 50;
+const READ_ONLY_MCP_TOOLS = new Set([
+  "chartermesh_status",
+  "chartermesh_work_list",
+  "chartermesh_work_next",
+  "chartermesh_work_show",
+  "chartermesh_decision_show",
+  "chartermesh_artifact_show",
+  "chartermesh_run_show",
+]);
 
 type JsonRpcId = string | number | null;
 
@@ -89,6 +99,7 @@ interface HandlerOptions {
   allowedExecutionTargets?: string[];
   workspaceRoot?: string;
   rolePolicies?: Readonly<Record<string, ToolPolicy>>;
+  beforeMutation?: () => void;
 }
 
 interface OpenBridgeOptions {
@@ -2083,6 +2094,7 @@ export function createControlPlaneMcpHandler(
             pattern: /^[A-Za-z0-9_-]+$/u,
           });
           try {
+            if (!READ_ONLY_MCP_TOOLS.has(name)) options.beforeMutation?.();
             const execution = executeTool(
               options.controlPlane,
               actor,
@@ -2139,9 +2151,26 @@ export function openControlPlaneMcpBridge(
   const stateDirectory = state.root;
   let budgets: ReturnType<typeof parseOrgSpec>["spec"]["budgets"] | undefined;
   let organization: ReturnType<typeof parseOrgSpec> | undefined;
-  organization = parseOrgSpec(
-    readBoundedRegularText(state.organization, { maxBytes: 2 * 1024 * 1024 }),
-  );
+  const organizationText = readBoundedRegularText(state.organization, {
+    maxBytes: 2 * 1024 * 1024,
+  });
+  organization = parseOrgSpec(organizationText);
+  const organizationHash = sha256(organizationText);
+  const beforeMutation = (): void => {
+    assertMaintenanceInactive(stateDirectory);
+    try {
+      assertNoLinkedPathComponents(state.organization);
+      const current = hashBoundedRegularFile(
+        state.organization,
+        realpathSync.native(state.organization),
+        2 * 1024 * 1024,
+      );
+      if (current.sha256 === organizationHash) return;
+    } catch (cause) {
+      throw new Error("PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED", { cause });
+    }
+    throw new Error("PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED");
+  };
   budgets = organization.spec.budgets;
   if (
     (options.allowedRoles?.length || options.allowedExecutionTargets?.length) &&
@@ -2174,7 +2203,13 @@ export function openControlPlaneMcpBridge(
     const controlPlane = new ControlPlane(
       database,
       state.artifacts,
-      { budgets, maintenanceDirectory: stateDirectory },
+      {
+        budgets,
+        maintenanceDirectory: stateDirectory,
+        // Recheck after the Control Plane holds its database write lock. A
+        // configure-project operation cannot race cached budgets/role policy.
+        beforeMutation,
+      },
     );
     const handler = createControlPlaneMcpHandler({
       controlPlane,
@@ -2185,6 +2220,9 @@ export function openControlPlaneMcpBridge(
       rolePolicies: Object.fromEntries(
         organization?.spec.roles.map(({ id, tools }) => [id, tools]) ?? [],
       ),
+      // Reject before inspecting workspace changes as well as at each durable
+      // mutation. Read-only tools remain usable to inspect the old session.
+      beforeMutation,
     });
     return {
       target,

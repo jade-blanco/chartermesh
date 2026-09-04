@@ -14,6 +14,7 @@ export {
   type ControlPlaneBackupManifest,
 } from "./backup.ts";
 export { ControlPlane } from "./service.ts";
+export { projectApprovalExplanation } from "./approval-explanation.ts";
 export {
   buildDecisionPacket,
   canonicalHash,

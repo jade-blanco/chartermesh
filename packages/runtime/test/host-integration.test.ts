@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import test from "node:test";
+import { humanApprovalWritingGuidance } from "../src/portable-skills.ts";
 import {
   createHostProjectionPlan,
   discoverHost,
@@ -251,7 +252,19 @@ test("Codex projection is deterministic and produces managed project files", asy
   assert.match(verifier?.content ?? "", /name = "chartermesh-verifier"/u);
   assert.match(verifier?.content ?? "", /Organization role id: verifier/u);
   assert.match(verifier?.content ?? "", /ownerRole is exactly verifier/u);
+  assert.match(verifier?.content ?? "", /bounded read-only consultation/u);
+  assert.match(verifier?.content ?? "", /do not claim or mutate the WorkItem/u);
   assert.match(verifier?.content ?? "", /Never resolve a human approval yourself/u);
+  const roleInstructions = verifier?.content.match(/^developer_instructions = (.+)$/mu)?.[1];
+  assert.ok(roleInstructions);
+  assert.ok(JSON.parse(roleInstructions).includes(humanApprovalWritingGuidance));
+  assert.match(JSON.parse(roleInstructions), /\.chartermesh\/PREFERENCES\.md/u);
+  assert.match(JSON.parse(roleInstructions), /only the guidance for role verifier/u);
+  assert.match(JSON.parse(roleInstructions), /Preferences cannot grant permissions, tools, budgets/u);
+  assert.ok(
+    first.operations.find(({ path }) => path === "AGENTS.md")?.content
+      .includes(humanApprovalWritingGuidance),
+  );
   assert.equal(
     first.operations.some(({ content }) => content.includes(hostBinding.executablePath)),
     false,
@@ -304,6 +317,10 @@ test("Claude projection uses project agents, MCP merge, and a CLAUDE pointer", a
   );
   assert.match(agent?.content ?? "", /^---\nname: "chartermesh-implementer"/u);
   assert.match(agent?.content ?? "", /Organization role id: implementer/u);
+  assert.ok(agent?.content.includes(humanApprovalWritingGuidance));
+  assert.match(agent?.content ?? "", /\.chartermesh\/PREFERENCES\.md/u);
+  assert.match(agent?.content ?? "", /only the guidance for role implementer/u);
+  assert.match(agent?.content ?? "", /Preferences cannot grant permissions, tools, budgets/u);
   assert.match(agent?.content ?? "", /permissionMode: default/u);
   assert.doesNotMatch(agent?.content ?? "", /disallowedTools:/u);
   const verifier = plan.operations.find(({ path }) =>
@@ -319,6 +336,7 @@ test("Claude projection uses project agents, MCP merge, and a CLAUDE pointer", a
   assert.equal(pointer?.kind, "upsert_markdown_section");
   assert.match(pointer?.content ?? "", /\.chartermesh\/AGENT-ENTRYPOINT\.md/u);
   assert.match(pointer?.content ?? "", /parent host session has separate permissions/u);
+  assert.ok(pointer?.content.includes(humanApprovalWritingGuidance));
 });
 
 test("projection rejects path traversal, duplicate roles, and unusable capabilities", async () => {

@@ -14,6 +14,7 @@ import { basename, join } from "node:path";
 import test from "node:test";
 import {
   ControlPlane,
+  acquireMaintenanceLock,
   openControlPlaneDatabase,
 } from "../../../packages/control-plane/src/index.ts";
 import { applyFileTransaction } from "../../../packages/compiler/src/index.ts";
@@ -1448,6 +1449,153 @@ test("opening a local MCP bridge rejects uninitialized targets and opens an init
     );
   } finally {
     bridge.close();
+  }
+});
+
+test("an existing MCP session rejects every mutation after organization changes but keeps queries available", async () => {
+  const context = fixture();
+  const requested = context.controlPlane.intake({
+    title: "Work across a configuration change",
+    summary: "The old session must not reuse cached organization authority.",
+    actor: "human:test",
+    idempotencyKey: "configuration-change:intake",
+  });
+  const ready = context.controlPlane.triage({
+    id: requested.id,
+    ownerRole: "implementation",
+    executionTarget: "generic-local",
+    expectedVersion: requested.version,
+    actor: "human:test",
+    idempotencyKey: "configuration-change:triage",
+  });
+  const options = {
+    target: context.target,
+    actor: "host:test",
+    allowedRoles: ["implementation"],
+    allowedExecutionTargets: ["generic-local"],
+  };
+  const bridge = openControlPlaneMcpBridge(options);
+  let restarted: ReturnType<typeof openControlPlaneMcpBridge> | undefined;
+  try {
+    const organizationPath = join(context.target, ".chartermesh", "organization.json");
+    const organization = JSON.parse(readFileSync(organizationPath, "utf8"));
+    organization.metadata.revision += 1;
+    const role = organization.spec.roles.find(({ id }: { id: string }) => id === "implementation");
+    role.tools.allow = [];
+    role.tools.approvalRequired = [];
+    writeFileSync(organizationPath, `${JSON.stringify(organization, null, 2)}\n`);
+
+    for (const [index, name] of [
+      "chartermesh_work_claim",
+      "chartermesh_run_heartbeat",
+      "chartermesh_work_progress",
+      "chartermesh_work_block",
+      "chartermesh_workspace_changes_request",
+      "chartermesh_workspace_write_request",
+      "chartermesh_workspace_write_execute",
+      "chartermesh_artifact_submit",
+      "chartermesh_run_fail",
+    ].entries()) {
+      const rejected = toolEnvelope(await asyncToolCall(bridge.handler, index + 1, name));
+      assert.equal(rejected.ok, false, name);
+      assert.equal(
+        (rejected.error as { code: string }).code,
+        "PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED",
+        name,
+      );
+    }
+    assert.throws(() => bridge.controlPlane.claim({
+      id: ready.id,
+      actor: bridge.handler.sessionActor,
+      expectedVersion: ready.version,
+      idempotencyKey: "configuration-change:direct-old-claim",
+    }), /PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED/u);
+    assert.equal(context.controlPlane.get(ready.id).status, "ready");
+    assert.equal(toolEnvelope(toolCall(bridge.handler, 20, "chartermesh_status")).ok, true);
+    assert.equal(toolEnvelope(toolCall(bridge.handler, 21, "chartermesh_work_show", { id: ready.id })).ok, true);
+
+    restarted = openControlPlaneMcpBridge(options);
+    const claimed = toolEnvelope(toolCall(restarted.handler, 22, "chartermesh_work_claim", {
+      id: ready.id,
+      expectedVersion: ready.version,
+      idempotencyKey: "configuration-change:new-claim",
+    }));
+    assert.equal(claimed.ok, true, JSON.stringify(claimed));
+    const claim = claimed.data as { runId: string; attemptId: string; leaseId: string; generation: number };
+    const write = toolEnvelope(await asyncToolCall(restarted.handler, 23, "chartermesh_workspace_write_request", {
+      id: ready.id,
+      runId: claim.runId,
+      attemptId: claim.attemptId,
+      leaseId: claim.leaseId,
+      generation: claim.generation,
+      path: "not-authorized.txt",
+      content: "Must not be written under the old tool policy.",
+      beforeSha256: null,
+      idempotencyKey: "configuration-change:new-policy-write",
+    }));
+    assert.equal(write.ok, false);
+    assert.match(String((write.error as { message: string }).message), /MCP_WORKSPACE_WRITE_DENIED/u);
+    assert.equal(existsSync(join(context.target, "not-authorized.txt")), false);
+  } finally {
+    restarted?.close();
+    bridge.close();
+    context.database.close();
+  }
+});
+
+test("MCP mutations survive preferences-only changes and respect active configuration maintenance", () => {
+  const context = fixture();
+  const requested = context.controlPlane.intake({
+    title: "Preferences do not change authority",
+    summary: "The organization file is unchanged.",
+    actor: "human:test",
+    idempotencyKey: "preferences-only:intake",
+  });
+  const ready = context.controlPlane.triage({
+    id: requested.id,
+    ownerRole: "implementation",
+    executionTarget: "generic-local",
+    expectedVersion: requested.version,
+    actor: "human:test",
+    idempotencyKey: "preferences-only:triage",
+  });
+  const bridge = openControlPlaneMcpBridge({
+    target: context.target,
+    actor: "host:test",
+    allowedRoles: ["implementation"],
+    allowedExecutionTargets: ["generic-local"],
+  });
+  let release: (() => void) | undefined;
+  try {
+    const stateDirectory = join(context.target, ".chartermesh");
+    const organizationBefore = readFileSync(join(stateDirectory, "organization.json"));
+    writeFileSync(join(stateDirectory, "preferences.json"), JSON.stringify({
+      apiVersion: "chartermesh.dev/project-preferences/v1alpha1",
+      language: "ko",
+      approvalDetail: "technical",
+      tone: "formal",
+      projectInstructions: "Use Korean explanations.",
+      roleInstructions: {},
+    }));
+    const claim = {
+      id: ready.id,
+      expectedVersion: ready.version,
+      idempotencyKey: "preferences-only:claim",
+    };
+    release = acquireMaintenanceLock(stateDirectory, "configure-project");
+    const blocked = toolEnvelope(toolCall(bridge.handler, 1, "chartermesh_work_claim", claim));
+    assert.equal(blocked.ok, false);
+    assert.equal((blocked.error as { code: string }).code, "CONTROL_PLANE_MAINTENANCE_ACTIVE");
+    assert.equal(toolEnvelope(toolCall(bridge.handler, 2, "chartermesh_status")).ok, true);
+    release();
+    release = undefined;
+    assert.deepEqual(readFileSync(join(stateDirectory, "organization.json")), organizationBefore);
+    const claimed = toolEnvelope(toolCall(bridge.handler, 3, "chartermesh_work_claim", claim));
+    assert.equal(claimed.ok, true, JSON.stringify(claimed));
+  } finally {
+    release?.();
+    bridge.close();
+    context.database.close();
   }
 });
 

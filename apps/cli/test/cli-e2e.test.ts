@@ -49,6 +49,56 @@ function cli(
   });
 }
 
+test("help advertises the complete kickoff team controls", () => {
+  const help = cli(["help"]);
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(
+    help.stdout,
+    /kickoff --target PATH --brief-file PATH[\s\S]*--team-template TEMPLATE[\s\S]*--profile lean\|balanced\|controlled/u,
+  );
+  assert.match(
+    help.stdout,
+    /bootstrap --target PATH \[--profile lean\|balanced\|controlled\]/u,
+  );
+  assert.match(
+    help.stdout,
+    /configure-host --target PATH[\s\S]*--executable-sha256 SHA256[\s\S]*--capability-snapshot-sha256 SHA256/u,
+  );
+  assert.match(
+    help.stdout,
+    /host doctor --host codex\|claude \[--target PATH\][\s\S]*--capability-snapshot-sha256 SHA256/u,
+  );
+  assert.match(
+    help.stdout,
+    /configure-host --target PATH[\s\S]*--timeout-ms 600000/u,
+  );
+  assert.match(
+    help.stdout,
+    /kickoff --host reports the observed executable digest/u,
+  );
+});
+
+test("evaluation approval previews explain costs and limits before exact plan hashes", () => {
+  const target = mkdtempSync(join(tmpdir(), "chartermesh-plain-evaluation-"));
+  for (const command of ["evaluate-workflow", "evaluate-decision-review"]) {
+    const args = [command, "--target", target,
+      ...(command === "evaluate-workflow" ? ["--artifacts-only"] : [])];
+    const preview = cli(args);
+    assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+    assert.ok(preview.stdout.startsWith("Plain-language approval (ELI5)\n"));
+    assert.match(preview.stdout, /total money cost is unknown/iu);
+    assert.match(preview.stdout, /If you decline or wait:/u);
+    assert.match(preview.stdout, /Undo limits:/u);
+    assert.match(preview.stdout, /No model was called/u);
+    const exact = cli([...args, "--json"]);
+    assert.equal(exact.status, 0, exact.stdout + exact.stderr);
+    const plan = JSON.parse(exact.stdout).data;
+    assert.ok(preview.stdout.includes(`Approval token: ${plan.planHash}`));
+    assert.equal("explanation" in plan, false);
+  }
+  assert.equal(existsSync(join(target, ".chartermesh")), false);
+});
+
 async function waitUntil(
   predicate: () => boolean,
   timeoutMs = 10_000,
@@ -68,6 +118,25 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   assert.equal(preview.status, 0, preview.stderr);
   const hash = preview.stdout.match(/Approval token: ([a-f0-9]{64})/u)?.[1];
   assert.ok(hash, preview.stdout);
+  assert.ok(preview.stdout.startsWith("Plain-language approval (ELI5)\n"));
+  for (const label of [
+    "What you are deciding:", "Why:", "If you approve:", "Cost and data:",
+    "What is confirmed:", "Risks and unknowns:", "If you decline or wait:",
+    "Undo limits:", "Your choice:",
+  ]) {
+    assert.ok(preview.stdout.includes(label), label);
+    assert.ok(preview.stdout.indexOf(label) < preview.stdout.indexOf("Technical details"));
+  }
+  assert.match(preview.stdout, /future cost is not known/u);
+  assert.match(preview.stdout, /not a one-click undo/u);
+  const jsonPlan = JSON.parse(cli([...bootstrapArgs, "--json"]).stdout).data;
+  assert.equal(jsonPlan.planHash, hash);
+  assert.equal("explanation" in jsonPlan, false);
+  for (const file of jsonPlan.files) {
+    assert.ok(preview.stdout.includes(file.path));
+    assert.ok(preview.stdout.includes(file.afterHash));
+    assert.ok(preview.stdout.includes(file.beforeHash ?? "absent"));
+  }
 
   const applied = cli([...bootstrapArgs, "--approve", hash]);
   assert.equal(applied.status, 0, applied.stderr);
@@ -148,6 +217,12 @@ test("clean target completes the fake-engine bootstrap workflow", () => {
   ]);
   assert.equal(packet.status, 0, packet.stderr);
   const packetHash = JSON.parse(packet.stdout).data.binding.packetHash;
+  const plainPacket = cli(["decision-packet", "--id", workId, "--target", target]);
+  assert.equal(plainPacket.status, 0, plainPacket.stderr);
+  const exactPacketMarker = "Technical details — exact decision packet\n";
+  assert.ok(plainPacket.stdout.indexOf(exactPacketMarker) > 0);
+  const exactPacket = JSON.parse(plainPacket.stdout.split(exactPacketMarker)[1]!);
+  assert.deepEqual(exactPacket, JSON.parse(packet.stdout).data);
 
   const decided = cli([
     "decide",
@@ -369,7 +444,7 @@ test("capability catalog is agent-readable and external integrations stay disabl
   );
   const skills = cli(["skills", "list", "--json"]);
   assert.equal(skills.status, 0, skills.stdout + skills.stderr);
-  assert.equal(JSON.parse(skills.stdout).data.items.length, 5);
+  assert.equal(JSON.parse(skills.stdout).data.items.length, 6);
 });
 
 test("bootstrap can opt into approval-gated loopback SearXNG search", () => {
@@ -1137,6 +1212,14 @@ test("Control Plane restore requires the exact preview hash and keeps a safety b
   assert.equal(restorePreview.status, 0, restorePreview.stderr);
   const plan = JSON.parse(restorePreview.stdout).data;
   assert.match(plan.planHash, /^[a-f0-9]{64}$/u);
+  const plainRestore = cli(restoreArgs.filter((argument) => argument !== "--json"));
+  assert.equal(plainRestore.status, 0, plainRestore.stderr);
+  assert.ok(plainRestore.stdout.startsWith("Plain-language approval (ELI5)\n"));
+  assert.match(plainRestore.stdout, /will no longer be the active records/u);
+  assert.match(plainRestore.stdout, /cannot undo files changed elsewhere/u);
+  assert.ok(plainRestore.stdout.includes(plan.planHash));
+  assert.ok(plainRestore.stdout.includes(plan.backupSha256));
+  assert.ok(plainRestore.stdout.includes(plan.currentSha256));
   const restored = cli([
     ...restoreArgs,
     "--approve",

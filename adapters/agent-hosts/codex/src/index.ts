@@ -854,7 +854,7 @@ export class CodexAppServerAgentHost implements AgentHost {
       clientInfo: {
         name: "chartermesh",
         title: "CharterMesh",
-        version: "0.0.9-alpha.1",
+        version: "0.0.10-alpha.1",
       },
     });
     connection.notify("initialized", {});

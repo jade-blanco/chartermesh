@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   renameSync,
   symlinkSync,
   writeFileSync,
@@ -11,10 +12,12 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ControlPlane,
+  acquireMaintenanceLock,
   openControlPlaneDatabase,
 } from "../../../packages/control-plane/src/index.ts";
 import { createProposal } from "../../cli/src/proposal.ts";
 import { startDashboard } from "../src/server.ts";
+import { defaultProjectPreferences } from "../../../packages/runtime/src/index.ts";
 
 function initializedTarget(): string {
   const target = mkdtempSync(join(tmpdir(), "chartermesh-dashboard-"));
@@ -43,6 +46,69 @@ function initializedTarget(): string {
   return target;
 }
 
+test("dashboard rejects stale organization mutations but keeps reads and preference-only changes available", async () => {
+  const target = initializedTarget();
+  const state = join(target, ".chartermesh");
+  const dashboard = await startDashboard({ target, port: 0, quiet: true });
+  let refreshed: Awaited<ReturnType<typeof startDashboard>> | undefined;
+  const sessionHeaders = async (server: typeof dashboard) => {
+    const html = await fetch(server.url).then((response) => response.text());
+    const token = html.match(/name="chartermesh-session" content="([^"]+)"/u)?.[1];
+    assert.ok(token);
+    return { "content-type": "application/json", origin: server.url, "x-chartermesh-session": token };
+  };
+  try {
+    const headers = await sessionHeaders(dashboard);
+    writeFileSync(join(state, "preferences.json"), JSON.stringify({ ...defaultProjectPreferences(), language: "ko" }));
+    const beforeChange = await fetch(`${dashboard.url}/api/work-items`, {
+      method: "POST", headers,
+      body: JSON.stringify({ title: "Same organization", summary: "A preference-only edit does not retire this session." }),
+    });
+    assert.equal(beforeChange.status, 201);
+    const item = await beforeChange.json();
+
+    const release = acquireMaintenanceLock(state, "dashboard-session-guard-test");
+    try {
+      const blocked = await fetch(`${dashboard.url}/api/work-items`, {
+        method: "POST", headers, body: JSON.stringify({ title: "No write during maintenance" }),
+      });
+      assert.equal(blocked.status, 422);
+      assert.equal((await blocked.json()).error, "CONTROL_PLANE_MAINTENANCE_ACTIVE");
+      assert.equal((await fetch(`${dashboard.url}/api/dashboard`, { headers })).status, 200);
+    } finally { release(); }
+
+    const organizationPath = join(state, "organization.json");
+    const organization = JSON.parse(readFileSync(organizationPath, "utf8"));
+    organization.metadata.revision++;
+    organization.spec.budgets.maxDailyModelStarts = 1;
+    writeFileSync(organizationPath, `${JSON.stringify(organization, null, 2)}\n`);
+    for (const path of [
+      "/api/work-items", `/api/work-items/${item.id}/triage`, `/api/work-items/${item.id}/run`,
+      `/api/work-items/${item.id}/decision`, `/api/work-items/${item.id}/approve-tool`,
+      `/api/work-items/${item.id}/deny-tool`, `/api/work-items/${item.id}/provide-input`,
+      `/api/work-items/${item.id}/cancel`, "/api/system/pause",
+    ]) {
+      const result = await fetch(`${dashboard.url}${path}`, { method: "POST", headers, body: "{}" });
+      assert.equal(result.status, 422, path);
+      assert.equal((await result.json()).error, "PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED", path);
+    }
+    const projection = await fetch(`${dashboard.url}/api/dashboard`, { headers }).then((response) => response.json());
+    assert.equal(projection.workItems.length, 1);
+    assert.equal(projection.workItems[0].status, "requested");
+
+    refreshed = await startDashboard({ target, port: 0, quiet: true });
+    const newHeaders = await sessionHeaders(refreshed);
+    const afterRestart = await fetch(`${refreshed.url}/api/work-items`, {
+      method: "POST", headers: newHeaders,
+      body: JSON.stringify({ title: "New organization", summary: "The restarted session uses the new policy snapshot." }),
+    });
+    assert.equal(afterRestart.status, 201);
+  } finally {
+    if (refreshed) await refreshed.close();
+    await dashboard.close();
+  }
+});
+
 test("dashboard refuses a linked CharterMesh state directory", async (context) => {
   const target = initializedTarget();
   const outside = mkdtempSync(join(tmpdir(), "chartermesh-dashboard-linked-"));
@@ -66,8 +132,9 @@ test("dashboard refuses a linked CharterMesh state directory", async (context) =
 });
 
 test("dashboard serves one projection and protects mutations", async () => {
+  const target = initializedTarget();
   const dashboard = await startDashboard({
-    target: initializedTarget(),
+    target,
     port: 0,
     quiet: true,
   });
@@ -202,6 +269,26 @@ test("dashboard serves one projection and protects mutations", async () => {
     ).then((response) => response.json());
     assert.equal(packet.kind, "artifact_review");
     assert.match(packet.binding.packetHash, /^[a-f0-9]{64}$/u);
+
+    const explained = await fetch(
+      `${dashboard.url}/api/work-items/${id}/decision-packet?explain=eli5`,
+      { headers: { "x-chartermesh-session": token } },
+    ).then((response) => response.json());
+    assert.deepEqual(explained.packet, packet);
+    assert.equal(explained.explanation.mode, "eli5");
+    assert.equal(explained.explanation.sections.length, 7);
+    assert.ok(explained.explanation.sections.some(({ id }: { id: string }) => id === "cautions"));
+    for (const approvalDetail of ["concise", "technical"] as const) {
+      writeFileSync(join(target, ".chartermesh", "preferences.json"), JSON.stringify({
+        ...defaultProjectPreferences(), language: "en", approvalDetail,
+      }));
+      const custom = await fetch(`${dashboard.url}/api/work-items/${id}/decision-packet?explain=project`,
+        { headers: { "x-chartermesh-session": token } }).then((response) => response.json());
+      assert.deepEqual(custom.packet, packet);
+      assert.equal(custom.explanation.mode, approvalDetail);
+      assert.equal(custom.explanation.sections.length, approvalDetail === "concise" ? 4 : 7);
+      assert.match(custom.explanation.heading, /Decision/u);
+    }
 
     const approved = await fetch(
       `${dashboard.url}/api/work-items/${id}/decision`,

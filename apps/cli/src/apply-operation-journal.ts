@@ -712,6 +712,12 @@ function writeReceipt<Plan extends ApplyOperationPlanLike>(
   );
 }
 
+export function validateApplyOperationPlan<Plan extends ApplyOperationPlanLike>(
+  target: string, approvedPlanHash: string, plan: Plan,
+): void {
+  assertPlan(canonicalTargetRoot(target), approvedPlanHash, plan);
+}
+
 export function beginApplyOperation<Plan extends ApplyOperationPlanLike>(
   target: string,
   approvedPlanHash: string,

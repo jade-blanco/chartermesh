@@ -6,10 +6,15 @@ work.
 When asked to apply this repository to another project, read BOOTSTRAP.md and
 use its inspect -> plan -> exact human approval -> apply -> verify protocol.
 With only the GitHub URL, the package-ready entry point is
-`npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1` after package-download
+`npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1` after package-download
 approval. The GitHub form requires Git, npm lifecycle scripts for the
 dependency-free prepare build, and normal network access. The tag selects a
 version but is movable and is not a cryptographic commit attestation.
+The v0.0.10-alpha.1 package includes project-type templates, TEAM-CHARTER,
+one-plan kickoff --host, and reviewed project customization. A source checkout
+is optional. The default generated MCP command targets the same tag; require
+approved apply and the new-session MCP health gate before reporting host-bound
+setup complete. Omit --host when the provider-neutral core is wanted.
 Tool execution is governed by OrgSpec allowlists, relative workspace roots,
 exact-call human approvals, evidence hashes, and bounded iterations.
 Any local executable can connect through the shell-free command-process JSON
@@ -29,20 +34,69 @@ the projection is not a substitute for the deliverable. SQLite schema v15
 stores report identity, AgentHost lineage, exact actor/request idempotency, and
 governed change-set reservation/settlement state. runtime_compiled is currently a
 BuiltInManagedRunner API option, not a CLI/runtime.json setting.
-Approved bootstrap plans also install five provider-neutral Apache-2.0 Agent
-Skills, including `tool-grounded-implementation`. External MCP servers remain
+Approved bootstrap plans also install six provider-neutral Apache-2.0 Agent
+Skills, including `organization-bootstrap` and
+`tool-grounded-implementation`. External MCP servers remain
 uninstalled and disabled. Optional
 SearXNG web.search requires a reviewed HTTPS/loopback endpoint, a tool-calling
 engine, an OrgSpec allowlist entry, and exact per-query human approval.
 
-Fresh projects can use one approved kickoff plan for files, the project brief,
-acceptance criteria, and the first WorkItem. A second configure-host plan can
-project Codex or Claude roles plus a local stdio MCP bridge. Each bridge process
+For installed-project customization, read project-config --target PATH --json.
+configure-project accepts optional --preferences-file and --organization-file,
+previews without target writes, and applies only when the same options include
+a human-approved exact --approve HASH. The six-field contract
+chartermesh.dev/project-preferences/v1alpha1 includes apiVersion, language
+auto|ko|en, approvalDetail eli5|concise|technical, tone plain|formal,
+projectInstructions, and roleInstructions. preferences.json stores approved
+advisory guidance; PREFERENCES.md is its readable projection. Neither changes
+permissions, trains a model, or becomes a task ledger. ELI5 remains the default;
+explicit presentation choices never remove hashes, evidence status, risks, or
+unknowns. Decision Packet views honor language/detail preferences; auto means
+CLI English and dashboard Korean. Bootstrap/configuration/evaluation plan
+explanations remain English ELI5. Tone and free-form instructions guide models,
+not translation of fixed UI labels or historical artifacts.
+An OrgSpec candidate keeps metadata.id and uses exactly the next revision. It
+must preserve current approval policy and existing execution/capability/
+orchestration bindings. Active runs or in_progress work block customization;
+other unfinished work must retain valid roles and targets, and the relevant
+work-state hash is bound into the plan. Connections and schedules stay separate.
+Even proposed/paused schedules protect referenced role/workflow definitions
+against changes other than display names. Native projection refresh supports
+one existing Codex or Claude host, requires matching --host codex|claude and
+--executable-sha256, and additionally
+--allow-unrestricted-read for Codex. Multiple hosts fail closed; removed roles
+become retired notices. Verify a new host session after apply. Applied
+customization prevents ordinary bootstrap overwrites; preserve preferences in
+bootstrap/kickoff and connection changes. A coordinator may propose
+improvements but never approves itself.
+
+Use a no-candidate configure-project plan to refresh an installed project's
+version pins and managed guides while preserving its organization, preferences,
+and unrelated user text; never use bootstrap as a customization reset. A pending
+configuration marker and the exact approved plan are atomically committed to
+Control Plane metadata before file replacement. Work mutations remain blocked
+across a crash until the same plan resumes. Organization drift makes old MCP
+and dashboard sessions reject mutations and require a restart; read-only
+inspection and preference-only read refresh remain available.
+
+Fresh projects can use one approved kickoff plan for a provider-neutral team,
+work allocation, copy/paste handoffs, human approval rules, files, the project
+brief, acceptance criteria, and the first WorkItem. Optional `--host codex` or
+`--host claude` projects project roles plus a local stdio MCP bridge in that
+same plan; `configure-host` remains available for later changes. Each bridge process
 has a unique non-human actor and exact WorkItem/Run/Attempt/lease/generation
 fences; it has no approval authority. Projected roles request one bounded,
 content-addressed multi-file change set, then a separately controlled human
 reviews its stored bytes and approves the exact call and Decision Packet. A new
 claim can apply only that stored set through a recoverable transaction.
+Before a host-bound kickoff may start even a version probe, bind the observed
+host executable SHA-256. When the digest option is omitted, kickoff reports the
+observed value and exits without starting the host; repeating with that digest
+still produces one plan and one CharterMesh human approval. Codex project trust
+or Claude's one-time MCP permission is a separate host UI action, not a second
+CharterMesh approval. After apply, close the old host session, start a new
+trusted session from the project root, and require
+`chartermesh_status` plus `chartermesh_work_next` to pass before assigning work.
 Provider-native parent permissions can override projected child defaults, and
 `human:*` is a procedural local policy boundary rather than cryptographic proof
 against a process with CLI/database access. This pre-alpha is not a production
@@ -51,6 +105,9 @@ authorization or OS-sandbox system.
 One project MCP bridge serves the aggregate allowed role set. Generated agents
 must claim only their own `ownerRole`, but native subagent identity is not
 authenticated at the shared bridge, so cross-role separation is procedural.
+Kickoff creates one initial operator-owned WorkItem. Coordinator and verifier
+stages are bounded copy/paste consultations unless the Control Plane separately
+assigns role-owned WorkItems; they must not claim or mutate the operator item.
 
 The evaluate-decision-review command is dry by default. Its live mode requires
 the exact plan hash and an attested Codex executable/model binding for 20
@@ -84,7 +141,10 @@ These are single-user local hash controls, not signatures or protection from a
 malicious local writer or whole-directory rollback.
 
 Project architecture: docs/PRODUCT-DESIGN.md
+Project preferences and organization revisions: docs/PROJECT-CUSTOMIZATION.md
 CLI and first run: docs/FIRST-RUN.md
+Team templates, handoffs, and approvals: docs/TEAM-COMPOSITION.md
+Codex and Claude Code host setup: docs/CODING-HOSTS.md
 Model connections: docs/LLM-CONNECTIONS.md
 Operating workflow: docs/USAGE.md
 Decision review benchmark: docs/DECISION-REVIEW-PROXY-BENCHMARK.md

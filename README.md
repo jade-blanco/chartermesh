@@ -8,15 +8,20 @@ Its primary job is not to claim an autonomous AI company. It compresses the
 work of many models, agents, and tools into one hash-bound decision a human can
 understand, verify, approve, revise, or reject.
 
-Give this repository URL to Codex, Claude Code, Gemini CLI, or another capable
-coding agent and say:
+Give this repository URL and the `v0.0.10-alpha.1` ref to
+Codex, Claude Code, Gemini CLI, or another capable coding agent and say:
 
 > Apply CharterMesh to this project.
 
+A manual source checkout is optional. With package-download approval, use
+`npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1` as the executable
+prefix for the commands below; source development can still use
+`node bin/chartermesh.mjs`.
+
 The agent reads [`BOOTSTRAP.md`](BOOTSTRAP.md), inspects the target without
-writing, proposes a project-aware organization, generates an immutable plan
-hash, and waits for a human to approve that exact hash. A human or shell script
-can use the same versioned CLI contract.
+writing, proposes a project-type-aware organization scaffold, generates an
+immutable plan hash, and waits for a human to approve that exact hash. A human
+or shell script can use the same CLI contract.
 
 처음 설치하고 운영하는 사용자는
 [`한국어 사용자 설명서`](docs/USER-GUIDE.ko.md)를 따라 전체 흐름을
@@ -42,7 +47,7 @@ through the core OrgSpec schema.
 `BuiltInManagedRunner` API; there is no CLI or `runtime.json` selector for it
 in this slice.
 
-## 0.0.9-alpha.1 runnable slice
+## 0.0.10-alpha.1 prerelease
 
 - Project-aware `lean`, `balanced`, and `controlled` proposals
 - Exact plan-hash approval and crash-recoverable journaled apply
@@ -84,13 +89,18 @@ in this slice.
   Decision Packet review presentations under an exact live plan hash
 - Synthetic local-model evaluation for comparing small models
 - Buildable dependency-free npm package and clean-install verification
-- Five bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan
+- Six bundled Apache-2.0 Agent Skills copied by the exact bootstrap plan,
+  including project-type-aware organization bootstrap
 - Agent-readable capability catalog with every external integration disabled
   by default
 - Optional approval-gated SearXNG `web.search` with bounded network behavior
 - Evidence-grounding instructions validated with a local Gemma 4 workflow
-- Project-brief `kickoff` that creates the approved files and first triaged
-  WorkItem together
+- Project-brief `kickoff` that creates the approved team, work allocation,
+  copy/paste handoffs, approval matrix, files, and first triaged WorkItem
+  together, with optional Codex/Claude projection in the same plan
+- Exact-approved `configure-project` for saved language, approval detail, tone,
+  project/role guidance, and validated organization revisions; `project-config`
+  reads the current settings without changing them
 - Local stdio MCP bridge with a unique non-human session actor, exact
   role/target/run fencing, governed workspace change-set requests, and no human
   approval authority
@@ -104,6 +114,11 @@ database. Keep the primary coding host away from approval credentials and make
 approval decisions in a separately controlled human session. Generated child
 role permissions can be overridden by a parent Codex/Claude session, so start
 that parent without native write/shell authority; this is not an OS sandbox.
+
+> Project-type teams, one-plan `kickoff --host`, and project customization use
+> the `v0.0.10-alpha.1` package. A host-bound setup is complete only after the
+> approved apply and the new-session MCP health check. Omit `--host` when you
+> want the provider-neutral core without native-host projection.
 
 ## Requirements
 
@@ -123,6 +138,7 @@ source checkout instead; `ignore-scripts` GitHub installs are unsupported.
 Every approved bootstrap installs these provider-neutral Agent Skills under
 `.chartermesh/skills/`:
 
+- `organization-bootstrap`
 - `web-research`
 - `repository-diagnostics`
 - `small-model-evidence`
@@ -167,45 +183,69 @@ the selected OrgSpec role together; use `--web-search-role ROLE_ID` when the
 role is not `operator`. Use `--disable-web-search` in a later approved engine
 plan to remove the endpoint and its role grants.
 
-## One-command entry from the GitHub URL
+## Released entry and one-setup flow
 
 On a machine with Node.js 24 or newer, a human, coding agent, or shell can run
-CharterMesh without manually checking out this source tree:
+the published friend-trial release without manually checking out this source
+tree:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 propose --target C:\path\to\project --profile balanced --json
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 bootstrap --target C:\path\to\project --profile balanced --engine fake --json
+npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1 propose --target C:\path\to\project --profile balanced --json
+npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1 bootstrap --target C:\path\to\project --profile balanced --engine fake --json
 ```
 
-The tag-pinned form above selects the friend-trial version, but a Git tag is
-movable and is not a cryptographic commit attestation. Omit `#v0.0.9-alpha.1`
-only when you intentionally want the latest `main` branch.
+The tag-pinned package includes project-type templates, `TEAM-CHARTER.md`,
+one-plan `kickoff --host`, and `configure-project`. A Git tag is movable and is
+not a cryptographic commit attestation; do not silently omit it to select `main`.
 
-For a completely new project, put the request in a brief file and use
-`kickoff` instead of separately bootstrapping and creating the first task:
+For a new project's one-setup flow, put the request in a
+brief file outside the target and use `kickoff` instead of separately
+bootstrapping, projecting the coding host, and creating the first task:
 
 ```powershell
+$CM = "github:jade-blanco/chartermesh#v0.0.10-alpha.1"
 $Target = "C:\path\to\new-project"
+$Brief = "C:\path\to\project-brief.md"
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 kickoff `
+npx --yes $CM kickoff `
   --target $Target `
-  --brief-file C:\path\to\project-brief.md `
+  --brief-file $Brief `
+  --team-template software-product `
   --profile controlled `
   --engine fake `
+  --host codex `
+  --executable-sha256 HOST_SHA256 `
+  --allow-unrestricted-read `
   --json
 ```
 
 The preview writes nothing. Repeat that identical command with
 `--approve PLAN_HASH`; it then installs the reviewed configuration, stores the
-brief, and creates one triaged WorkItem with explicit acceptance criteria.
+brief, creates the selected domain-team scaffold and
+`.chartermesh/TEAM-CHARTER.md`, projects the
+Codex project roles and MCP bridge, and creates one triaged WorkItem with
+explicit acceptance criteria. Use `--host claude` for Claude Code. Omit
+`--host` when only the provider-neutral core is wanted. If a coding host does
+not supply `--team-template`, kickoff still creates the sanitized `general`
+team; the bundled `organization-bootstrap` skill is expected to select the
+more specific template from the user's project goal.
+
+Before a host-bound preview executes the host's version probe, it requires the
+resolved executable's read-only SHA-256 as `--executable-sha256`. When omitted,
+the CLI reports the observed digest and exits without starting the host; the
+coding agent repeats the preview with that value. This is still one CharterMesh
+approval plan, not a second CharterMesh human decision. Codex project trust or
+Claude's one-time MCP permission remains a separate host UI action and cannot
+approve the plan.
 
 ### Connect the project to Codex or Claude Code
 
-First inspect the installed host without making a model call or changing the
-project:
+The no-write `kickoff --host` preview inspects and binds the installed host
+without making a model call or changing the project. For an already installed
+project, the same inspection is available separately:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 host doctor `
+npx --yes $CM host doctor `
   --host codex `
   --target $Target `
   --json
@@ -219,19 +259,22 @@ protocol. Use `host doctor --direct` only to test the exact Codex app-server
 protocol used by direct execution. The post-projection MCP health check below
 is therefore mandatory.
 
-Then generate a second exact plan. This projects the OrgSpec roles and a
-tag-pinned CharterMesh MCP command into the host's project configuration:
+For a project that was initialized without `kickoff --host`, generate a later
+exact plan. This projects the OrgSpec roles and a tag-pinned CharterMesh MCP
+command into the host's project configuration:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 configure-host `
+npx --yes $CM configure-host `
   --host codex `
   --target $Target `
+  --executable-sha256 HOST_SHA256 `
   --allow-unrestricted-read `
   --max-agents 4 `
   --json
 ```
 
-Repeat with `--approve PLAN_HASH`. Use `--host claude` for Claude Code. Both
+Repeat with `--approve PLAN_HASH`. A fresh-project `kickoff --host` already
+performs this projection and does not need the second plan. Both
 hosts then read and mutate the same CharterMesh Control Plane through local
 stdio MCP; their native task lists are not authoritative and the MCP server
 cannot perform a human approval. Projected role files deny native shell and
@@ -246,8 +289,13 @@ One project bridge serves the aggregate configured OrgSpec roles. Generated
 profiles are instructed to claim only their own `ownerRole`, but a shared MCP
 connection cannot authenticate the native subagent identity. Treat cross-role
 separation as procedural in this alpha, not as an authorization boundary.
+Kickoff creates one entry-role `operator` WorkItem. Coordinator and verifier
+profiles participate through the generated copy/paste consultation packets;
+they may read bounded referenced context but cannot claim or mutate the
+operator's item. Give them separate role-owned WorkItems before expecting
+Control Plane mutation or automatic dependency progression.
 
-After applying the host plan, close the pre-projection host session and start a
+After applying either host-bound plan, close the pre-projection host session and start a
 new Codex or Claude Code session from the project root. Trust the project so
 Codex loads `.codex/config.toml`; in Claude Code, approve the project MCP server
 once and inspect it with `/mcp`. Verify that `chartermesh_status` and
@@ -261,7 +309,9 @@ distribution in the approved host plan.
 
 Codex can additionally be selected as a direct execution target by including
 `--activate-role operator --allow-unrestricted-read` in both the preview and
-approved command. The acknowledgement is required because Codex's read-only
+approved **`configure-host`** command after initialization. `kickoff` performs
+project-role and MCP projection only and rejects `--activate-role`. The
+acknowledgement is required because Codex's read-only
 sandbox does not confine reads to the project directory. That path uses the
 hash-pinned experimental app-server adapter and may consume the user's Codex
 quota. Claude direct AgentHost execution is not implemented in this alpha;
@@ -275,36 +325,50 @@ normally needs no pass-through variable.
 For a coding-agent handoff, this prompt is sufficient even for an empty
 project folder:
 
-> Use https://github.com/jade-blanco/chartermesh at tag v0.0.9-alpha.1. Treat
-> this message as the project brief and apply the `kickoff` flow to the empty
-> project folder. Read `BOOTSTRAP.md`, inspect first, show every file and the
-> exact plan hash, and do not write to the target until I approve that same
-> hash. After approval run `doctor`, run `host doctor` for the coding host you
-> are using, create a `configure-host` plan, and again wait for my exact hash
-> approval. For Codex projection include `--allow-unrestricted-read`. Start a
-> new trusted host session from the project root after applying the host plan,
-> verify the CharterMesh MCP tools, and never treat a model review or host
-> permission prompt as my CharterMesh approval.
+> Use CharterMesh v0.0.10-alpha.1 from its tag-pinned GitHub package or a reviewed
+> matching source checkout. Treat this message as the project brief and
+> apply the `kickoff` flow to the empty project folder. Read `BOOTSTRAP.md` and
+> the `organization-bootstrap` skill.
+> Select the matching provider-neutral team template and a defensible profile
+> (`balanced` by default; `controlled` when I explicitly want separate
+> coordination, production, and verification). If you are Codex or Claude,
+> include that coding host in the same kickoff plan
+> with its read-only executable SHA-256 (`--host codex
+> --executable-sha256 HOST_SHA256 --allow-unrestricted-read` for Codex or
+> `--host claude --executable-sha256 HOST_SHA256` for Claude). If the digest is
+> unknown, report it without starting the host and retry the preview. If you are
+> another coding agent, omit `--host` and use the provider-neutral entrypoint
+> and handoff packets. Show
+> the proposed team scaffold, division of work, handoff rules, approval
+> matrix, every file, and the exact plan hash. Do not write until I approve
+> that same hash. After approval run `doctor`. For Codex or Claude, start a new
+> trusted host session from the project root and verify the CharterMesh MCP
+> tools; for another agent, verify `AGENT-ENTRYPOINT.md` and
+> `TEAM-CHARTER.md`. Never treat a model review or host permission prompt as my
+> CharterMesh approval.
 
-`bootstrap` returns the exact plan hash and still performs no target writes.
-After a human approves that value, repeat the same command with
+The template/profile mapping and exact handoff packets are documented in
+[`docs/TEAM-COMPOSITION.md`](docs/TEAM-COMPOSITION.md).
+
+`kickoff` previews—and the existing-project core-only `bootstrap` preview—return
+an exact plan hash and perform no target writes. After a human approves that
+value, repeat the same plan-generating command with
 `--approve PLAN_HASH`. The GitHub package path builds dependency-free
 JavaScript before execution. Downloading the package requires network access
 and should be explicitly authorized in managed agent environments.
 
-For a first trial, give a coding agent the target project and this repository
-URL, then say:
-
-> Apply CharterMesh to this project. Read `BOOTSTRAP.md`, use the `balanced`
-> profile and the free offline `fake` engine first, show me the exact plan hash
-> before any target writes, and apply only after I approve that same hash. Then
-> run `doctor`, `seed-demo`, and show me the local dashboard.
+For a one-setup trial, give a coding agent the target path and
+project goal together with the single handoff prompt above.
 
 This is a pre-alpha evaluation path. Use a disposable branch or project copy,
 inspect the plan, and do not grant deployment, payment, credential, or important
 data-changing authority during the first trial.
 
-## Five-minute offline source start
+## Five-minute existing-project core start
+
+This `bootstrap` path is for an existing project that needs the provider-neutral
+core only. It does not create the goal-bound team charter or initial WorkItem.
+For a new project, use the `kickoff` flow above instead; do not apply both.
 
 First inspect the project-aware proposal:
 
@@ -335,6 +399,41 @@ evidence, then use explicit `recover` or repeat the exact already-approved apply
 command to resume it. Use
 `chartermesh version --check` for an explicit network check of the latest
 published GitHub release, including prereleases.
+
+## Tailor the project after setup
+
+A coordinating agent may propose clearer instructions or a better division of
+work. It cannot approve its own proposal: inspect the current setup, preview the
+candidate, and have a person approve that exact hash.
+
+```powershell
+node bin/chartermesh.mjs project-config --target TARGET --json
+node bin/chartermesh.mjs configure-project --target TARGET `
+  --preferences-file PREFERENCES_FILE --json
+# After a person approves PLAN_HASH, repeat every option unchanged:
+node bin/chartermesh.mjs configure-project --target TARGET `
+  --preferences-file PREFERENCES_FILE --json --approve PLAN_HASH
+```
+
+Preferences select language (`auto|ko|en`), approval detail
+(`eli5|concise|technical`), tone (`plain|formal`), and project/role instructions.
+They are advisory guidance, not new permissions or model training. ELI5 is the
+default; every style retains exact hashes, evidence status, risks, and unknowns.
+The saved contract is `.chartermesh/preferences.json`; `PREFERENCES.md` is its
+readable projection.
+Decision Packet views honor language/detail preferences. Bootstrap,
+configuration, and evaluation plan explanations currently remain English ELI5;
+free-form guidance does not translate every fixed UI label or past artifact.
+
+Use `--organization-file` for a complete validated OrgSpec revision that keeps
+the organization ID. Active runs block changes; unfinished work must retain
+valid roles and execution targets. Existing approval policy cannot be weakened,
+and engine/host connections remain separate. Applied customization protects
+the project against a default bootstrap overwrite. See
+[`Project customization`](docs/PROJECT-CUSTOMIZATION.md) for the full contract,
+existing-host re-attestation flags, and recovery limits. To refresh an installed
+project for this release, use `configure-project` with no candidate files;
+review and approve its plan instead of rerunning bootstrap over custom settings.
 
 ## Connect a local or remote model
 
@@ -647,6 +746,10 @@ unprovable effect becomes `TOOL_OUTCOME_UNKNOWN` for human inspection.
 
 CharterMesh does not create a Markdown task ledger or treat a provider chat as
 authoritative.
+
+Project customization also saves `.chartermesh/preferences.json`, a readable
+`.chartermesh/PREFERENCES.md`, and an overwrite-protection marker. Keep the marker;
+use a new approved `configure-project` plan for later changes.
 
 ## Verify the source
 

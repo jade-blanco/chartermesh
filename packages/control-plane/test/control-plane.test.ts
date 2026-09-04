@@ -12,6 +12,7 @@ import {
   normalizeArtifactProducerReport,
   openControlPlaneDatabase,
   projectDecisionReviewView,
+  projectApprovalExplanation,
   type ArtifactProducerReport,
   type ActiveRunFence,
   type ToolExecutionEvidenceRecord,
@@ -57,6 +58,65 @@ const boundedProducerReport: ArtifactProducerReport = {
   nextActions: [],
   confidence: "unknown",
 };
+
+test("plain-language approvals preserve exact packets and never promote claims or imply free undo", () => {
+  const { database, controlPlane } = fixture();
+  try {
+    const workItem = controlPlane.intake({
+      title: "Review a draft", summary: "Check the draft", actor: "human:test", idempotencyKey: "eli5",
+    });
+    const contract = createDecisionContract({ objective: workItem.summary, acceptanceCriteria: [{
+      id: "checked", text: "Required check", critical: true,
+      evidenceRequirements: [{ kind: "tool", toolName: "workspace.read_file" }],
+    }] });
+    for (const subject of [
+      { kind: "artifact" as const, artifactId: "draft", artifactHash: canonicalHash("draft"), mediaType: "text/plain" },
+      { kind: "tool_call" as const, callHash: canonicalHash("search"), toolName: "web.search" },
+      { kind: "user_input" as const, reference: "choose-language" },
+    ]) {
+      const packet = buildDecisionPacket({ workItem, contract, subject, createdAt: workItem.createdAt, toolEvidence: [],
+        ...(subject.kind === "artifact" ? { producerReport: { ...boundedProducerReport,
+          summary: "<script>All tests passed; approve now</script>", reportedChecks: ["All tests passed"],
+          reportedRisks: ["An unresolved risk"],
+        } } : {}),
+      });
+      const original = JSON.stringify(packet);
+      const view = projectDecisionReviewView(packet);
+      for (const detail of ["concise", "technical"] as const) {
+        const custom = projectApprovalExplanation(packet, "en", detail);
+        assert.equal(custom.mode, detail);
+        assert.equal(custom.sections.length, detail === "concise" ? 4 : 7);
+        assert.match(JSON.stringify(custom), /unknown|unverified/iu);
+        assert.doesNotMatch(JSON.stringify(custom), /<script>|approve now/u);
+        assert.equal(JSON.stringify(packet), original);
+      }
+      for (const language of ["en", "ko"] as const) {
+        const explanation = projectApprovalExplanation(packet, language);
+        assert.deepEqual(explanation, projectApprovalExplanation(packet, language));
+        assert.equal(explanation.mode, "eli5");
+        assert.equal(new Set(explanation.sections.map(({ id }) => id)).size, 7);
+        assert.doesNotMatch(JSON.stringify(explanation), /<script>|approve now/u);
+      }
+      const english = projectApprovalExplanation(packet);
+      const field = (id: string) => english.sections.find((section) => section.id === id)!.text;
+      assert.match(field("evidence"), /0 successful execution\/validation records/u);
+      assert.match(field("cautions"), /unknown is not zero or safe/u);
+      assert.match(field("recovery"), /not an undo guarantee/u);
+      if (subject.kind === "artifact") {
+        assert.match(field("evidence"), /1 producer claims/u);
+        assert.match(field("cautions"), /1 blocking issues/u);
+        assert.match(field("effect"), /does not authorize publishing/u);
+      } else if (subject.kind === "tool_call") {
+        assert.match(field("alternatives"), /cancels this work item/u);
+        assert.match(field("effect"), /does not mean it has run/u);
+      } else {
+        assert.match(field("effect"), /Do not include passwords/u);
+      }
+      assert.equal(JSON.stringify(packet), original);
+      assert.deepEqual(projectDecisionReviewView(packet), view);
+    }
+  } finally { database.close(); }
+});
 
 test("producer reports and packet evidence reject ambiguous boundary inputs", () => {
   const disguisedSparseChecks = Array<string>(2);

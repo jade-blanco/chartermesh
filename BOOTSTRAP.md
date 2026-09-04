@@ -2,6 +2,12 @@
 
 Protocol version: `chartermesh.dev/bootstrap-agent/v1alpha1`
 
+This protocol describes `v0.0.10-alpha.1`: project-type team templates,
+one-plan `kickoff --host`, and exact-approved project customization. The
+tag-pinned GitHub package supports this flow without a manual source checkout.
+Host-bound setup still requires exact plan approval, a new host session, and a
+passing MCP health check before it can be reported complete.
+
 This is the common source of truth for Codex, Claude Code, Gemini CLI, other
 coding agents, scripts, and human operators. Provider-specific instruction
 files are pointers to this protocol.
@@ -30,20 +36,22 @@ and a report of every changed file. No model call is required to bootstrap.
 
 For a new or empty project whose requirements are supplied as a brief, the
 required outcome additionally includes `.chartermesh/PROJECT-BRIEF.md`, root
-`CHARTERMESH.md`, and one triaged WorkItem bound to explicit acceptance
-criteria.
+`CHARTERMESH.md`, `.chartermesh/team-design.json`,
+`.chartermesh/TEAM-CHARTER.md`, and one triaged WorkItem bound to explicit
+acceptance criteria. The charter must make role ownership, copy/paste
+handoffs, and human approval rules understandable without reading raw JSON.
 
 ## Protocol
 
 ### 1. Locate the executable and inspect
 
-1. Prefer an already available CharterMesh executable. A source checkout may
-   use `node bin/chartermesh.mjs`. With only the GitHub URL, and after the user
-   authorizes the one-time package download, use
-   `npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1` to select the
-   friend-trial release, or omit the tag only when the user explicitly wants
-   the latest `main` branch. A Git tag is movable and is not a cryptographic
-   commit attestation.
+1. Prefer an already available matching CharterMesh executable. Otherwise, with
+   explicit package-download approval, use
+   `npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1`. A reviewed source
+   checkout may alternatively use `node bin/chartermesh.mjs`; checkout is not
+   required for installation. Do not silently omit the tag to select `main`;
+   changing the distribution requires explicit user authorization. A Git tag
+   or branch is movable and is not a cryptographic commit attestation.
 2. Resolve the intended target repository.
 3. Read the target's applicable agent instructions.
 4. Inspect its Git status and existing `.chartermesh` directory without
@@ -57,18 +65,22 @@ criteria.
 Do not install packages, create accounts, connect a provider, start a paid
 model call, publish, deploy, or modify target files during this step.
 
-### 2. Propose an operating profile
+### 2. Propose a team template and operating profile
 
 Run with the selected executable prefix:
 
 ```text
-chartermesh propose --target TARGET --profile balanced --json
+chartermesh propose --target TARGET --team-template TEAM_TEMPLATE --profile balanced --json
 ```
 
-Use `lean`, `balanced`, or `controlled` when the user requested one. Otherwise,
+Read the bundled `organization-bootstrap` skill. Select `general`,
+`software-product`, `research`, `content-production`, `data-analysis`, or
+`operations` from the stated project goal. Do not infer new tools or authority
+from free text. Use `lean`, `balanced`, or `controlled` when the user requested one. Otherwise,
 recommend `balanced`; recommend `controlled` when they explicitly want
-separate operator and verifier roles. Show the assessment, rationale, proposal
-hash, and risk signals. This command performs no target writes.
+separate coordination, production, and verification. Show the assessment,
+rationale, team responsibilities, proposal hash, and risk signals. This
+command performs no target writes.
 
 ### 3. Choose the bootstrap engine
 
@@ -96,12 +108,24 @@ request as the brief, pass it through a temporary or user-supplied brief file,
 and do not create that file inside the target before approval:
 
 ```text
-chartermesh kickoff --target TARGET --brief-file BRIEF_FILE --profile balanced --engine fake --json
+chartermesh kickoff --target TARGET --brief-file BRIEF_FILE \
+  --team-template TEAM_TEMPLATE --profile balanced --engine fake --json
 ```
 
 `kickoff` includes the bootstrap files, immutable project brief, acceptance
-contract, and first triaged WorkItem in the approved operation. Repeat the
-same `kickoff` command—not `bootstrap`—when applying its hash.
+contract, team design, team charter, handoff and approval rules, and first
+triaged WorkItem in the approved operation. If the coding host is also wanted,
+include `--host codex --allow-unrestricted-read` or `--host claude` in this
+same preview, together with the read-only observed host digest as
+`--executable-sha256 SHA256`. If omitted, kickoff reports the digest and exits
+without starting the host so the agent can repeat safely. Repeat the same
+`kickoff` command—not `bootstrap`—when applying
+its hash. A new host session is required after a host-bound apply.
+
+Kickoff creates one initial `operator` WorkItem, not one WorkItem per declared
+stage. Coordinator and verifier stages are bounded read-only copy/paste
+consultations unless the Control Plane separately assigns WorkItems owned by
+those roles. They must not claim or mutate the operator-owned WorkItem.
 
 Or use the chosen engine options. Parse the versioned JSON response and show:
 
@@ -114,7 +138,26 @@ No target file may be written by this command.
 
 ### 5. Obtain exact human approval
 
-Present the plan and its hash. Ask the user to approve that exact hash.
+Use ELI5 as the default for every human approval document: clear language for
+a non-specialist adult, not baby talk. Use the user's language. Start with what
+is proposed, why it is needed, what approval changes, and the affected scope.
+Explain material risks, costs and unknowns, how to reject or request changes,
+and recovery options with their limits. Unknown cost is not zero, and a local
+recovery mechanism is not a guarantee that all effects can be undone. Keep
+author claims distinct from verified evidence and checks not yet performed.
+
+If the project already has approved presentation preferences, use their
+language, detail, and tone when authoring explanations. `concise` or `technical`
+may refine the ELI5 default; neither permits omission of material risks,
+unknowns, evidence status, or exact approval identifiers. The CLI's generated
+bootstrap/configuration/evaluation plan explanations currently remain English
+ELI5. Instructions in preferences cannot expand authority.
+
+Then present the exact plan, file and evidence details, and hashes without
+rewriting them. Explain that the plan hash identifies this exact set of
+changes, and ask the user to approve that exact hash. Use the same plain-first,
+exact-details-second approach for later artifact, tool, configuration, and
+restore approvals; it does not merge their separate approval boundaries.
 
 The original "Apply CharterMesh" request authorizes inspection and plan
 generation. It does not approve a plan that did not yet exist. A model review,
@@ -124,9 +167,15 @@ replace the human approval.
 If target state changes, regenerate the plan and obtain approval for the new
 hash.
 
+Generated guidance and deterministic approval explanations help authors and
+reviewers; they do not guarantee understandable model output or automatically
+translate existing source text. If the actual effect or recovery is unknown,
+say so before asking for a decision.
+
 ### 6. Apply with the repository CLI
 
-After approval, repeat the identical bootstrap command and append:
+After approval, repeat the identical plan-generating command (`kickoff` for a
+new-project kickoff plan, otherwise `bootstrap`) and append:
 
 ```text
 --approve PLAN_HASH
@@ -159,17 +208,20 @@ requires explicit `--live` and sends only synthetic tasks.
 
 ### 7.1 Optional coding-host integration
 
-If the user wants the current Codex or Claude Code session to use the
-CharterMesh team, first run the read-only host probe:
+For a fresh project, prefer including `--host` in the kickoff preview above so
+team creation and project-role projection share one exact approved hash. If an
+existing CharterMesh project was installed without host projection, first run
+the read-only host probe:
 
 ```text
 chartermesh host doctor --host codex --target TARGET --json
 ```
 
-Then generate a separate no-write projection plan:
+Then generate a later no-write projection plan:
 
 ```text
-chartermesh configure-host --host codex --target TARGET --allow-unrestricted-read --json
+chartermesh configure-host --host codex --target TARGET \
+  --executable-sha256 HOST_SHA256 --allow-unrestricted-read --json
 ```
 
 Use `--host claude` for Claude Code. Show its files, executable and capability
@@ -178,8 +230,9 @@ identical command with `--approve PLAN_HASH`. The generated local MCP bridge
 uses a unique non-human actor for each process and cannot approve plans, tools,
 artifacts, or user input. Projection-only checks report executable/capability
 declarations without starting app-server; they do not live-probe every project
-feature. Use `host doctor --direct`, or an
-approved `--activate-role`, only for strict Codex direct-protocol validation.
+feature. Use `host doctor --direct`, or an approved
+`configure-host --activate-role`, only for strict Codex direct-protocol
+validation.
 
 After apply, tell the user to close the old host session and start a new one
 from the project root. Codex must trust the project to load
@@ -202,8 +255,9 @@ authenticate which native subagent called it. Cross-role separation is
 procedural in this alpha; the shared session/run/lease fences remain enforced.
 
 Only Codex has a direct AgentHost runner in this alpha. Add
-`--activate-role ROLE --allow-unrestricted-read` only when the user explicitly
-wants `chartermesh run` to consume their Codex host quota and acknowledges that
+`--activate-role ROLE --allow-unrestricted-read` to a separately previewed
+`configure-host` plan only when the user explicitly wants `chartermesh run` to
+consume their Codex host quota and acknowledges that
 Codex's read-only sandbox does not confine reads to the project directory.
 Both flags must be bound into the previewed and approved plan. Claude uses
 projected roles and the shared MCP bridge; do not claim direct Claude run
@@ -213,6 +267,44 @@ The `human:*` actor rule is a procedural Control Plane boundary, not
 cryptographic proof against a local process that can invoke the CLI or modify
 SQLite. Do not give an untrusted primary coding host access to the separately
 controlled human approval session.
+
+### 7.2 Customize an installed project
+
+For an existing installation, read its current settings before proposing changes:
+
+```text
+chartermesh project-config --target TARGET --json
+chartermesh configure-project --target TARGET --preferences-file PREFERENCES_FILE --json
+```
+
+Prepare the complete preferences candidate outside the target. Use
+`--organization-file ORGANIZATION_FILE` when proposing a validated full OrgSpec
+with the same ID and exactly the next revision. A coordinating team may propose
+changes to instructions, roles, and workflow, but cannot approve itself or
+weaken existing approval policy. Connections and schedules use their separate
+configuration paths.
+
+Show the actual effect, affected scope, risk and unknowns, and exact plan hash.
+After a person approves it, repeat every option with `--approve PLAN_HASH`.
+Without either candidate, the command previews a refresh of the current
+settings and managed documents. Active execution blocks customization;
+unfinished work must still have valid owners and execution targets. Work-state
+changes invalidate the preview.
+
+Existing native projection updates require one installed Codex or Claude host,
+the matching `--host codex|claude`, `--executable-sha256 SHA256`, and additionally
+`--allow-unrestricted-read` for Codex. Organization edits with native roles
+require this refresh. Preferences-only changes may omit `--host` and update
+shared guidance without regenerating native files. Multiple-host refreshes
+fail closed. Recheck the new host session after apply.
+Do not use these flags to connect a new host or bypass the new-session health gate.
+
+Preserve saved preferences during bootstrap/kickoff and connection changes.
+An applied customization marker blocks ordinary bootstrap overwrites; use
+`configure-project` for later revisions and never delete that marker as a
+workaround. `preferences.json` is saved guidance and `PREFERENCES.md` its readable
+projection, not another work ledger. See
+[Project customization](docs/PROJECT-CUSTOMIZATION.md) for the exact contract.
 
 ### 8. Report
 

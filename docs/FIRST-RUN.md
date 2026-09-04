@@ -7,20 +7,24 @@ For an integrated Korean guide covering installation, dashboard state,
 approvals, model connection, operations, and troubleshooting, see
 [`USER-GUIDE.ko.md`](USER-GUIDE.ko.md).
 
+> This guide uses `v0.0.10-alpha.1`, including project-type teams, one-plan
+> `kickoff --host`, and reviewed project customization. A source checkout is
+> optional. Host-bound setup requires approved apply and a passing MCP check
+> from a new host session; omit `--host` for a provider-neutral core trial.
+
 ## 1. Prepare CharterMesh
 
 GitHub package path, with no manual source checkout:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 version --json
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 propose `
+npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1 version --json
+npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1 propose `
   --target C:\path\to\target `
   --profile balanced
 ```
 
-The tag selects this guide's pre-alpha friend-trial version, but a Git tag is
-movable and is not a cryptographic commit attestation. Omit `#v0.0.9-alpha.1`
-only when intentionally testing the latest `main` branch.
+The tag selects this prerelease, but a Git tag is movable and is not a
+cryptographic commit attestation. Do not silently omit the tag to select `main`.
 
 This requires an explicitly authorized package download, Git 2.x, and normal
 npm lifecycle scripts so the dependency-free `prepare` build can run. An
@@ -30,22 +34,37 @@ or source checkout. For source development:
 ```powershell
 git clone https://github.com/jade-blanco/chartermesh.git chartermesh
 cd chartermesh
+git checkout v0.0.10-alpha.1
 node --version
 pnpm verify
 ```
 
 Node.js 24 or newer is required. No runtime npm dependency is needed.
 
-With a coding agent, provide the repository URL and say:
+With a coding agent, provide the target path, the repository URL/ref (or a
+reviewed matching checkout), and your actual project goal, then say:
 
-> Apply CharterMesh to this project.
+> Use CharterMesh v0.0.10-alpha.1. Treat my goal as the project brief.
+> Follow `BOOTSTRAP.md` and
+> the `organization-bootstrap` skill, select the matching team template and a
+> defensible profile, and generate one no-write `kickoff` plan containing the
+> team, work allocation, handoffs, approval rules, and first WorkItem. If you
+> are Codex or Claude, include that host; otherwise omit `--host` and use the
+> provider-neutral entrypoint and handoff packets. Show the exact plan hash and
+> do not write until I approve that hash.
 
 The agent must follow `BOOTSTRAP.md` and use the repository CLI.
 
-The approved bootstrap also installs five Apache-2.0 portable skills—
-`web-research`, `repository-diagnostics`, `small-model-evidence`,
+The approved bootstrap also installs six Apache-2.0 portable skills—
+`organization-bootstrap`, `web-research`, `repository-diagnostics`, `small-model-evidence`,
 `tool-grounded-implementation`, and `integration-review`—plus
 `.chartermesh/AGENT-ENTRYPOINT.md`. Inspect them without model or network use:
+
+The examples below use the source command `node bin/chartermesh.mjs`. Without a
+checkout, replace that prefix with
+`npx --yes github:jade-blanco/chartermesh#v0.0.10-alpha.1`; all command options
+stay the same. The initial package download requires network access; the
+installed offline inspection commands do not call a model.
 
 ```powershell
 node bin/chartermesh.mjs skills list --json
@@ -57,6 +76,7 @@ node bin/chartermesh.mjs capabilities recommend --json
 ```powershell
 node bin/chartermesh.mjs propose `
   --target C:\path\to\target `
+  --team-template software-product `
   --profile balanced
 ```
 
@@ -64,13 +84,21 @@ node bin/chartermesh.mjs propose `
 package manager, tests, CI, and deployment/infrastructure signals. It does not
 write to the target.
 
-Profiles:
+Team templates describe the work domain: `general`, `software-product`,
+`research`, `content-production`, `data-analysis`, and `operations`. Profiles
+describe role separation:
 
-- `lean`: one worker and conservative budgets.
-- `balanced`: one worker with moderate local budgets.
-- `controlled`: worker plus verifier and a separate verification stage.
+- `lean`: one domain operator and conservative budgets.
+- `balanced`: coordinator plus domain operator.
+- `controlled`: coordinator, domain operator, and independent verifier.
 
 ## 3. Preview and approve the exact plan
+
+> **Choose one path:** for a new or empty project with a goal, skip the
+> `bootstrap` commands immediately below and use **Start from an empty project
+> brief**. The `bootstrap` path is retained for an existing project that needs
+> only the provider-neutral core; it does not create the goal-bound team
+> charter and initial WorkItem.
 
 ```powershell
 node bin/chartermesh.mjs bootstrap `
@@ -99,18 +127,30 @@ commands report an incomplete replacement without mutating it. Use explicit
 
 ### Start from an empty project brief
 
-For a brand-new folder, `kickoff` combines bootstrap and the first requested
-WorkItem. The target directory must already exist; create it before the
-no-write preview. Put the intended service or product in a brief file:
+For a brand-new folder, `kickoff` combines bootstrap, team setup, optional host
+projection, and the first requested WorkItem. The target directory must already
+exist; create it before the no-write preview. Put the intended service or
+product in a brief file outside the target. If a host-bound preview is first
+run without `--executable-sha256`, the CLI reports the observed digest and exits
+without starting the host. Repeat the preview with that value as `HOST_SHA256`;
+this read-only preflight does not create a second CharterMesh approval. Codex
+project trust or Claude's one-time MCP permission remains a separate host UI
+action and does not approve the plan:
 
 ```powershell
+$CM = "C:\path\to\chartermesh\bin\chartermesh.mjs"
 $Target = "C:\path\to\new-project"
+$Brief = "C:\path\to\project-brief.md"
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 kickoff `
+node $CM kickoff `
   --target $Target `
-  --brief-file C:\path\to\project-brief.md `
+  --brief-file $Brief `
+  --team-template software-product `
   --profile controlled `
   --engine fake `
+  --host codex `
+  --executable-sha256 HOST_SHA256 `
+  --allow-unrestricted-read `
   --acceptance "The implementation satisfies the approved brief and reports verification evidence." `
   --json
 ```
@@ -118,23 +158,34 @@ npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 kickoff `
 Review the no-write response, then repeat every option and append
 `--approve PLAN_HASH`. The apply stores the immutable brief and creates one
 ready `operator` WorkItem; team setup is not counted as a model call. Use
-`controlled` when the trial should project both operator and verifier roles;
-`balanced` intentionally creates only one operator.
+`controlled` when the trial should separate coordinator, operator, and
+verifier. The same approved plan writes `.chartermesh/TEAM-CHARTER.md` and,
+when `--host` is supplied, projects the host roles and MCP bridge. Omit
+`--host` for a core-only installation. A missing `--team-template` safely
+falls back to the general team.
+
+The first Control Plane WorkItem remains owned by `operator`. Coordinator and
+verifier stages use the charter's bounded copy/paste consultation packets in
+this release; they do not become separate claimable WorkItems merely because
+host role files exist. Assign a separate role-owned WorkItem before allowing a
+consulting role to mutate Control Plane state.
 
 ### Project the team into Codex or Claude Code
 
 The host check starts no model call:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 host doctor `
-  --host codex --target C:\path\to\new-project --json
+node $CM host doctor `
+  --host codex --target $Target --json
 ```
 
-Generate and separately approve the host projection:
+If the project was kicked off without `--host`, generate and separately
+approve the later host projection:
 
 ```powershell
-npx --yes github:jade-blanco/chartermesh#v0.0.9-alpha.1 configure-host `
-  --host codex --target C:\path\to\new-project `
+node $CM configure-host `
+  --host codex --target $Target `
+  --executable-sha256 HOST_SHA256 `
   --allow-unrestricted-read --max-agents 4 --json
 ```
 
@@ -159,11 +210,12 @@ and approves its exact Decision Packet with `approve-tool`; a new claim then
 applies only the stored approved bytes through a recoverable transaction and
 records evidence. The MCP server cannot approve its own change set.
 
-For Codex only, repeat `--activate-role operator` in the preview and approved
-command if `chartermesh run` should
-invoke the experimental app-server adapter. The
-`--allow-unrestricted-read` acknowledgement already present in the host plan
-records that
+For Codex only, direct `chartermesh run` execution is a later, optional
+`configure-host` change. Preview and separately approve a `configure-host`
+plan containing `--activate-role operator --allow-unrestricted-read` if the
+experimental app-server adapter should be enabled. `kickoff` intentionally
+rejects `--activate-role`; its one-plan host path provides project roles and MCP
+only. The acknowledgement records that
 Codex's read-only sandbox does not confine reads to the project directory.
 That path can consume the user's Codex quota. A role whose writes require
 CharterMesh approval remains read-only because provider permission prompts are
@@ -280,6 +332,25 @@ node bin/chartermesh.mjs scheduler tick --target C:\path\to\target --json
 The default organization contains no schedules. An active local controller
 schedule checks the queue before model inference and records an empty tick
 without a model start. See `USAGE.md` before enabling a watcher.
+
+## Refresh an installed project
+
+Do not rerun bootstrap to reset a customized project. Inspect its settings,
+then preview a `configure-project` refresh that keeps the organization,
+preferences, and unrelated user-written guide text:
+
+```powershell
+node bin/chartermesh.mjs project-config --target C:\path\to\target --json
+node bin/chartermesh.mjs configure-project --target C:\path\to\target --json
+```
+
+After a person approves the returned hash, repeat the second command with
+`--approve PLAN_HASH`. This can refresh installation/version references and
+managed guidance without replacing the team with a default template. Supply
+candidate files only when you intend to change the organization or preferences;
+see [Project customization](PROJECT-CUSTOMIZATION.md) for those boundaries.
+Organization changes require a new MCP/dashboard session before mutations can
+continue. Read-only inspection remains available.
 
 ## Removal
 

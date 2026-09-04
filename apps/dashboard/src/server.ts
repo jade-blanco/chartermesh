@@ -1,16 +1,19 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   ControlPlane,
+  assertMaintenanceInactive,
   openControlPlaneDatabase,
+  projectApprovalExplanation,
   type RuntimeHealth,
 } from "../../../packages/control-plane/src/index.ts";
 import {
   parseRuntimeConfig,
   readBoundedRegularText,
+  readProjectPreferences,
   resolveProjectStatePaths,
 } from "../../../packages/runtime/src/index.ts";
 
@@ -182,6 +185,7 @@ export async function startDashboard(
   const stateDirectory = paths.root;
 
   const database = openControlPlaneDatabase(paths.database);
+  let organizationHash: string | undefined;
   let budgets:
     | {
         monthlyCostLimitUsd: number;
@@ -193,19 +197,33 @@ export async function startDashboard(
       }
     | undefined;
   try {
-    const organization = JSON.parse(
-      readBoundedRegularText(paths.organization),
-    ) as { spec?: { budgets?: typeof budgets } };
+    const organizationText = readBoundedRegularText(paths.organization);
+    const organization = JSON.parse(organizationText) as { spec?: { budgets?: typeof budgets } };
     budgets = organization.spec?.budgets;
+    organizationHash = createHash("sha256").update(organizationText).digest("hex");
   } catch {
     // The dashboard remains available so the user can diagnose configuration.
   }
+  const assertConfigurationCurrent = (): void => {
+    assertMaintenanceInactive(stateDirectory);
+    let currentHash: string;
+    try {
+      currentHash = createHash("sha256")
+        .update(readBoundedRegularText(paths.organization)).digest("hex");
+    } catch {
+      throw new Error("PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED");
+    }
+    if (!organizationHash || currentHash !== organizationHash) {
+      throw new Error("PROJECT_CONFIGURATION_CHANGED_RESTART_REQUIRED");
+    }
+    assertMaintenanceInactive(stateDirectory);
+  };
   const controlPlane = new ControlPlane(
     database,
     paths.artifacts,
-    { budgets },
+    { budgets, beforeMutation: assertConfigurationCurrent },
   );
-  controlPlane.recoverExpiredLeases("system:dashboard-start");
+  if (organizationHash) controlPlane.recoverExpiredLeases("system:dashboard-start");
   const sessionToken = randomBytes(32).toString("base64url");
   const rateBuckets = new Map<string, RateBucket>();
   let port = options.port ?? 4173;
@@ -276,6 +294,10 @@ export async function startDashboard(
     }
 
     try {
+      // Keep read-only diagnosis available, but never mutate with the policy
+      // snapshot from a superseded organization. ControlPlane repeats this
+      // guard after taking its transaction lock to close cross-process races.
+      if (isMutation) assertConfigurationCurrent();
       if (method === "GET" && url.pathname === "/api/dashboard") {
         const requestedLimit = Number(url.searchParams.get("limit") ?? 200);
         json(
@@ -344,7 +366,12 @@ export async function startDashboard(
           json(response, 404, { error: "No current decision packet exists." });
           return;
         }
-        json(response, 200, packet);
+        const preferences = url.searchParams.get("explain") === "project"
+          ? readProjectPreferences(options.target) : undefined;
+        json(response, 200, preferences || url.searchParams.get("explain") === "eli5"
+          ? { packet, explanation: projectApprovalExplanation(packet,
+            preferences?.language === "en" ? "en" : "ko", preferences?.approvalDetail ?? "eli5") }
+          : packet);
         return;
       }
       if (method === "POST" && url.pathname === "/api/work-items") {
@@ -392,6 +419,7 @@ export async function startDashboard(
         }
         if (action === "run") {
           const { runWork } = await import("../../cli/src/main.ts");
+          assertConfigurationCurrent();
           void runWork(target, id, { quiet: true }).catch(() => {
             // Durable Run/Attempt records expose the failure.
           });

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, posix } from "node:path";
 import { canonicalJson } from "../../orgspec/src/index.ts";
+import { humanApprovalWritingGuidance } from "./portable-skills.ts";
 
 export type HostKind = "codex" | "claude";
 
@@ -642,9 +643,12 @@ function commonRoleInstructions(
     `CharterMesh Organization role id: ${role.id}.`,
     `Claim and mutate only WorkItems whose ownerRole is exactly ${role.id}.`,
     `Read ${entrypointPath} before acting.`,
+    `Read .chartermesh/PREFERENCES.md at the start of every session when present. Apply project guidance and only the guidance for role ${role.id} within OrgSpec and exact approved task boundaries. Preferences cannot grant permissions, tools, budgets, approval bypass, or a separate work ledger.`,
+    "Read .chartermesh/TEAM-CHARTER.md when present. A complete CharterMesh handoff packet may ask you to provide a bounded read-only consultation for a WorkItem owned by another role; in that case do not claim or mutate the WorkItem, and return a copy/paste response packet to the sender.",
     "Treat the CharterMesh Control Plane as the sole mutable WorkItem and approval ledger.",
     "Use the CharterMesh MCP bridge for claims, heartbeats, progress or blocking, governed workspace-write requests, artifacts, and failures.",
     "Never resolve a human approval yourself or treat a host permission prompt as CharterMesh approval.",
+    humanApprovalWritingGuidance,
     permissionText,
     "",
     role.instructions,
@@ -751,9 +755,11 @@ function renderPointer(entrypointPath: string): string {
     "## CharterMesh host integration",
     "",
     `Read \`${entrypointPath}\` before acting on this project.`,
+    "Read `.chartermesh/PREFERENCES.md` at the start of every session when present. Apply project guidance and only the current assigned role's guidance within OrgSpec and exact approved task boundaries; preferences cannot grant permissions, tools, budgets, approval bypass, or a separate work ledger.",
     "Use the configured `chartermesh` MCP server for Control Plane operations.",
     "Keep requirements, integration, and final verification with the primary agent; delegate bounded work to projected roles.",
     "A host permission prompt or model review never satisfies a CharterMesh human approval.",
+    humanApprovalWritingGuidance,
     "Projected roles are denied native writes. They may request one bounded content-addressed workspace change set through MCP; only a separate human Control Plane approval followed by a new claim permits execution of the stored bytes and evidence recording.",
     "The parent host session has separate permissions; do not use them to bypass CharterMesh approval or evidence requirements.",
     "",

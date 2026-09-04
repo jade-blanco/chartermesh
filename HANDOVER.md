@@ -7,7 +7,8 @@
   projection boundaries.
 - OrgSpec, the SQLite Control Plane, the safe Tool Runtime, recoverable apply,
   operational backup/audit controls, the reviewed-work dashboard, and a
-  dependency-free package build are present at `0.0.9-alpha.1`.
+  dependency-free package build are present. The current prerelease is
+  `0.0.10-alpha.1`; its GitHub package can be used without a manual checkout.
 - `ModelEngine`, `AgentHost`, and `ManagedRunner` are separate contracts;
   generic and fake engines are the primary foundation, while Codex and Claude
   Code remain optional host adapters.
@@ -50,6 +51,30 @@ git status --short
 13. Fresh-project kickoff, namespaced Codex/Claude role projection, a required
     local MCP bridge, exact-fenced multi-file approvals, and the direct Codex
     AgentHost v1alpha2 slice.
+14. Project-type team templates, generated team design and human-readable team
+    charter, copy/paste handoffs, exact approval rules, and same-plan
+    Codex/Claude project-role projection.
+15. Plain-language-first human approvals with exact evidence and authority
+    boundaries retained; ELI5 is the default rather than a quality guarantee.
+16. Read-only `project-config` and exact-approved `configure-project` for saved
+    preferences and complete validated organization revisions. Customized
+    projects are protected from ordinary bootstrap overwrites; connection
+    changes preserve their advisory preferences. Active execution blocks changes,
+    unfinished work must retain valid references, and work state is hash-bound.
+    Native projection refresh supports one re-attested Codex or Claude host,
+    retires removed roles, and requires a fresh session.
+
+The customization contract and constraints are in
+`docs/PROJECT-CUSTOMIZATION.md` and ADR 0025. It does not weaken current approval
+policy, change connection/schedule authority, train models, or create a second
+work ledger. ELI5 can be explicitly refined to concise or technical presentation
+without dropping hashes, risk disclosure, or claimed-versus-verified status.
+Release verification uses the full `pnpm verify` over the integrated changes;
+do not substitute partial test runs. Installed projects refresh through an
+exact-approved `configure-project` plan, not a default bootstrap overwrite.
+Pending marker and exact plan metadata are stored atomically before file
+replacement. Old MCP/dashboard sessions reject mutations after an organization
+change and need restarting; preference-only read refresh stays available.
 
 ## Next implementation slice
 

@@ -1,8 +1,8 @@
 # Implementation roadmap
 
-Current milestone: `0.0.9-alpha.1`, verifiable Decision Packets, safe
-decision-review resume, provider-neutral local operations, and the first
-bounded coding-agent host integration.
+Current milestone: `0.0.10-alpha.1`, project-type-aware one-setup onboarding,
+verifiable Decision Packets, safe decision-review resume, provider-neutral
+local operations, and bounded coding-agent host integration.
 
 ## Completed foundation
 

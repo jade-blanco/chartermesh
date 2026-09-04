@@ -45,6 +45,7 @@ import {
   createControlPlaneBackup,
   listControlPlaneBackups,
   openControlPlaneDatabase,
+  projectApprovalExplanation,
   readControlPlaneBackup,
   validateControlPlaneDatabase,
   type WaitCondition,
@@ -72,6 +73,9 @@ import {
   parseStructuredArtifact,
   portableAgentEntrypoint,
   portableSkillDocuments,
+  readProjectPreferences,
+  parseProjectPreferences,
+  renderProjectPreferences,
   readBoundedRegularText,
   recommendedCapabilities,
   resolveProjectStatePaths,
@@ -87,7 +91,11 @@ import {
   createProposal,
   type OrganizationProposal,
   type ProposalProfile,
+  type TeamDesign,
+  type TeamTemplateId,
 } from "./proposal.ts";
+import { renderTeamCharter } from "./team-charter.ts";
+import { validateOrganizationCustomization, renderCustomTeamCharter } from "./project-customization.ts";
 import { evaluateModelEngine } from "./evaluate-model.ts";
 import { evaluateCollaboration } from "./evaluate-collaboration.ts";
 import { runControlPlaneMcpStdio } from "./mcp-server.ts";
@@ -99,6 +107,7 @@ import {
   listPendingApplyOperations,
   markApplyOperationDatabaseCommitted,
   markApplyOperationFilesCommitted,
+  validateApplyOperationPlan,
   type ApplyOperationReceipt,
   type JsonValue,
 } from "./apply-operation-journal.ts";
@@ -154,7 +163,7 @@ import {
 } from "./decision-review-evaluation/resume.ts";
 
 const CLI_API_VERSION = "chartermesh.dev/cli/v1alpha1";
-const CHARTERMESH_VERSION = "0.0.9-alpha.1";
+const CHARTERMESH_VERSION = "0.0.10-alpha.1";
 const CHARTERMESH_GITHUB_REF =
   `github:jade-blanco/chartermesh#v${CHARTERMESH_VERSION}`;
 
@@ -167,10 +176,11 @@ interface BootstrapFile {
 
 interface BootstrapPlan {
   apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1";
-  operation: "bootstrap" | "kickoff" | "configure-engine" | "configure-host";
+  operation: "bootstrap" | "kickoff" | "configure-engine" | "configure-host" | "configure-project";
   target: string;
   engine: string;
   files: BootstrapFile[];
+  projectGuard?: { workSnapshotHash: string };
   kickoff?: {
     title: string;
     summary: string;
@@ -203,6 +213,23 @@ interface BootstrapPlan {
     fromExecutionTarget: string;
     toExecutionTarget: string;
   }>;
+  onboarding?: {
+    teamTemplate: TeamTemplateId;
+    teamSource: TeamDesign["source"];
+    entryRole: string;
+    roleIds: string[];
+    stageIds: string[];
+    teamCharterPath: ".chartermesh/TEAM-CHARTER.md";
+    handoffMode: "copy_paste";
+    allocationMode: "single_entry_work_item_with_manual_role_consultations";
+    approvalMode: "exact_hash_human";
+    executionBoundary: TeamDesign["executionBoundary"];
+    hostProjection?: {
+      kind: HostKind;
+      executionTarget: string;
+      newSessionRequired: true;
+    };
+  };
   planHash: string;
 }
 
@@ -405,7 +432,7 @@ function assertNoPendingFileTransactions(target: string): void {
   }
 }
 
-function controlPlaneFor(target: string) {
+function controlPlaneFor(target: string, expectedRuntime?: RuntimeConfig) {
   const paths = statePaths(target);
   const database = openControlPlaneDatabase(paths.database);
   let budgets:
@@ -418,10 +445,13 @@ function controlPlaneFor(target: string) {
         maxWorkItemArtifactBytes?: number;
       }
     | undefined;
-  if (existsSync(paths.organization)) {
+  const organizationText = existsSync(paths.organization) ? readBoundedRegularText(paths.organization) : null;
+  const organizationHash = organizationText === null ? null : createHash("sha256").update(organizationText).digest("hex");
+  const expectedRuntimeHash = expectedRuntime ? sha256(expectedRuntime) : undefined;
+  if (organizationText !== null) {
     try {
       const organization = JSON.parse(
-        readBoundedRegularText(paths.organization),
+        organizationText,
       ) as {
         spec?: { budgets?: typeof budgets };
       };
@@ -433,7 +463,13 @@ function controlPlaneFor(target: string) {
   return {
     paths,
     database,
-    controlPlane: new ControlPlane(database, paths.artifacts, { budgets }),
+    controlPlane: new ControlPlane(database, paths.artifacts, { budgets, beforeMutation: () => {
+      const currentHash = existsSync(paths.organization)
+        ? createHash("sha256").update(readBoundedRegularText(paths.organization)).digest("hex") : null;
+      if (currentHash !== organizationHash || (expectedRuntimeHash && sha256(readRuntime(target)) !== expectedRuntimeHash)) {
+        throw new Error("PROJECT_CONFIGURATION_CHANGED: retry the command using the current organization and runtime.");
+      }
+    } }),
   };
 }
 
@@ -488,6 +524,27 @@ function profileOf(args: string[]): ProposalProfile {
   return value as ProposalProfile;
 }
 
+const teamTemplateIds = [
+  "general",
+  "software-product",
+  "research",
+  "content-production",
+  "data-analysis",
+  "operations",
+] as const satisfies readonly TeamTemplateId[];
+
+function teamTemplateOf(args: string[]): TeamTemplateId | undefined {
+  const value = option(args, "--team-template");
+  if (value === undefined) return undefined;
+  if (!(teamTemplateIds as readonly string[]).includes(value)) {
+    throw new Error(
+      "--team-template must be general, software-product, research, " +
+        "content-production, data-analysis, or operations.",
+    );
+  }
+  return value as TeamTemplateId;
+}
+
 function pricingFrom(args: string[]) {
   const input = option(args, "--input-price-per-million");
   const output = option(args, "--output-price-per-million");
@@ -513,9 +570,22 @@ function pricingFrom(args: string[]) {
   };
 }
 
-function proposalFor(args: string[]): OrganizationProposal {
+function proposalFor(
+  args: string[],
+  defaultTeamTemplate?: TeamTemplateId,
+): OrganizationProposal {
+  const explicitTeamTemplate = teamTemplateOf(args);
+  const teamTemplate = explicitTeamTemplate ?? defaultTeamTemplate;
   return createProposal(targetOf(args), profileOf(args), {
     webSearch: option(args, "--web-search-searxng") !== undefined,
+    ...(teamTemplate
+      ? {
+          teamTemplate,
+          teamTemplateSource: explicitTeamTemplate
+            ? "explicit" as const
+            : "kickoff_default" as const,
+        }
+      : {}),
   });
 }
 
@@ -668,13 +738,27 @@ function runtimeTemplate(args: string[]): RuntimeConfig {
   }, args);
 }
 
-function bootstrapPlan(args: string[]): BootstrapPlan {
+function bootstrapPlan(
+  args: string[],
+  defaultTeamTemplate?: TeamTemplateId,
+): BootstrapPlan {
   const target = targetOf(args);
   assertNoPendingFileTransactions(target);
   const runtime = runtimeTemplate(args);
   const paths = statePaths(target);
-  const proposal = proposalFor(args);
+  if (existsSync(join(paths.root, "project-customization.json"))) {
+    throw new Error("PROJECT_CUSTOMIZED: use configure-project to refresh or change this project; bootstrap would replace its approved custom settings.");
+  }
+  const preferences = readProjectPreferences(target);
+  const proposal = proposalFor(args, defaultTeamTemplate);
   const desired = [
+    {
+      path: join(paths.root, "preferences.json"),
+      content: existsSync(join(paths.root, "preferences.json"))
+        ? readBoundedRegularText(join(paths.root, "preferences.json"), { maxBytes: 1024 * 1024 })
+        : `${JSON.stringify(preferences, null, 2)}\n`,
+    },
+    { path: join(paths.root, "PREFERENCES.md"), content: renderProjectPreferences(preferences) },
     {
       path: paths.proposal,
       content: `${JSON.stringify(proposal, null, 2)}\n`,
@@ -696,11 +780,20 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
           proposalHash: proposal.proposalHash,
           assessmentHash: proposal.assessment.assessmentHash,
           profile: proposal.profile,
+          ...(proposal.teamDesign
+            ? { teamTemplate: proposal.teamDesign.template }
+            : {}),
         },
         null,
         2,
       )}\n`,
     },
+    ...(proposal.teamDesign
+      ? [{
+          path: join(paths.root, "team-design.json"),
+          content: `${JSON.stringify(proposal.teamDesign, null, 2)}\n`,
+        }]
+      : []),
     {
       path: join(paths.root, ".gitignore"),
       content: [
@@ -724,6 +817,7 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
         "# CharterMesh local state",
         "",
         "- `proposal.json`, `organization.json`, and `runtime.json` are reviewable desired configuration.",
+        "- `team-design.json` and `TEAM-CHARTER.md` describe approved roles, allocation, handoffs, and human approval rules when kickoff is used.",
         "- `installation.json` pins the CharterMesh version and proposal hashes.",
         "- `state.db` is the local mutable ledger and is ignored by Git.",
         "- `backups/` and `exports/` can contain private operational metadata and are ignored by Git.",
@@ -763,7 +857,75 @@ function bootstrapPlan(args: string[]): BootstrapPlan {
   return { ...body, planHash: sha256(body) };
 }
 
-function kickoffPlan(args: string[]): BootstrapPlan {
+function inferredKickoffTitle(brief: string): string {
+  const preferredLabels = new Set([
+    "name",
+    "title",
+    "goal",
+    "objective",
+    "project name",
+    "project title",
+    "project goal",
+    "project objective",
+    "이름",
+    "제목",
+    "목표",
+    "목적",
+    "프로젝트명",
+    "프로젝트 명",
+    "프로젝트 제목",
+    "프로젝트 목표",
+    "프로젝트 목적",
+  ]);
+  const genericLabels = new Set([
+    "type",
+    "category",
+    "requirements",
+    "constraints",
+    "acceptance criteria",
+    "project type",
+    "project category",
+    "유형",
+    "분류",
+    "요구사항",
+    "제약사항",
+    "승인 기준",
+    "프로젝트 유형",
+    "프로젝트 분류",
+  ]);
+  let takeNextAsPreferred = false;
+  const preferred: string[] = [];
+  const headings: string[] = [];
+  const fallback: string[] = [];
+  for (const rawLine of brief.split(/\r?\n/u)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    const isHeading = /^#+\s*/u.test(trimmed);
+    const clean = trimmed.replace(/^#+\s*/u, "").trim();
+    if (!clean) continue;
+    const label = clean.replace(/[：:]$/u, "").trim().toLowerCase();
+    if (isHeading && preferredLabels.has(label)) {
+      takeNextAsPreferred = true;
+      continue;
+    }
+    if (isHeading && genericLabels.has(label)) {
+      takeNextAsPreferred = false;
+      continue;
+    }
+    if (takeNextAsPreferred && !isHeading) {
+      preferred.push(clean);
+      takeNextAsPreferred = false;
+    } else if (isHeading) {
+      takeNextAsPreferred = false;
+      headings.push(clean);
+    }
+    fallback.push(clean);
+  }
+  return (preferred[0] ?? headings[0] ?? fallback[0] ??
+    "Implement the approved project brief").slice(0, 240);
+}
+
+async function kickoffPlan(args: string[]): Promise<BootstrapPlan> {
   const briefFile = option(args, "--brief-file");
   if (!briefFile) {
     throw new Error("kickoff requires --brief-file PATH.");
@@ -782,17 +944,46 @@ function kickoffPlan(args: string[]): BootstrapPlan {
   }
   const brief = rawBrief.trim();
   if (!brief) throw new Error("Project brief cannot be empty.");
-  const base = bootstrapPlan(args);
-  const titleFromBrief = brief
-    .split(/\r?\n/u)
-    .map((line) => line.replace(/^#+\s*/u, "").trim())
-    .find(Boolean) ?? "Implement the approved project brief";
+  let base = bootstrapPlan(args, "general");
+  if (option(args, "--host") !== undefined) {
+    base = await withInitialHostProjection(base, args);
+  }
+  const titleFromBrief = inferredKickoffTitle(brief);
   const title = (option(args, "--title") ?? titleFromBrief).trim();
   if (!title || title.length > 240) {
     throw new Error("Kickoff title must contain 1 to 240 characters.");
   }
-  const ownerRole = option(args, "--role") ?? "operator";
-  const executionTarget = option(args, "--execution-target") ?? "local";
+  const proposalFile = base.files.find(
+    ({ path }) => path === statePaths(base.target).proposal,
+  );
+  const organizationFile = base.files.find(
+    ({ path }) => path === statePaths(base.target).organization,
+  );
+  if (!proposalFile || !organizationFile) {
+    throw new Error("Kickoff plan is missing its proposal or organization file.");
+  }
+  const proposal = JSON.parse(proposalFile.content) as OrganizationProposal;
+  const organization = parseOrgSpec(organizationFile.content);
+  if (!proposal.teamDesign) {
+    throw new Error("Kickoff requires a generated team design.");
+  }
+  const ownerRole = option(args, "--role") ?? proposal.teamDesign.entryRole;
+  const selectedRole = organization.spec.roles.find(({ id }) => id === ownerRole);
+  if (!selectedRole) {
+    throw new Error(
+      `--role '${ownerRole}' is not present in the generated team design.`,
+    );
+  }
+  const executionTarget =
+    option(args, "--execution-target") ?? selectedRole.execution.preferred;
+  const selectedTarget = organization.spec.executionTargets.find(
+    ({ id }) => id === executionTarget,
+  );
+  if (!selectedTarget?.enabled) {
+    throw new Error(
+      `--execution-target '${executionTarget}' is not an enabled target in the generated organization.`,
+    );
+  }
   const priority = Number(option(args, "--priority") ?? 70);
   if (!Number.isInteger(priority) || priority < 0 || priority > 100) {
     throw new Error("--priority must be an integer from 0 to 100.");
@@ -820,6 +1011,7 @@ function kickoffPlan(args: string[]): BootstrapPlan {
     `(SHA-256 ${briefHash}).\n\n`;
   const summary = `${summaryPrefix}${brief}`.slice(0, 4_000);
   const projectBriefPath = join(base.target, ".chartermesh", "PROJECT-BRIEF.md");
+  const teamCharterPath = join(base.target, ".chartermesh", "TEAM-CHARTER.md");
   const rootGuidePath = join(base.target, "CHARTERMESH.md");
   const extraDesired = [
     {
@@ -827,11 +1019,28 @@ function kickoffPlan(args: string[]): BootstrapPlan {
       content: `${brief}\n`,
     },
     {
+      path: teamCharterPath,
+      content: renderTeamCharter({
+        projectTitle: title,
+        briefHash,
+        profile: proposal.profile,
+        teamDesign: proposal.teamDesign,
+        approvalRequiredTools: [
+          ...new Set(
+            organization.spec.roles.flatMap(
+              ({ tools }) => tools.approvalRequired ?? [],
+            ),
+          ),
+        ],
+      }),
+    },
+    {
       path: rootGuidePath,
       content: [
         "# CharterMesh project",
         "",
         "The approved project brief is `.chartermesh/PROJECT-BRIEF.md`.",
+        "The approved team, work allocation, copy/paste handoffs, and human approval matrix are in `.chartermesh/TEAM-CHARTER.md`.",
         "Mutable work, runs, host bindings, evidence, and decisions live in the local Control Plane database.",
         "Do not replace that ledger with a Markdown task list or a provider-native task list.",
         "",
@@ -870,6 +1079,28 @@ function kickoffPlan(args: string[]): BootstrapPlan {
       "Does the result satisfy the approved project brief?",
     acceptanceCriteria: criteria,
   };
+  const projectedHostKind = option(args, "--host") as HostKind | undefined;
+  const onboarding: NonNullable<BootstrapPlan["onboarding"]> = {
+    teamTemplate: proposal.teamDesign.template,
+    teamSource: proposal.teamDesign.source,
+    entryRole: proposal.teamDesign.entryRole,
+    roleIds: proposal.teamDesign.roles.map(({ id }) => id),
+    stageIds: proposal.teamDesign.stages.map(({ id }) => id),
+    teamCharterPath: ".chartermesh/TEAM-CHARTER.md",
+    handoffMode: "copy_paste",
+    allocationMode: "single_entry_work_item_with_manual_role_consultations",
+    approvalMode: "exact_hash_human",
+    executionBoundary: proposal.teamDesign.executionBoundary,
+    ...(projectedHostKind
+      ? {
+          hostProjection: {
+            kind: projectedHostKind,
+            executionTarget: `${projectedHostKind}-project`,
+            newSessionRequired: true as const,
+          },
+        }
+      : {}),
+  };
   const body = {
     apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1" as const,
     operation: "kickoff" as const,
@@ -877,6 +1108,8 @@ function kickoffPlan(args: string[]): BootstrapPlan {
     engine: base.engine,
     files,
     kickoff,
+    onboarding,
+    ...(base.hostBinding ? { hostBinding: base.hostBinding } : {}),
   };
   return { ...body, planHash: sha256(body) };
 }
@@ -977,7 +1210,22 @@ async function inspectHost(
   const observedSha256 = createHash("sha256")
     .update(readFileSync(located))
     .digest("hex");
-  const expectedSha256 = option(args, "--executable-sha256") ?? observedSha256;
+  const explicitExpectedSha256 = option(args, "--executable-sha256");
+  if (
+    explicitExpectedSha256 !== undefined &&
+    !/^[a-f0-9]{64}$/u.test(explicitExpectedSha256)
+  ) {
+    throw new Error("--executable-sha256 must be a lowercase SHA-256 digest.");
+  }
+  if (
+    explicitExpectedSha256 !== undefined &&
+    explicitExpectedSha256 !== observedSha256
+  ) {
+    throw new Error(
+      "Host executable bytes do not match --executable-sha256; no host process was started.",
+    );
+  }
+  const expectedSha256 = explicitExpectedSha256 ?? observedSha256;
   let observedVersionOutput = "";
   const result = await discoverHost(
     {
@@ -1150,6 +1398,7 @@ function assertMergeableCodexToml(text: string): void {
   let table = "";
   for (const [offset, line] of text.replaceAll("\r\n", "\n").split("\n").entries()) {
     const lineNumber = offset + 1;
+    if (/^\s*#/u.test(line)) continue;
     if (/^\s*\[\[/u.test(line)) {
       throw new Error(
         `Codex config contains an array table at line ${lineNumber}; refusing an ambiguous merge.`,
@@ -1409,6 +1658,216 @@ function projectionContent(target: string, operation: HostProjectionOperation): 
     return mergeClaudeMcpJson(existing, operation.content);
   }
   return upsertMarkdownProjection(existing, operation.sectionId, operation.content);
+}
+
+async function withInitialHostProjection(
+  base: BootstrapPlan,
+  args: string[],
+): Promise<BootstrapPlan> {
+  if (options(args, "--activate-role").length > 0 || has(args, "--direct")) {
+    throw new Error(
+      "kickoff --host creates project roles and the MCP bridge in one approved plan; " +
+      "--activate-role and --direct are only available to configure-host after initialization.",
+    );
+  }
+  if (option(args, "--executable-sha256") === undefined) {
+    const hostKind = hostKindOf(args);
+    const executableInput = option(args, "--executable") ?? hostKind;
+    const located = locateHostExecutable(executableInput);
+    if (!located) {
+      throw new Error(
+        `${hostKind} executable was not found. Pass --executable ABSOLUTE_PATH.`,
+      );
+    }
+    const observedSha256 = createHash("sha256")
+      .update(readFileSync(located))
+      .digest("hex");
+    throw new Error(
+      "kickoff --host will execute the host only after its bytes are explicitly bound. " +
+        `Repeat with --executable-sha256 ${observedSha256}; no host process was started.`,
+    );
+  }
+  const binding = await inspectHost(base.target, args);
+  if (binding.hostKind === "codex" && !has(args, "--allow-unrestricted-read")) {
+    throw new Error(
+      "Configuring Codex roles requires --allow-unrestricted-read because its read-only sandbox does not confine reads to the project directory.",
+    );
+  }
+  const paths = statePaths(base.target);
+  const organizationFile = base.files.find(
+    ({ path }) => path === paths.organization,
+  );
+  const proposalFile = base.files.find(({ path }) => path === paths.proposal);
+  const installationFile = base.files.find(
+    ({ path }) => path === paths.installation,
+  );
+  if (!organizationFile || !proposalFile || !installationFile) {
+    throw new Error(
+      "Initial host projection requires organization, proposal, and installation files.",
+    );
+  }
+  const organization = parseOrgSpec(organizationFile.content);
+  const projectHostId = `${binding.hostKind}-project-host`;
+  const projectTargetId = `${binding.hostKind}-project`;
+  const roles = organization.spec.roles.map((role) => ({
+    id: role.id,
+    description: `${role.name}: ${role.class} role for ${organization.metadata.name}.`,
+    instructions: [
+      `Fulfill the '${role.id}' role using capabilities: ${role.capabilities.join(", ") || "none"}.`,
+      `Allowed tools: ${role.tools.allow.join(", ") || "none"}.`,
+      role.tools.approvalRequired?.length
+        ? `The following tools still require Control Plane approval: ${role.tools.approvalRequired.join(", ")}.`
+        : "Do not infer any additional approval authority.",
+    ].join("\n"),
+    permission:
+      role.tools.allow.includes("workspace.write_file") &&
+        !role.tools.approvalRequired?.includes("workspace.write_file")
+        ? "workspace_write" as const
+        : "read_only" as const,
+  }));
+  const projection = createHostProjectionPlan({
+    binding,
+    roles,
+    bridge: {
+      command: option(args, "--bridge-command") ?? "npx",
+      args:
+        options(args, "--bridge-arg").length > 0
+          ? options(args, "--bridge-arg")
+          : [
+              "--yes",
+              CHARTERMESH_GITHUB_REF,
+              "mcp",
+              "serve",
+              "--find-project-root",
+              "--actor",
+              `host:${binding.hostKind}`,
+              ...roles.flatMap(({ id }) => ["--role", id]),
+              "--execution-target",
+              projectTargetId,
+            ],
+      cwd: ".",
+    },
+    maxConcurrentAgents: Number(option(args, "--max-agents") ?? 4),
+  });
+
+  organization.spec.agentHosts = [
+    ...organization.spec.agentHosts.filter(({ id }) => id !== projectHostId),
+    {
+      id: projectHostId,
+      adapter: `${binding.hostKind}-project-session`,
+      executionHost: "local",
+      enabled: true,
+    },
+  ];
+  organization.spec.executionTargets = [
+    ...organization.spec.executionTargets.filter(
+      ({ id }) => id !== projectTargetId,
+    ),
+    {
+      id: projectTargetId,
+      kind: "agent_host",
+      hostRef: projectHostId,
+      enabled: true,
+    },
+  ];
+  for (const role of organization.spec.roles) {
+    const candidates = [
+      role.execution.preferred,
+      ...(role.execution.fallbacks ?? []),
+    ];
+    role.execution = {
+      preferred: projectTargetId,
+      fallbacks: [...new Set(candidates)].filter(
+        (targetId) =>
+          targetId !== projectTargetId &&
+          organization.spec.executionTargets.some(
+            ({ id, enabled }) => id === targetId && enabled,
+          ),
+      ),
+    };
+  }
+  const organizationContent = `${JSON.stringify(organization, null, 2)}\n`;
+  parseOrgSpec(organizationContent);
+
+  const proposal = JSON.parse(proposalFile.content) as OrganizationProposal;
+  const { proposalHash: _proposalHash, ...proposalWithoutHash } = proposal;
+  const proposalBody = {
+    ...proposalWithoutHash,
+    organization,
+    rationale: [
+      ...proposal.rationale,
+      `Projected the approved team into the ${binding.hostKind} project host capability.`,
+    ],
+  };
+  const projectedProposal: OrganizationProposal = {
+    ...proposalBody,
+    proposalHash: sha256(proposalBody),
+  };
+  const installation = JSON.parse(installationFile.content) as Record<
+    string,
+    unknown
+  >;
+  installation.proposalHash = projectedProposal.proposalHash;
+
+  const desired = new Map(
+    base.files.map(({ path, content }) => [path, content] as const),
+  );
+  desired.set(paths.organization, organizationContent);
+  desired.set(
+    paths.proposal,
+    `${JSON.stringify(projectedProposal, null, 2)}\n`,
+  );
+  desired.set(
+    paths.installation,
+    `${JSON.stringify(installation, null, 2)}\n`,
+  );
+  for (const operation of projection.operations) {
+    desired.set(
+      resolve(base.target, operation.path),
+      projectionContent(base.target, operation),
+    );
+  }
+  desired.set(
+    join(paths.root, "hosts", `${binding.hostKind}.json`),
+    `${JSON.stringify(
+      {
+        apiVersion: "chartermesh.dev/host-binding/v1alpha1",
+        hostKind: binding.hostKind,
+        command: option(args, "--executable") ?? binding.hostKind,
+        executableSha256: binding.executableSha256,
+        reportedVersion: binding.reportedVersion,
+        capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+        capabilitySnapshot: binding.capabilitySnapshot,
+        projectionPlanHash: projection.planHash,
+        directProtocol: false,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  const files = [...desired.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([path, content]) => ({
+      path,
+      content,
+      beforeHash: existsSync(path)
+        ? createHash("sha256").update(readFileSync(path)).digest("hex")
+        : null,
+      afterHash: createHash("sha256").update(content).digest("hex"),
+    }));
+  const hostBinding = {
+    kind: binding.hostKind,
+    executablePath: binding.executablePath,
+    executableSha256: binding.executableSha256,
+    args: binding.args,
+    reportedVersion: binding.reportedVersion,
+    capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+    projectionPlanHash: projection.planHash,
+    directProtocol: false,
+  };
+  const { planHash: _planHash, ...withoutHash } = base;
+  const body = { ...withoutHash, files, hostBinding };
+  return { ...body, planHash: sha256(body) };
 }
 
 async function configureHostPlan(args: string[]): Promise<BootstrapPlan> {
@@ -1893,6 +2352,210 @@ function runtimePlan(args: string[]): BootstrapPlan {
   return { ...body, planHash: sha256(body) };
 }
 
+function projectWorkSnapshot(database: DatabaseSync): unknown[] {
+  const running = database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'running'").get() as { count: number };
+  if (Number(running.count) > 0) throw new Error("PROJECT_CONFIGURATION_BUSY: finish or cancel active runs before changing project configuration.");
+  const rows = database.prepare(
+    "SELECT id, owner_role, execution_target, status, version FROM work_items WHERE status NOT IN ('done', 'canceled') ORDER BY id LIMIT 1001",
+  ).all();
+  if (rows.length > 1000) throw new Error("PROJECT_CONFIGURATION_WORK_LIMIT: finish outstanding work before changing this project.");
+  if (rows.some((row) => row.status === "in_progress")) throw new Error("PROJECT_CONFIGURATION_BUSY: active work must settle first.");
+  return rows;
+}
+
+function configurationReadDatabase(path: string, approvedRecovery = false): DatabaseSync {
+  if (approvedRecovery) return new DatabaseSync(path, { readOnly: true });
+  // SQLite readOnly alone may create WAL/SHM files. Preview must not write
+  // anything in the target, and immutable mode must not ignore a live WAL.
+  if (existsSync(`${path}-wal`) && statSync(`${path}-wal`).size > 0) {
+    throw new Error("PROJECT_CONFIGURATION_BUSY: close active writers/idle host and dashboard connections so SQLite checkpoints before a no-write configuration preview.");
+  }
+  return new DatabaseSync(`${pathToFileURL(path).href}?mode=ro&immutable=1`, { readOnly: true });
+}
+
+function projectConfiguration(target: string) {
+  const paths = resolveProjectStatePaths(target, { requireInitialized: true });
+  return {
+    organization: readOrganization(target),
+    preferences: readProjectPreferences(target),
+    customization: existsSync(join(paths.root, "project-customization.json"))
+      ? JSON.parse(readBoundedRegularText(join(paths.root, "project-customization.json"), { maxBytes: 32 * 1024 }))
+      : null,
+  };
+}
+
+async function configureProjectPlan(args: string[]): Promise<BootstrapPlan> {
+  const target = targetOf(args);
+  assertNoPendingFileTransactions(target);
+  const paths = resolveProjectStatePaths(target, { requireInitialized: true });
+  const current = readOrganization(target);
+  const candidatePath = option(args, "--organization-file");
+  const organization = candidatePath
+    ? validateOrganizationCustomization(current, readBoundedRegularText(resolve(candidatePath), { maxBytes: 2 * 1024 * 1024 }))
+    : current;
+  const preferencesPath = option(args, "--preferences-file");
+  const preferences = preferencesPath
+    ? parseProjectPreferences(readBoundedRegularText(resolve(preferencesPath), { maxBytes: 1024 * 1024 }))
+    : readProjectPreferences(target);
+  for (const id of Object.keys(preferences.roleInstructions)) {
+    if (!organization.spec.roles.some((role) => role.id === id)) {
+      throw new Error(`PROJECT_PREFERENCES_ROLE_UNKNOWN: '${id}' is not in the proposed organization.`);
+    }
+  }
+  const database = configurationReadDatabase(paths.database);
+  let snapshot: unknown[];
+  try {
+    snapshot = projectWorkSnapshot(database);
+    for (const record of snapshot as Array<{ id: string; owner_role: string; execution_target: string; status: string }>) {
+      if (record.status === "requested" && record.owner_role === "unassigned" && record.execution_target === "unassigned") continue;
+      const role = organization.spec.roles.find(({ id }) => id === record.owner_role);
+      if (!role || ![role.execution.preferred, ...(role.execution.fallbacks ?? [])].includes(record.execution_target)) {
+        throw new Error(`PROJECT_CONFIGURATION_ORPHAN_WORK: '${record.id}' still needs its current role and execution target. Reassign or settle it first.`);
+      }
+    }
+  } finally { database.close(); }
+  const desired = [
+    { path: paths.organization, content: candidatePath ? `${JSON.stringify(organization, null, 2)}\n` : readBoundedRegularText(paths.organization) },
+    { path: paths.runtime, content: readBoundedRegularText(paths.runtime) },
+    { path: join(paths.root, "preferences.json"), content: `${JSON.stringify(preferences, null, 2)}\n` },
+    { path: join(paths.root, "PREFERENCES.md"), content: renderProjectPreferences(preferences) },
+    { path: join(paths.root, "AGENT-ENTRYPOINT.md"), content: portableAgentEntrypoint() },
+    ...portableSkillDocuments().map(({ id, content }) => ({ path: join(paths.root, "skills", id, "SKILL.md"), content })),
+    { path: join(paths.root, "project-customization.json"), content: `${JSON.stringify({
+      apiVersion: "chartermesh.dev/project-customization/v1alpha1", organizationHash: sha256(organization),
+      preferencesHash: sha256(preferences), charterMeshVersion: CHARTERMESH_VERSION,
+    }, null, 2)}\n` },
+  ];
+  if (existsSync(paths.installation)) {
+    const installation = JSON.parse(readBoundedRegularText(paths.installation, { maxBytes: 128 * 1024 }));
+    if (!installation || Array.isArray(installation) || installation.apiVersion !== "chartermesh.dev/installation/v1alpha1") {
+      throw new Error("PROJECT_INSTALLATION_INVALID: repair invalid installation metadata before upgrading.");
+    }
+    desired.push({ path: paths.installation, content: `${JSON.stringify({ ...installation, charterMeshVersion: CHARTERMESH_VERSION }, null, 2)}\n` });
+  }
+  // Preserve authored guide text; refresh only this package's pinned command.
+  for (const path of [join(target, "CHARTERMESH.md"), join(paths.root, "README.md")]) {
+    if (!existsSync(path)) continue;
+    const prior = readBoundedRegularText(path);
+    const content = prior.replace(/github:jade-blanco\/chartermesh#v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?/gu, CHARTERMESH_GITHUB_REF);
+    if (content !== prior) desired.push({ path, content });
+  }
+  if (candidatePath || existsSync(join(paths.root, "project-customization.json"))) {
+    desired.push({ path: join(paths.root, "TEAM-CHARTER.md"), content: renderCustomTeamCharter(organization) });
+    desired.push({ path: join(paths.root, "team-design.json"), content: `${JSON.stringify({
+      apiVersion: "chartermesh.dev/custom-team-design/v1alpha1", source: "approved_custom_orgspec",
+      organizationHash: sha256(organization), roles: organization.spec.roles, workflows: organization.spec.workflows,
+      executionBoundary: "manual_handoffs_until_workflow_runtime_binding",
+    }, null, 2)}\n` });
+  }
+  // Native role files must not silently become stale when staffing changes.
+  const projectedKinds = [...new Set(organization.spec.agentHosts.filter(({ enabled, adapter }) => enabled && /^(codex|claude)-project-session$/u.test(adapter))
+    .map(({ adapter }) => adapter.startsWith("codex") ? "codex" : "claude"))];
+  let hostBinding: BootstrapPlan["hostBinding"];
+  if ((candidatePath && projectedKinds.length > 0) || has(args, "--host")) {
+    if (projectedKinds.length !== 1 || option(args, "--host") !== projectedKinds[0]) {
+      throw new Error("PROJECT_HOST_REFRESH_REQUIRED: an organization edit with native roles requires the same --host, --executable-sha256 and host acknowledgement in this plan. Multiple native hosts must be migrated separately; this command does not silently leave stale projections.");
+    }
+    if (!option(args, "--executable-sha256")) throw new Error("PROJECT_HOST_SHA_REQUIRED: provide the reviewed host executable SHA-256.");
+    if (projectedKinds[0] === "codex" && !has(args, "--allow-unrestricted-read")) throw new Error("Codex host refresh requires --allow-unrestricted-read.");
+    const binding = await inspectHost(target, args);
+    const projection = createHostProjectionPlan({
+      binding,
+      roles: [...organization.spec.roles.map((role) => ({
+        id: role.id, description: `${role.name}: ${role.class} role for ${organization.metadata.name}.`,
+        instructions: `Read .chartermesh/organization.json and .chartermesh/PREFERENCES.md. Capabilities: ${role.capabilities.join(", ")}. Allowed tools: ${role.tools.allow.join(", ")}. Approval-required tools: ${role.tools.approvalRequired?.join(", ") ?? "none"}.`,
+        permission: "read_only" as const,
+      })), ...current.spec.roles.filter((role) => !organization.spec.roles.some(({ id }) => id === role.id)).map((role) => ({
+        id: role.id, description: `Retired CharterMesh role: ${role.id}`,
+        instructions: "This role was retired by an approved organization change. Do not claim work, call tools, delegate, or act. Ask the user to select a current role from organization.json.",
+        permission: "read_only" as const,
+      }))],
+      bridge: { command: "npx", args: ["--yes", CHARTERMESH_GITHUB_REF, "mcp", "serve", "--find-project-root", "--actor", `host:${binding.hostKind}`,
+        ...organization.spec.roles.flatMap(({ id }) => ["--role", id]), "--execution-target", `${binding.hostKind}-project`], cwd: "." },
+      maxConcurrentAgents: Math.min(organization.spec.budgets.maxConcurrentRuns, 16),
+    });
+    desired.push(...projection.operations.map((operation) => ({ path: resolve(target, operation.path), content: projectionContent(target, operation) })));
+    const bindingPath = join(paths.root, "hosts", `${binding.hostKind}.json`);
+    const priorBinding = existsSync(bindingPath) ? JSON.parse(readBoundedRegularText(bindingPath, { maxBytes: 512 * 1024 })) : {};
+    desired.push({ path: bindingPath, content: `${JSON.stringify({
+      ...priorBinding, apiVersion: "chartermesh.dev/host-binding/v1alpha1", hostKind: binding.hostKind,
+      command: binding.executablePath, executableSha256: binding.executableSha256,
+      reportedVersion: binding.reportedVersion, capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+      capabilitySnapshot: binding.capabilitySnapshot, projectionPlanHash: projection.planHash, directProtocol: false,
+    }, null, 2)}\n` });
+    hostBinding = { kind: binding.hostKind, executablePath: binding.executablePath, executableSha256: binding.executableSha256,
+      args: binding.args, reportedVersion: binding.reportedVersion, capabilitySnapshotSha256: binding.capabilitySnapshotSha256,
+      projectionPlanHash: projection.planHash, directProtocol: false };
+  }
+  const files = [...new Map(desired.map((file) => [file.path, file])).values()]
+    .sort((a, b) => a.path.localeCompare(b.path)).map(({ path, content }) => ({ path, content,
+      beforeHash: existsSync(path) ? createHash("sha256").update(readBoundedRegularText(path, { maxBytes: 2 * 1024 * 1024, allowEmpty: true })).digest("hex") : null,
+      afterHash: createHash("sha256").update(content).digest("hex"),
+    }));
+  const body = { apiVersion: "chartermesh.dev/bootstrap-plan/v1alpha1" as const, operation: "configure-project" as const,
+    target, engine: "project-settings", files, projectGuard: { workSnapshotHash: sha256(snapshot) }, ...(hostBinding ? { hostBinding } : {}) };
+  return { ...body, planHash: sha256(body) };
+}
+
+async function applyProjectConfiguration(args: string[], plan: BootstrapPlan): Promise<void> {
+  const approval = option(args, "--approve");
+  if (!approval) { printBootstrapPlan(plan, args); return; }
+  if (approval !== plan.planHash || !plan.projectGuard) throw new Error("Approval hash does not match the current project plan.");
+  validateApplyOperationPlan(plan.target, plan.planHash, plan);
+  if (Buffer.byteLength(JSON.stringify(plan), "utf8") > 16 * 1024 * 1024) throw new Error("PROJECT_CONFIGURATION_PLAN_TOO_LARGE");
+  let receipt = findApplyOperation<BootstrapPlan>(plan.target, plan.planHash);
+  if (receipt?.stage === "complete") {
+    const check = configurationReadDatabase(statePaths(plan.target).database, true);
+    let pending: unknown;
+    try { pending = check.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_pending'").get(); }
+    finally { check.close(); }
+    if (!pending) { printAppliedBootstrapResult(plan, args, receipt.result as Record<string, JsonValue>); return; }
+  }
+  if (plan.hostBinding && (!receipt || inspectApplyOperationFiles(receipt) === "pending")) {
+    await inspectHost(plan.target, ["--host", plan.hostBinding.kind, "--executable", plan.hostBinding.executablePath,
+      "--executable-sha256", plan.hostBinding.executableSha256, "--expected-version", plan.hostBinding.reportedVersion,
+      "--capability-snapshot-sha256", plan.hostBinding.capabilitySnapshotSha256,
+      ...plan.hostBinding.args.flatMap((arg) => ["--host-arg", arg])]);
+  }
+  const paths = statePaths(plan.target);
+  const release = acquireMaintenanceLock(paths.root, "configure-project");
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(paths.database);
+    database.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+    if (sha256(projectWorkSnapshot(database)) !== plan.projectGuard.workSnapshotHash) {
+      throw new Error("PROJECT_CONFIGURATION_WORK_CHANGED: work changed after the preview; generate a new plan.");
+    }
+    const pending = database.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_pending'").get();
+    if (pending && pending.value !== plan.planHash) throw new Error("PROJECT_CONFIGURATION_PENDING: resume the previous exact approved plan first.");
+    // Persist the maintenance barrier before file replacement. A crash must
+    // not allow new work to invalidate the approved recovery snapshot.
+    database.prepare("INSERT INTO metadata(key, value) VALUES ('project_configuration_pending', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(plan.planHash);
+    database.prepare("INSERT INTO metadata(key, value) VALUES ('project_configuration_plan', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(plan));
+    database.exec("COMMIT; BEGIN IMMEDIATE");
+    receipt ??= beginApplyOperation(plan.target, plan.planHash, plan);
+    recoverFileTransaction(plan.target, plan.planHash, plan.files);
+    const fileState = inspectApplyOperationFiles(receipt);
+    if (fileState === "pending" && receipt.stage === "approved") applyFileTransaction(plan.target, plan.planHash, plan.files);
+    else if (fileState !== "committed") throw new Error(`Project apply files are '${fileState}'; no new writes were attempted.`);
+    if (inspectApplyOperationFiles(receipt) !== "committed") throw new Error("Project configuration files did not commit.");
+    if (receipt.stage === "approved") receipt = markApplyOperationFilesCommitted(plan.target, plan.planHash, { fileCount: plan.files.length });
+    const result: Record<string, JsonValue> = { applied: true, planHash: plan.planHash,
+      files: plan.files.map(({ path, beforeHash, afterHash }) => ({ path, beforeHash, afterHash })),
+      nextActions: ["Run doctor; start a new coding-host session to read the current preferences and role charter."],
+    };
+    if (receipt.stage === "files_committed") receipt = markApplyOperationDatabaseCommitted(plan.target, plan.planHash, result);
+    if (receipt.stage === "db_committed") receipt = completeApplyOperation(plan.target, plan.planHash, receipt.result);
+    database.prepare("DELETE FROM metadata WHERE key = 'project_configuration_pending' AND value = ?").run(plan.planHash);
+    database.prepare("DELETE FROM metadata WHERE key = 'project_configuration_plan'").run();
+    database.exec("COMMIT");
+    printAppliedBootstrapResult(plan, args, receipt.result as Record<string, JsonValue>);
+  } finally {
+    if (database) { try { database.exec("ROLLBACK"); } catch {} database.close(); }
+    release();
+  }
+}
+
 function printProposal(args: string[]): void {
   const proposal = proposalFor(args);
   if (has(args, "--json")) {
@@ -1916,6 +2579,15 @@ function printProposal(args: string[]): void {
   );
 }
 
+function printApprovalExplanation(sections: Array<[string, string]>): void {
+  console.log("Plain-language approval (ELI5)");
+  for (const [label, explanation] of sections) {
+    console.log(`${label}: ${explanation}`);
+  }
+  console.log("");
+  console.log("Technical details — exact values for this approval");
+}
+
 function printBootstrapPlan(plan: BootstrapPlan, args: string[]): void {
   if (has(args, "--json")) {
     writeJsonEnvelope(plan.operation, {
@@ -1925,6 +2597,45 @@ function printBootstrapPlan(plan: BootstrapPlan, args: string[]): void {
     });
     return;
   }
+  const changes = plan.files.filter((file) => file.beforeHash !== file.afterHash);
+  const newFileCount = changes.filter((file) => file.beforeHash === null).length;
+  const purposes: Record<BootstrapPlan["operation"], [string, string]> = {
+    bootstrap: [
+      "Set up CharterMesh's local team settings and work records.",
+      "Give this project a place to keep its work, limits, and approval rules.",
+    ],
+    kickoff: [
+      "Set up the team and add the first task from your project brief.",
+      "Make it clear who owns the work, what they should produce, and when they must ask you.",
+    ],
+    "configure-engine": [
+      "Change which model the team will use and its connection settings.",
+      "Prepare future work to use the selected model and tool settings.",
+    ],
+    "configure-host": [
+      "Add or update CharterMesh's settings in the selected coding app.",
+      "Let that app use the approved team roles and report work to CharterMesh.",
+    ],
+    "configure-project": [
+      "Update this project's preferences, team roles, or work rules.",
+      "Let the coordinating team adapt its operating guide to your project without changing model connections or granting itself approval authority.",
+    ],
+  };
+  const [what, why] = purposes[plan.operation];
+  printApprovalExplanation([
+    ["What you are deciding", what],
+    ["Why", why],
+    ["If you approve", `Create ${newFileCount} files and replace ${changes.length - newFileCount} existing files listed below; ${plan.files.length - changes.length} files already match. Save the approval record and initialize or update local work records.` +
+      (plan.kickoff ? " Add one first task; this does not start the work." : "") +
+      (plan.workRetargets?.length ? ` Move ${plan.workRetargets.length} waiting tasks to the selected coding app.` : "") +
+      (plan.hostBinding ? " Start a new app session afterward to use the settings." : "")],
+    ["Cost and data", "Applying this setup does not start model work, install packages, publish, or deploy. Later model use may send task data to the selected provider and use paid service or account limits; that future cost is not known from this plan."],
+    ["What is confirmed", "The file list and before/after fingerprints below describe this exact proposed setup. This preview has not applied it. A fingerprint (hash) identifies an exact version; it does not prove that the setup is suitable for your project."],
+    ["Risks and unknowns", "Existing settings may be replaced. Future model quality, service charges, and successful task completion are not verified by this plan. Review the listed files and limits before agreeing."],
+    ["If you decline or wait", "Do not run the approval command. None of these planned changes will be applied."],
+    ["Undo limits", "Interrupted file changes have a recovery record, but this is not a one-click undo of a completed setup. Restoring settings or work records may need a separate reviewed plan; future external actions cannot be undone by restoring these files."],
+    ["Your choice", "Approve only if this scope matches what you want. Otherwise ask for changes. Approval covers only the exact hash below, not future actions."],
+  ]);
   console.log(`CharterMesh ${plan.operation} plan ${plan.planHash}`);
   console.log(`Target: ${plan.target}`);
   console.log(`${plan.operation === "configure-host" ? "Runtime" : "Model engine"}: ${plan.engine}`);
@@ -1933,6 +2644,23 @@ function printBootstrapPlan(plan: BootstrapPlan, args: string[]): void {
       `Host: ${plan.hostBinding.kind} ${plan.hostBinding.reportedVersion} ` +
         `(${plan.hostBinding.executableSha256})`,
     );
+  }
+  if (plan.onboarding) {
+    console.log(
+      `Team: ${plan.onboarding.teamTemplate} (${plan.onboarding.teamSource}) ` +
+        `(${plan.onboarding.roleIds.join(" -> ")})`,
+    );
+    console.log(
+      `Allocation: ${plan.onboarding.allocationMode}; handoffs: ` +
+        `${plan.onboarding.handoffMode}; approvals: ${plan.onboarding.approvalMode}`,
+    );
+    console.log(`Team charter: ${plan.onboarding.teamCharterPath}`);
+    if (plan.onboarding.hostProjection) {
+      console.log(
+        `Host projection: ${plan.onboarding.hostProjection.kind} ` +
+          `(${plan.onboarding.hostProjection.executionTarget}); a new host session is required after apply.`,
+      );
+    }
   }
   for (const retarget of plan.workRetargets ?? []) {
     console.log(
@@ -1955,6 +2683,64 @@ function printBootstrapPlan(plan: BootstrapPlan, args: string[]): void {
   );
 }
 
+function onboardingNextActions(plan: BootstrapPlan): JsonValue[] {
+  if (plan.operation === "configure-project") return [
+    "Run doctor to check the updated project settings.",
+    "Start a new coding-host session to read the approved preferences and role charter. No model work was started.",
+  ];
+  const actions: JsonValue[] = [
+    {
+      id: "doctor",
+      instruction: "Verify the approved installation and local Control Plane.",
+      command: {
+        executable: "npx",
+        arguments: [
+          "--yes",
+          CHARTERMESH_GITHUB_REF,
+          "doctor",
+          "--target",
+          plan.target,
+        ],
+      },
+    },
+  ];
+  if (!plan.onboarding) return actions;
+  actions.push({
+    id: "review-team-charter",
+    instruction:
+      "Review .chartermesh/TEAM-CHARTER.md for roles, copy/paste handoffs, and human approval rules.",
+  });
+  if (plan.onboarding.hostProjection) {
+    actions.push({
+      id: "start-new-host-session",
+      instruction:
+        `Start a new ${plan.onboarding.hostProjection.kind} session in the project so the projected roles and CharterMesh MCP bridge are loaded.`,
+    });
+  } else {
+    actions.push({
+      id: "optional-host-projection",
+      instruction:
+        "To load native Codex or Claude project roles, generate and approve a configure-host plan, or repeat kickoff on a clean project with --host.",
+    });
+  }
+  actions.push({
+    id: "inspect-initial-work",
+    instruction: "Inspect the initial approved WorkItem before execution.",
+    command: {
+      executable: "npx",
+      arguments: [
+        "--yes",
+        CHARTERMESH_GITHUB_REF,
+        "list",
+        "--target",
+        plan.target,
+        "--active-only",
+      ],
+    },
+  });
+  return actions;
+}
+
 function approvedOperationPlan(
   args: string[],
   operation: BootstrapPlan["operation"],
@@ -1962,7 +2748,24 @@ function approvedOperationPlan(
   const approved = option(args, "--approve");
   if (!approved) return null;
   const receipt = findApplyOperation<BootstrapPlan>(targetOf(args), approved);
-  if (!receipt) return null;
+  if (!receipt) {
+    if (operation !== "configure-project") return null;
+    const path = resolveProjectStatePaths(targetOf(args)).database;
+    if (!existsSync(path)) return null;
+    const database = configurationReadDatabase(path, true);
+    try {
+      const pending = database.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_pending'").get();
+      if (!pending) return null;
+      if (pending.value !== approved) throw new Error("PROJECT_CONFIGURATION_PENDING: resume the previous exact approved plan.");
+      const size = database.prepare("SELECT length(CAST(value AS BLOB)) AS bytes FROM metadata WHERE key = 'project_configuration_plan'").get();
+      if (!size || Number(size.bytes) > 16 * 1024 * 1024) throw new Error("PROJECT_CONFIGURATION_PENDING_PLAN_INVALID");
+      const stored = database.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_plan'").get();
+      const plan = JSON.parse(String(stored!.value)) as BootstrapPlan;
+      validateApplyOperationPlan(targetOf(args), approved, plan);
+      if (plan.operation !== operation || !plan.projectGuard) throw new Error("PROJECT_CONFIGURATION_PENDING_PLAN_INVALID");
+      return plan;
+    } finally { database.close(); }
+  }
   if (receipt.plan.operation !== operation) {
     throw new Error(
       `Approved operation ${approved} belongs to '${receipt.plan.operation}', not '${operation}'.`,
@@ -1972,6 +2775,14 @@ function approvedOperationPlan(
 }
 
 function assertNoUnfinishedApplyOperation(target: string): void {
+  const path = statePaths(target).database;
+  if (existsSync(path)) {
+    const database = configurationReadDatabase(path);
+    try {
+      const pendingConfiguration = database.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_pending'").get();
+      if (pendingConfiguration) throw new Error(`PROJECT_CONFIGURATION_PENDING: resume configure-project --approve ${pendingConfiguration.value} before generating another configuration plan.`);
+    } finally { database.close(); }
+  }
   const pending = listPendingApplyOperations<BootstrapPlan>(target);
   if (pending.length === 0) return;
   throw new Error(
@@ -2005,9 +2816,34 @@ function printAppliedBootstrapResult(
         retargeted.join(", "),
     );
   }
-  console.log(
-    `Next: npx --yes ${CHARTERMESH_GITHUB_REF} doctor --target "${plan.target}"`,
-  );
+  for (const [index, action] of onboardingNextActions(plan).entries()) {
+    if (
+      typeof action === "object" &&
+      action !== null &&
+      !Array.isArray(action)
+    ) {
+      const instruction = action.instruction;
+      const command = action.command;
+      if (typeof instruction === "string") {
+        console.log(`${index === 0 ? "Next" : "Then"}: ${instruction}`);
+      }
+      if (
+        typeof command === "object" &&
+        command !== null &&
+        !Array.isArray(command) &&
+        typeof command.executable === "string" &&
+        Array.isArray(command.arguments) &&
+        command.arguments.every((value) => typeof value === "string")
+      ) {
+        console.log(
+          `  Command argv (not shell text): ${JSON.stringify([
+            command.executable,
+            ...command.arguments,
+          ])}`,
+        );
+      }
+    }
+  }
 }
 
 async function applyBootstrap(args: string[], plan: BootstrapPlan): Promise<void> {
@@ -2053,7 +2889,7 @@ async function applyBootstrap(args: string[], plan: BootstrapPlan): Promise<void
         plan.hostBinding.capabilitySnapshotSha256
     ) {
       throw new Error(
-        "Host executable, reported version, or capabilities changed after planning; generate and approve a new configure-host plan.",
+        "Host executable, reported version, or capabilities changed after planning; generate and approve a new host-bound plan.",
       );
     }
   }
@@ -2139,6 +2975,33 @@ async function applyBootstrap(args: string[], plan: BootstrapPlan): Promise<void
       ...(kickoffWorkItemId ? { workItemId: kickoffWorkItemId } : {}),
       ...(retargetedWorkItemIds.length > 0
         ? { retargetedWorkItemIds }
+        : {}),
+      ...(plan.onboarding
+        ? {
+            onboarding: {
+              teamTemplate: plan.onboarding.teamTemplate,
+              teamSource: plan.onboarding.teamSource,
+              entryRole: plan.onboarding.entryRole,
+              roleIds: plan.onboarding.roleIds,
+              stageIds: plan.onboarding.stageIds,
+              teamCharterPath: plan.onboarding.teamCharterPath,
+              handoffMode: plan.onboarding.handoffMode,
+              allocationMode: plan.onboarding.allocationMode,
+              approvalMode: plan.onboarding.approvalMode,
+              executionBoundary: plan.onboarding.executionBoundary,
+              ...(plan.onboarding.hostProjection
+                ? {
+                    hostProjection: {
+                      kind: plan.onboarding.hostProjection.kind,
+                      executionTarget:
+                        plan.onboarding.hostProjection.executionTarget,
+                      newSessionRequired: true,
+                    },
+                  }
+                : {}),
+            },
+            nextActions: onboardingNextActions(plan),
+          }
         : {}),
     };
     receipt = markApplyOperationDatabaseCommitted<BootstrapPlan>(
@@ -2243,6 +3106,17 @@ function doctor(target: string, args: string[]): number {
   const paths = statePaths(target);
   let organization: ReturnType<typeof readOrganization> | undefined;
   let webSearchConfiguration: "disabled" | "configured" = "disabled";
+  try { readProjectPreferences(target); }
+  catch (error) { issues.push(`preferences.json: ${error instanceof Error ? error.message : String(error)}`); }
+  if (existsSync(paths.database)) {
+    let check: DatabaseSync | undefined;
+    try {
+      check = configurationReadDatabase(paths.database);
+      const pending = check.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_pending'").get();
+      if (pending) issues.push(`PROJECT_CONFIGURATION_PENDING: resume configure-project --approve ${pending.value} with the identical options; work changes remain blocked.`);
+    } catch (error) { issues.push(`Configuration maintenance state: ${error instanceof Error ? error.message : String(error)}`); }
+    finally { check?.close(); }
+  }
   if (existsSync(paths.installation)) {
     try {
       const installed = JSON.parse(
@@ -2682,6 +3556,16 @@ function restoreControlPlane(target: string, args: string[]): void {
   if (!approval) {
     if (has(args, "--json")) writeJsonEnvelope("restore", plan);
     else {
+      printApprovalExplanation([
+        ["What you are deciding", "Replace CharterMesh's current work records with an earlier saved copy."],
+        ["Why", "Use this only if the selected backup is the version you want to return to."],
+        ["If you approve", `Restore the selected backup and ${plan.backupArtifactCount} saved outputs. Work records created or changed after that backup will no longer be the active records.`],
+        ["Cost and data", "This is a local restore. It does not call a model or send the backup to a provider; local storage and time are required."],
+        ["What is confirmed", "The fingerprints below identify the selected backup, its saved outputs, and the current database. No restore has happened in this preview."],
+        ["Risks and unknowns", "A valid backup is not proof that it contains the work you want. Check its date and contents. Stop running workers and dashboards before restoring."],
+        ["If you decline or wait", "Keep the current work records; do not run the approval command."],
+        ["Undo limits", "A safety backup of the current records is made before replacement. Returning to it requires another exact-hash restore approval. Restoring records cannot undo files changed elsewhere, sent data, payments, or other external actions."],
+      ]);
       console.log(JSON.stringify(plan, null, 2));
       console.log("");
       console.log(
@@ -2849,7 +3733,7 @@ export async function runWork(
   } = {},
 ): Promise<RunWorkResult> {
   const runtime = readRuntime(target);
-  const { database, controlPlane } = controlPlaneFor(target);
+  const { database, controlPlane } = controlPlaneFor(target, runtime);
   let heartbeat: NodeJS.Timeout | undefined;
   let cancellationPoll: NodeJS.Timeout | undefined;
   let invocationId: string | undefined;
@@ -3304,6 +4188,7 @@ export async function runWork(
             replayedEvidence.length > 0
               ? "An exact human-approved pending tool call was replayed successfully in this run. Inspect the resulting workspace state before final submission."
               : "",
+            agentHostProfile ? renderProjectPreferences(readProjectPreferences(target), role.id) : "",
           ].filter(Boolean).join("\n\n"),
           acceptanceCriteria: [
             ...decisionContract.acceptanceCriteria.map(
@@ -3485,6 +4370,7 @@ export async function runWork(
         const controller = new DelegationController();
         result = await controller.run(hostRequest, {
           engine,
+          projectPreferences: readProjectPreferences(target),
           toolRuntime,
           signal: runController.signal,
           lifecycle: {
@@ -3559,7 +4445,7 @@ export async function runWork(
         });
       } else {
         if (!engine) throw new Error("MANAGED_ENGINE_UNAVAILABLE");
-        const runner = new BuiltInManagedRunner();
+        const runner = new BuiltInManagedRunner({ projectPreferences: readProjectPreferences(target), roleId: role.id });
         invocationId = controlPlane.startInvocation({
           attemptId: claim.attemptId,
           engineId: engine.manifest.profileId,
@@ -4477,7 +5363,17 @@ function printDecisionPacket(target: string, args: string[]): void {
     const packet = controlPlane.decisionPacket(id);
     if (!packet) throw new Error("No current human decision packet exists.");
     if (has(args, "--json")) writeJsonEnvelope("decision-packet", packet);
-    else console.log(JSON.stringify(packet, null, 2));
+    else {
+      const preferences = readProjectPreferences(target);
+      const explanation = projectApprovalExplanation(packet, preferences.language === "ko" ? "ko" : "en", preferences.approvalDetail);
+      console.log(explanation.heading);
+      for (const section of explanation.sections) {
+        console.log(`${section.label}: ${section.text}`);
+      }
+      console.log("");
+      console.log("Technical details — exact decision packet");
+      console.log(JSON.stringify(packet, null, 2));
+    }
   } finally {
     database.close();
   }
@@ -5270,6 +6166,16 @@ async function evaluateWorkflowCommand(
     if (has(args, "--json")) {
       writeJsonEnvelope("evaluate-workflow plan", plan);
     } else {
+      printApprovalExplanation([
+        ["What you are deciding", `Run ${plan.plannedTrajectories} test runs to compare ways of organizing model work.`],
+        ["Why", "Measure how these model setups perform on the selected test tasks before relying on them."],
+        ["If you approve", "The live command will call the configured models and save local test results. Code tasks also run generated code in the configured sandbox."],
+        ["Cost and data", "Live calls can consume paid service or account limits and send test inputs to the selected providers. The total money cost is unknown; review the exact run and feedback limits below."],
+        ["What is confirmed", "This preview lists the test tasks, model bindings, and limits. No model was called by this preview."],
+        ["Risks and unknowns", "Tests can fail or stop early. Passing these tasks does not prove that the setup is safe or reliable for all real work."],
+        ["If you decline or wait", "Do not add --live and the approval hash. The test will not start."],
+        ["Undo limits", "Stopping future calls does not refund completed calls or retract data already sent to a provider. Saved results do not undo code execution effects."],
+      ]);
       console.log(
         `Workflow study plan ${plan.studyId}: ${plan.tasks.length} tasks × ${plan.conditions.length} conditions = ${plan.plannedTrajectories} trajectories.`,
       );
@@ -5640,6 +6546,19 @@ async function evaluateDecisionReviewCommand(
         resumePlan ?? plan,
       );
     } else {
+      printApprovalExplanation([
+        ["What you are deciding", resumePlan
+          ? `Continue the paused comparison with ${resumePlan.remainingCount} model calls left; completed scored calls will not be repeated.`
+          : `Make ${plan.plannedCalls} model calls to compare two ways of presenting approval information.`],
+        ["Why", "Check whether a model spots important facts and risks in the approval information."],
+        ["If you approve", "The live command will call the selected Codex model and save local progress and results. It does not approve any real project work."],
+        ["Cost and data", "Calls can consume paid service or account limits and send synthetic test inputs to the provider. Total money cost is unknown; each response is limited to 1,024 output tokens (pieces of text)."],
+        ["What is confirmed", "This preview has not called a model. Exact test and model settings are bound to the hash below."],
+        ["Risks and unknowns", "This tests a model, not people: results do not prove that humans understand the approval information or that the presentation caused an improvement." +
+          (resumePlan ? " The account context is what the operator declared; account identity has not been independently verified." : "")],
+        ["If you decline or wait", "Do not add --live and the approval hash. No new test calls will start."],
+        ["Undo limits", "Stopping future calls cannot refund completed calls or retract test data already sent. A paused run needs its own newly approved resume hash."],
+      ]);
       if (resumePlan) {
         console.log(
           `Decision-review resume plan ${resumePlan.benchmarkId}: ${resumePlan.completedCount}/20 scored calls sealed; sequence ${resumePlan.nextSequence} is next.`,
@@ -6062,11 +6981,18 @@ inspect -> plan -> approve exact hash -> apply -> doctor -> run -> review.
 
 Commands:
   chartermesh version [--target PATH] [--check] [--json]
-  chartermesh propose --target PATH [--profile lean|balanced|controlled] [--json]
-  chartermesh bootstrap --target PATH [--profile balanced] [--engine fake] [--json]
+  chartermesh propose --target PATH [--profile lean|balanced|controlled] \
+    [--team-template general|software-product|research|content-production|data-analysis|operations] [--json]
+  chartermesh bootstrap --target PATH [--profile lean|balanced|controlled] [--engine fake] \
+    [--team-template TEMPLATE] [--json]
   chartermesh kickoff --target PATH --brief-file PATH [--title TEXT] \
-    [--acceptance TEXT] [--role operator] [--execution-target local] \
-    [--priority 70] [--engine fake] [--json]
+    [--team-template TEMPLATE] [--profile lean|balanced|controlled] \
+    [--acceptance TEXT] [--role operator] \
+    [--execution-target TARGET] [--priority 70] [--engine fake] [--json]
+  chartermesh kickoff ... --host codex|claude \
+    --executable-sha256 SHA256 [--executable ABSOLUTE_PATH] [--host-arg ARG] \
+    [--max-agents 4] [--bridge-command COMMAND --bridge-arg ARG] \
+    [--allow-unrestricted-read]
   chartermesh kickoff ... --approve PLAN_HASH
   chartermesh bootstrap --target PATH --engine openai-compatible \\
     --endpoint URL --model MODEL [--api-key-env ENV_NAME] \\
@@ -6085,14 +7011,22 @@ Commands:
   chartermesh configure-engine --target PATH --engine command-process \\
     --command ABSOLUTE_EXECUTABLE [--command-arg ARG] [--pass-env ENV_NAME]
   chartermesh configure-engine ... --approve PLAN_HASH
-  chartermesh host doctor --host codex|claude [--direct]
+  chartermesh project-config --target PATH [--json]
+  chartermesh configure-project --target PATH [--preferences-file PATH] [--organization-file PATH] [--json]
+    [--host codex|claude --executable-sha256 SHA256] [--executable ABSOLUTE_PATH]
+    [--host-arg ARG] [--allow-unrestricted-read]
+  chartermesh configure-project ... --approve PLAN_HASH
+  chartermesh host doctor --host codex|claude [--target PATH] [--direct]
     [--executable ABSOLUTE_PATH]
     [--host-arg ARG]
-    [--executable-sha256 SHA256] [--expected-version VERSION] [--json]
+    [--executable-sha256 SHA256] [--expected-version VERSION]
+    [--capability-snapshot-sha256 SHA256] [--json]
   chartermesh configure-host --target PATH --host codex|claude \
     [--executable ABSOLUTE_PATH] [--host-arg ARG] [--max-agents 4]
+    [--executable-sha256 SHA256] [--expected-version VERSION]
+    [--capability-snapshot-sha256 SHA256] [--json]
     [--allow-unrestricted-read] [--activate-role ROLE] [--model MODEL]
-    [--reasoning-effort medium] [--pass-env ENV_NAME]
+    [--reasoning-effort medium] [--pass-env ENV_NAME] [--timeout-ms 600000]
     [--bridge-command COMMAND --bridge-arg ARG]
   chartermesh configure-host ... --approve PLAN_HASH
   chartermesh mcp serve (--target PATH | --find-project-root)
@@ -6176,7 +7110,11 @@ Search remains disabled without this option, is OrgSpec allowlisted, and each
 exact external query requires Control Plane approval.
 
 Live model calls are opt-in. Credentials are read from the configured
-environment-variable name and are never written to CharterMesh files.`);
+environment-variable name and are never written to CharterMesh files.
+
+kickoff --host reports the observed executable digest and exits before a host
+process starts when --executable-sha256 is omitted. Repeat with that digest to
+generate the one approval plan.`);
 }
 
 export async function main(args = process.argv.slice(2)): Promise<number> {
@@ -6208,13 +7146,25 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   if (command === "kickoff") {
     const resumed = approvedOperationPlan(args, "kickoff");
     if (!resumed) assertNoUnfinishedApplyOperation(target);
-    await applyBootstrap(args, resumed ?? kickoffPlan(args));
+    await applyBootstrap(args, resumed ?? await kickoffPlan(args));
     return 0;
   }
   if (command === "configure-engine") {
     const resumed = approvedOperationPlan(args, "configure-engine");
     if (!resumed) assertNoUnfinishedApplyOperation(target);
     await applyBootstrap(args, resumed ?? runtimePlan(args));
+    return 0;
+  }
+  if (command === "project-config") {
+    const config = projectConfiguration(target);
+    if (has(args, "--json")) writeJsonEnvelope(command, config);
+    else console.log(JSON.stringify(config, null, 2));
+    return 0;
+  }
+  if (command === "configure-project") {
+    const resumed = approvedOperationPlan(args, "configure-project");
+    if (!resumed) assertNoUnfinishedApplyOperation(target);
+    await applyProjectConfiguration(args, resumed ?? await configureProjectPlan(args));
     return 0;
   }
   if (command === "host") {

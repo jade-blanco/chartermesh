@@ -4,6 +4,10 @@ CharterMesh integrates coding products as optional hosts around the same local
 Control Plane. It does not copy WorkItems into a provider task list and it does
 not require either product for the provider-neutral ManagedRunner path.
 
+> Use `v0.0.10-alpha.1` for this flow. Its tag-pinned GitHub package works
+> without a source checkout, and the generated MCP command uses the same ref.
+> Exact approved apply and a new-session MCP health check are mandatory.
+
 ## Two integration modes
 
 | Mode | Codex | Claude Code | Model/quota use |
@@ -11,8 +15,9 @@ not require either product for the provider-neutral ManagedRunner path.
 | Project roles + local MCP | supported | supported | only when the user starts work in that host |
 | Direct `chartermesh run` AgentHost | experimental app-server adapter | not implemented | consumes the selected host account's quota |
 
-Project mode is the recommended friend trial. `configure-host` derives role
-files from OrgSpec and adds one tag-pinned local stdio MCP entry. The MCP
+Project mode is the recommended friend trial. Fresh projects can include it in
+the same `kickoff --host` plan that creates the team. Existing projects use
+`configure-host`. Both derive role files from OrgSpec and add one tag-pinned local stdio MCP entry. The MCP
 server exposes fenced work execution and read surfaces under a unique
 per-process non-human actor. It cannot approve a plan, tool call, artifact, or
 user-input decision. Without `--activate-role`, it does not create a direct
@@ -26,31 +31,34 @@ recovered; the replacement session cannot reuse the old lease tuple.
 ## Fresh-project flow
 
 ```powershell
-$CM = "github:jade-blanco/chartermesh#v0.0.9-alpha.1"
+$CM = "github:jade-blanco/chartermesh#v0.0.10-alpha.1"
 $Target = "C:\path\to\new-project"
+$Brief = "C:\path\to\brief.md"
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
 # No write: inspect the kickoff plan and retain data.planHash.
-npx --yes $CM kickoff --target $Target --brief-file C:\path\to\brief.md `
-  --profile controlled --engine fake --json
-
-# Repeat the identical options only after approving that exact hash.
-npx --yes $CM kickoff --target $Target --brief-file C:\path\to\brief.md `
-  --profile controlled --engine fake --json --approve PLAN_HASH
-
-# No model call and no project write.
-npx --yes $CM host doctor --host codex --target $Target --json
-
-# No write: inspect the separate host projection hash.
-npx --yes $CM configure-host --host codex --target $Target `
+npx --yes $CM kickoff --target $Target --brief-file $Brief `
+  --team-template software-product --profile controlled --engine fake `
+  --host codex --executable-sha256 HOST_SHA256 `
   --allow-unrestricted-read --max-agents 4 --json
 
-# Repeat only after approving the second exact hash.
-npx --yes $CM configure-host --host codex --target $Target `
-  --allow-unrestricted-read --max-agents 4 --json --approve HOST_PLAN_HASH
+# Repeat the identical options only after approving that exact hash.
+npx --yes $CM kickoff --target $Target --brief-file $Brief `
+  --team-template software-product --profile controlled --engine fake `
+  --host codex --executable-sha256 HOST_SHA256 `
+  --allow-unrestricted-read --max-agents 4 --json `
+  --approve PLAN_HASH
 ```
 
-Use `--host claude` for Claude Code. An explicitly installed executable can be
+This is one plan and one CharterMesh human approval. Codex project trust or
+Claude's one-time MCP permission remains a separate host UI action and never
+approves the plan. The no-write preview performs the host inspection and
+includes its executable and capability hashes. Resolve and hash
+the executable read-only first. If `--executable-sha256` is omitted, kickoff
+reports the observed digest and exits before starting the host; repeat with
+that exact digest. Use
+`--host claude` for Claude Code. For an already initialized project, retain the
+separate `host doctor` then `configure-host` flow. An explicitly installed executable can be
 selected with `--executable ABSOLUTE_PATH`. The preview records its resolved
 version, executable SHA-256, and CharterMesh-declared compatibility-snapshot
 SHA-256. That snapshot is not a live host feature probe. Apply rechecks the
@@ -172,24 +180,46 @@ are started read-only on the direct path. Interactive project mode remains
 available through the governed MCP write sequence above.
 
 Projected role files are capability profiles, not a second authoritative team
-ledger. A `controlled` profile creates operator and verifier roles, and the
-primary host may invoke them, but provider-native subagent/session lineage is
-not yet mirrored as child WorkItems. All authoritative assignment and result
-state remains in the CharterMesh Control Plane.
+ledger. A `controlled` profile creates coordinator, operator, and verifier roles, and the
+primary host may invoke coordinator and verifier through bounded copy/paste
+consultation packets, but provider-native subagent/session lineage is not yet
+mirrored as child WorkItems. They must not claim or mutate the initial
+operator-owned WorkItem. All authoritative assignment and result state remains
+in the CharterMesh Control Plane.
+
+## Updating an installed team
+
+Use `configure-project` to change or refresh approved project preferences and
+organization guidance; do not rebootstrap a customized project. Organization
+edits with native roles require the matching `--host`, re-attested executable
+hash, and Codex read-scope acknowledgement. A preferences-only update may omit
+host projection. See [Project customization](PROJECT-CUSTOMIZATION.md).
+
+After the organization changes, old MCP and dashboard sessions reject mutation
+requests because their loaded policy is out of date. Restart them and verify
+the new-session health gate before work continues. Read-only inspection and
+preference-only read refresh remain available; this does not make a running
+model automatically reload its prompt. New host connections still use the
+separate `configure-host` plan.
 
 ## Session prompt
 
 For an empty folder, give the coding host this message with the folder path and
 your actual project requirements:
 
-> Use https://github.com/jade-blanco/chartermesh at tag v0.0.9-alpha.1. Treat
-> my requirements as the project brief and follow `BOOTSTRAP.md`. Generate a
-> no-write `kickoff` plan first and show me its exact hash and all files. Apply
-> only after I approve that same hash. Then run `doctor`, inspect your host with
-> `host doctor`, generate a separate `configure-host` plan, and again wait for
-> my exact hash approval. Use the projected roles and CharterMesh MCP for work
-> state. Never treat your own review, a subagent response, or a host permission
-> prompt as my approval.
+> Use CharterMesh v0.0.10-alpha.1 from its tag-pinned package or a reviewed
+> matching source checkout. Treat my requirements as the
+> project brief and follow `BOOTSTRAP.md`. Generate a
+> no-write `kickoff` plan that selects the matching team template and includes
+> your current host (`--host codex --executable-sha256 HOST_SHA256
+> --allow-unrestricted-read` or `--host claude --executable-sha256
+> HOST_SHA256`). If the digest is not known, report it without starting the host
+> and retry the preview with that value. Show me the team, work allocation,
+> handoff and approval rules,
+> exact hash, and all files. Apply only after I approve that same hash. Then run
+> `doctor`, start a new project session, and verify the projected roles and
+> CharterMesh MCP. Never treat your own review, a subagent response, or a host
+> permission prompt as my approval.
 
-That prompt authorizes inspection and plan generation. The two plan hashes are
-still distinct human decisions.
+That prompt authorizes inspection and plan generation. The generated hash is
+still a distinct human decision that did not exist in the original request.

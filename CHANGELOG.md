@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.0.10-alpha.1 — 2026-09-05
+
+- Added read-only `project-config` and exact-approved `configure-project` for
+  project language, approval detail, tone, project/role instructions, and
+  validated complete organization revisions. Saved preferences have a readable
+  `PREFERENCES.md` projection; customization is protected against default
+  bootstrap overwrites and connection changes preserve preferences.
+- Project customization retains approval-policy and connection boundaries,
+  blocks active execution, validates unfinished-work ownership and targets,
+  and binds relevant work state into the plan. Refreshing one existing native
+  host requires executable re-attestation; removed roles become retired notices.
+- Stored the pending customization marker and exact approved plan atomically
+  before file replacement, keeping work mutations blocked across interrupted
+  apply until exact-plan recovery. Old MCP/dashboard sessions reject mutations
+  after organization changes; read-only inspection remains available.
+- Added approved installation/version and managed-guide refresh while
+  preserving the current organization, saved preferences, and unrelated user text.
+- ELI5 remains the default; explicit concise/technical and language/tone
+  preferences affect presentation, not evidence status, risks, or approval
+  authority. This is reviewed configuration, not model training or autonomous
+  self-modification. Decision Packet views honor language/detail settings;
+  bootstrap/configuration/evaluation plan explanations remain English ELI5.
+- Made human approval explanations plain-language-first (ELI5) in the CLI,
+  dashboard, team charter, portable skill and coding-host/runner instructions.
+  Exact packet schemas, hashes, evidence status and approval rules are unchanged;
+  unknown costs and recovery limits remain explicit, not safety guarantees.
+- Added explicit provider-neutral project team templates and a bundled
+  `organization-bootstrap` skill. A fresh `kickoff` now produces a general
+  team by default or a software, research, content, data, or operations team
+  selected by the coding host from the user's goal.
+- Added machine-readable team design plus a sanitized human-readable
+  `.chartermesh/TEAM-CHARTER.md` with responsibilities, stage allocation,
+  copy/paste inter-team handoffs, and exact-hash human approval rules.
+- Added optional one-plan Codex/Claude project-role and MCP projection through
+  `kickoff --host`, while preserving executable attestation, exact plan
+  approval, Control Plane authority, and the required new host session.
+- Added pre-write validation for initial owner roles and execution targets and
+  structured post-apply onboarding actions.
+
 ## 0.0.9-alpha.1 — 2026-08-15
 
 - Migrated the SQLite Control Plane to schema v15 with safety backups. Command

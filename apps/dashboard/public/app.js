@@ -9,6 +9,7 @@ const state = {
   artifact: null,
   toolEvidence: null,
   decisionPacket: null,
+  approvalExplanation: null,
   primaryDecisionPacket: null,
   reviewDecision: null,
   busy: false,
@@ -240,7 +241,11 @@ function renderDecisionFocus() {
     kindLabels[packet?.kind] ??
     (action.category === "user_input" ? "사용자 입력" : "사람 결정");
   document.querySelector("#focus-question").textContent =
-    packet?.question ?? `${item.title}에 대해 결정이 필요합니다.`;
+    packet?.kind === "artifact_review"
+      ? `“${item.title}” 결과물을 받아들일까요?`
+      : packet?.kind === "tool_execution"
+        ? `“${item.title}”의 도구 작업을 허락할까요?`
+        : packet?.question ?? `${item.title}에 대해 결정이 필요합니다.`;
   document.querySelector("#focus-result").textContent =
     packet?.producerReport?.summary ?? item.summary;
   const verified = (packet?.evidence ?? []).filter(
@@ -261,14 +266,14 @@ function renderDecisionFocus() {
     ({ severity }) => severity === "warning",
   ).length;
   document.querySelector("#focus-risk").textContent = packet
-    ? `차단 예외 ${blocking}건 · 경고 ${warnings}건`
+    ? `승인을 막는 문제 ${blocking}건 · 주의 ${warnings}건`
     : "미확인";
   document.querySelector("#focus-consequence").textContent =
     packet?.kind === "tool_execution"
       ? "승인하면 이 정확한 호출만 실행 가능, 거부하면 실행 없이 작업 종료"
       : packet?.kind === "user_input"
         ? "입력하면 대기 중인 작업을 재개"
-        : "승인하면 산출물을 완료, 수정 요청하면 근거와 함께 실행팀으로 반환";
+        : "승인하면 결과물을 받아들였다고 기록합니다. 수정 요청하면 담당자가 보완합니다. 게시·배포 허락은 별개입니다.";
   const button = document.querySelector("#focus-open-button");
   button.dataset.selectId = item.id;
   button.setAttribute("aria-controls", "inspector");
@@ -415,8 +420,12 @@ function renderReviewList(selector, values, emptyText) {
 }
 
 function reviewSummary(item) {
+  if (state.decisionPacket && state.approvalExplanation) {
+    return state.approvalExplanation.sections.find(({ id }) => id === "decision")?.text ?? item.summary;
+  }
   const pending = activePendingTool(item);
   if (pending) {
+    if (pending.toolName !== "workspace.write_file") return "도구 실행을 허락할지 결정하는 요청입니다. 정확한 입력과 외부 영향을 확인하세요.";
     const args = objectValue(pending.arguments);
     const path = typeof args.path === "string" ? args.path : "대상 파일";
     const replacements = Array.isArray(args.replacements)
@@ -443,6 +452,7 @@ function reviewSummary(item) {
 function inspectorTitle(item) {
   const pending = activePendingTool(item);
   if (pending) {
+    if (pending.toolName !== "workspace.write_file") return `${item.title} · 실행 결재`;
     const args = objectValue(pending.arguments);
     const changeCount = Number(pending.summary?.changeCount ?? 0);
     const path =
@@ -559,6 +569,28 @@ function renderArtifact() {
     state.artifact.content;
 }
 
+function renderApprovalExplanation() {
+  const block = document.querySelector("#approval-explanation");
+  const explanation = state.approvalExplanation;
+  block.hidden = !state.decisionPacket || !explanation;
+  block.replaceChildren();
+  if (block.hidden) return;
+  const heading = document.createElement("h3");
+  heading.textContent = explanation.heading;
+  block.append(heading);
+  for (const item of explanation.sections) {
+    const section = document.createElement("section");
+    section.className = "review-section";
+    section.dataset.explanationSection = item.id;
+    const label = document.createElement("h4");
+    label.textContent = item.label;
+    const text = document.createElement("p");
+    text.textContent = item.text;
+    section.append(label, text);
+    block.append(section);
+  }
+}
+
 function renderToolApproval(item) {
   const block = document.querySelector("#tool-approval-block");
   const pending = activePendingTool(item);
@@ -571,6 +603,7 @@ function renderToolApproval(item) {
     !Array.isArray(pending.arguments)
       ? pending.arguments
       : {};
+  const isFileWrite = pending.toolName === "workspace.write_file";
   const unparsed = typeof args.unparsed === "string";
   const replacements = Array.isArray(args.replacements)
     ? args.replacements
@@ -591,7 +624,9 @@ function renderToolApproval(item) {
     : [];
   const isChangeSet = changes.length > 0;
   const content =
-    isChangeSet
+    !isFileWrite
+      ? JSON.stringify(args, null, 2)
+      : isChangeSet
       ? changes
           .map((change, index) => {
             const summary = summaryChanges.find(
@@ -636,7 +671,7 @@ function renderToolApproval(item) {
   const byteSize = new TextEncoder().encode(content).byteLength;
 
   document.querySelector("#tool-change-title").textContent =
-    `${path} 변경 승인`;
+    isFileWrite ? `${path} 변경 승인` : `${pending.toolName} 실행 승인`;
   document.querySelector("#tool-name").textContent = pending.toolName;
   document.querySelector("#tool-size").textContent =
     isChangeSet
@@ -648,12 +683,18 @@ function renderToolApproval(item) {
   document.querySelector("#tool-packet-hash").textContent =
     state.decisionPacket?.binding?.packetHash ?? "패킷 없음";
   document.querySelector("#tool-content").textContent = content;
-  document.querySelector("#tool-impact").textContent = isChangeSet
+  document.querySelector("#tool-impact").textContent = !isFileWrite
+    ? pending.toolName === "web.search"
+      ? "검색어를 설정된 검색 서버로 보냅니다. 검색어에 비밀정보가 없는지 확인하세요. 비용과 서버의 데이터 보관 방식은 별도로 확인해야 합니다."
+      : "이 도구를 아래의 정확한 입력 내용으로 실행하도록 허락합니다. 파일 변경·외부 전송·비용이 생기는지는 도구의 설명과 입력을 확인하세요."
+    : isChangeSet
     ? `프로젝트 내부 ${changes.length.toLocaleString("ko-KR")}개 파일을 하나의 승인 단위로 변경합니다. 모든 경로·승인 전 해시·승인 후 전체 바이트는 아래 기술 상세에 함께 표시됩니다.`
     : replacements
       ? `프로젝트 내부의 "${path}" 파일에서 기존 코드 ${replacements.length.toLocaleString("ko-KR")}곳만 정확히 찾아 교체합니다. 파일 전체를 덮어쓰지 않으며 다른 파일은 변경하지 않습니다.`
       : `프로젝트 내부의 "${path}" 파일 내용을 ${byteSize.toLocaleString("ko-KR")}바이트 규모로 변경합니다. 정확한 원문은 아래 기술 상세에서 확인할 수 있습니다.`;
-  const safeguards = isChangeSet
+  const safeguards = !isFileWrite
+    ? ["표시된 정확한 도구 호출만 승인합니다. 다음 작업까지 허락하는 것은 아닙니다.", "영향이나 복구 방법을 모르면 먼저 설명을 요청하세요."]
+    : isChangeSet
     ? [
         "표시된 모든 파일의 현재 SHA-256 또는 부재 상태가 승인 시점과 같을 때만 실행합니다.",
         "한 파일이라도 달라졌으면 변경 묶음 전체를 적용하지 않습니다.",
@@ -696,8 +737,8 @@ function renderToolApproval(item) {
   button.hidden = unparsed;
   button.disabled = pending.approved || state.busy;
   button.textContent = pending.approved
-    ? "정확한 변경 승인됨"
-    : "위 내용을 확인하고 변경 승인";
+    ? "정확한 도구 실행 승인됨"
+    : isFileWrite ? "위 내용을 확인하고 변경 승인" : "위 내용을 확인하고 도구 실행 승인";
   const denyButton = document.querySelector("#tool-deny-button");
   denyButton.disabled = pending.approved || state.busy;
   denyButton.hidden = pending.approved;
@@ -746,6 +787,7 @@ function renderInspector() {
   const isReview = Boolean(state.decisionPacket);
   reviewSource.hidden = !isReview;
   document.querySelector("#task-instructions").textContent = item.summary;
+  document.querySelector("#original-decision-question").textContent = state.decisionPacket?.question ?? "";
   document.querySelector("#inspector-status").innerHTML = statusPill(item);
   document.querySelector("#inspector-action").textContent =
     nextActionFor(item);
@@ -768,6 +810,7 @@ function renderInspector() {
       `${waitLabels[item.wait.type] ?? item.wait.type}: ${waitReason}${resume}`;
   }
   renderReviewFeedback(item);
+  renderApprovalExplanation();
   renderToolApproval(item);
   renderArtifact();
   renderActions(item);
@@ -860,6 +903,7 @@ async function selectWork(
   state.artifact = null;
   state.toolEvidence = null;
   state.decisionPacket = null;
+  state.approvalExplanation = null;
   state.reviewDecision = null;
   if (!preserveDetails) {
     document.querySelectorAll(".technical-details").forEach((details) => {
@@ -886,14 +930,16 @@ async function selectWork(
             : "도구 증거를 읽지 못했습니다.",
         );
       }),
-    api(`/api/work-items/${encodeURIComponent(id)}/decision-packet`)
+    api(`/api/work-items/${encodeURIComponent(id)}/decision-packet?explain=project`)
       .then((result) => {
         if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
-        state.decisionPacket = result;
+        state.decisionPacket = result.packet;
+        state.approvalExplanation = result.explanation;
       })
       .catch(() => {
         if (selectionVersion !== state.selectionVersion || state.selectedId !== id) return;
         state.decisionPacket = null;
+        state.approvalExplanation = null;
       }),
   ];
   if (item?.status === "review_pending") {
@@ -935,6 +981,9 @@ async function selectWork(
   renderWork();
   state.inspectorReturnFocus = document.querySelector(sourceSelector);
   renderInspector();
+  if (!preserveDetails && state.approvalExplanation?.mode === "technical") {
+    document.querySelectorAll(".technical-details").forEach((details) => { details.open = true; });
+  }
   if (!preserveInspectorState || inspectorWasOpen) {
     inspector.classList.add("open");
   }

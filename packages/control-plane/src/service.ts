@@ -535,6 +535,7 @@ export class ControlPlane {
   private readonly artifactDirectory: string;
   private readonly budgets?: RuntimeBudgets;
   private readonly maintenanceDirectory: string;
+  private readonly beforeMutation?: () => void;
 
   constructor(
     database: DatabaseSync,
@@ -542,11 +543,13 @@ export class ControlPlane {
     options: {
       budgets?: RuntimeBudgets;
       maintenanceDirectory?: string;
+      beforeMutation?: () => void;
     } = {},
   ) {
     this.database = database;
     this.artifactDirectory = artifactDirectory;
     this.budgets = options.budgets;
+    this.beforeMutation = options.beforeMutation;
     this.maintenanceDirectory =
       options.maintenanceDirectory ?? join(artifactDirectory, "..");
     mkdirSync(artifactDirectory, { recursive: true });
@@ -554,11 +557,20 @@ export class ControlPlane {
 
   private assertWritable(): void {
     assertMaintenanceInactive(this.maintenanceDirectory);
+    if (this.database.prepare("SELECT value FROM metadata WHERE key = 'project_configuration_pending'").get()) {
+      throw new Error("PROJECT_CONFIGURATION_PENDING: resume the exact approved configure-project plan before changing work.");
+    }
   }
 
   private transact<T>(operation: () => T): T {
     this.assertWritable();
-    return transaction(this.database, operation);
+    return transaction(this.database, () => {
+      // Recheck after obtaining SQLite's writer lock, not only before waiting
+      // for it: a configuration apply may have won that race.
+      this.assertWritable();
+      this.beforeMutation?.();
+      return operation();
+    });
   }
 
   private assertRunBudgets(): void {

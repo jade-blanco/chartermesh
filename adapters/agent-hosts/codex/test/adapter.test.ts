@@ -74,7 +74,7 @@ class FakeCodexProcess extends EventEmitter {
         id: message.id,
         result: {
           userAgent:
-            "chartermesh/0.145.0 (fixture; x86_64) test (chartermesh; 0.0.9-alpha.1)",
+            "chartermesh/0.145.0 (fixture; x86_64) test (chartermesh; 0.0.10-alpha.1)",
           platformFamily: "fixture",
           platformOs: "fixture",
         },

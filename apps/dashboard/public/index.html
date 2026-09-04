@@ -169,6 +169,7 @@
           표에서 작업을 선택하면 현재 상태, 다음 조치, 승인 대기 변경과 계보를 볼 수 있습니다.
         </p>
         <div class="inspector-content" id="inspector-content" hidden>
+          <div class="inspector-block decision-brief" id="approval-explanation" hidden></div>
           <div class="inspector-block">
             <label>현재 상태</label>
             <div id="inspector-status"></div>
@@ -247,11 +248,11 @@
               <ul class="review-list criteria" id="artifact-criteria"></ul>
             </section>
             <section class="review-section">
-              <h3>제어면이 확인한 실행 증거</h3>
+              <h3>실행 기록으로 확인한 내용</h3>
               <ul class="review-list verified" id="artifact-verified-evidence"></ul>
             </section>
             <section class="review-section">
-              <h3>작업자가 보고한 수행 근거</h3>
+              <h3>작업자가 확인했다고 말한 내용 (별도 검증 아님)</h3>
               <ul class="review-list" id="artifact-checks"></ul>
             </section>
             <section class="review-section review-alert">
@@ -275,6 +276,8 @@
             <details class="technical-details">
               <summary>원래 작업 지시 보기 <span>모델 입력 원문</span></summary>
               <p id="task-instructions"></p>
+              <p>원래 결재 질문</p>
+              <p id="original-decision-question"></p>
             </details>
           </div>
           <div class="inspector-block">

@@ -9,6 +9,11 @@ import {
   type ManagedRunResult,
 } from "./managed-runner.ts";
 import type { ToolRuntime } from "./tool-runtime.ts";
+import {
+  defaultProjectPreferences,
+  parseProjectPreferences,
+  type ProjectPreferences,
+} from "./project-preferences.ts";
 
 export type DelegatedRole =
   | "planner"
@@ -163,8 +168,14 @@ export class DelegationController {
       signal?: AbortSignal;
       toolRuntime?: ToolRuntime;
       lifecycle?: DelegationLifecycle;
+      projectPreferences?: ProjectPreferences;
     },
   ): Promise<DelegatedRunResult> {
+    // One validated snapshot for the whole bounded collaboration. Mutable
+    // caller input cannot change instructions between child model starts.
+    const projectPreferences = parseProjectPreferences(JSON.stringify(
+      options.projectPreferences ?? defaultProjectPreferences(),
+    ));
     const original = request.taskPacket as {
       objective?: string;
       context?: string;
@@ -193,6 +204,8 @@ export class DelegationController {
       try {
         const runner = new BuiltInManagedRunner({
           maxOutputTokens: this.maxOutputTokensPerCall,
+          projectPreferences,
+          roleId: role,
         });
         const handle = await runner.start(
           {
